@@ -51,6 +51,10 @@ Observed protocol facts recorded for later milestones:
 * ``response/status`` becomes ``FINISHED`` on success; the adapter maps it
   to ``finish_reason='stop'`` so the vendored loop's terminal-break fires
   and downstream layers see one normalized terminal event.
+* The initial ``{"v": {"response": {...}}}`` snapshot may already carry
+  non-empty ``content`` / ``thinking_content`` (the first generated tokens
+  can arrive there, before any APPEND op); the adapter emits them as the
+  first delta chunk so nothing is dropped.
 * Text arrives via APPEND ops on ``response/content``; thinking (when
   enabled) via APPEND ops on ``response/thinking_content``, followed by
   ``response/thinking_elapsed_secs`` SET bookkeeping.
@@ -130,6 +134,20 @@ class WireSession:
                 message_id = response.get("message_id")
                 if message_id:
                     chunk["response_message_id"] = str(message_id)
+                # The snapshot can already carry generated text (live
+                # evidence, post-M6: ``"content": "The"`` arrived here
+                # BEFORE the first APPEND op). Dropping it silently loses
+                # the first chunk of the answer — emit it. ``content``
+                # wins over ``thinking_content`` when both are present;
+                # the one-chunk-per-line contract cannot carry both.
+                content = response.get("content")
+                thinking = response.get("thinking_content")
+                if isinstance(content, str) and content:
+                    chunk["content"] = content
+                    chunk["type"] = "text"
+                elif isinstance(thinking, str) and thinking:
+                    chunk["content"] = thinking
+                    chunk["type"] = "thinking"
                 return chunk
             return None
 

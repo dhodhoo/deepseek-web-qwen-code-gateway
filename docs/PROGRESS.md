@@ -6,7 +6,7 @@ The coding agent must update this file after every milestone.
 
 **Current milestone:** M6 — One emulated tool call
 
-**State:** COMPLETE (offline-verified AND gateway-side live-verified: the M6 live smoke against the real DeepSeek backend produced a valid structured tool call on the first try, and the tool-history round trip answered correctly). Final acceptance step is user-run: connect real Qwen Code and let it execute one structured tool call. M7 (multi-turn tool loop) not started — awaits explicit instruction.
+**State:** COMPLETE (offline-verified AND gateway-side live-verified: the M6 live smoke against the real DeepSeek backend produced a valid structured tool call on the first try, and the tool-history round trip answered correctly). The user's first real Qwen Code acceptance attempt surfaced three live bugs — all three are now DIAGNOSED, FIXED, and live-re-verified (post-M6 hotfix addendum below; ADR-024/025/026): the 69-tool instruction block stalled DeepSeek Web (>6 min), `parent_message_id` was serialized as a string where upstream requires a u32 number (every session-reuse turn 422'd, causing the duplicate-session symptom), and the wire adapter dropped the first streamed chunk when it arrived inside the initial snapshot event. Final acceptance step is user-run again: connect real Qwen Code and let it execute one structured tool call. M7 (multi-turn tool loop) not started — awaits explicit instruction.
 
 ## Completed
 
@@ -65,13 +65,30 @@ non-stream round trip (re-sending that exact assistant tool_calls +
 role=tool history) finished stop with content "README.md". Proof the
 real model follows the control-envelope protocol and the canonical
 round trip works live. Script deleted after use (established pattern).
+
+Post-M6 hotfix (next day, three live bugs from the user's acceptance
+attempt — ADR-024/025/026):
+.venv\Scripts\python.exe -m pytest -q
+370 -> 376 (instruction-block compaction tests)
+     -> 379 (parent_message_id u32 conversion tests)
+     -> 382 passed, 3 deselected (wire snapshot-content tests)
+Offline replay of the captured 69-tool Qwen Code turn (diagnostics
+record 13) through the real app with a FakeBackend: prompt shrank
+165,262 -> 84,656 chars (instructions block 106,333 -> 25,727,
+-76%), pipeline 200 + [DONE] in 0.11 s.
+Live re-verification against the real backend: the same 69-tool turn
+first token in 2.6 s (was >6 min stall); the tool-history turn 2 now
+succeeds ON the session-reuse/delta path (1.1 s, correct answer, no
+duplicate session); streamed answers arrive complete (snapshot first
+chunk no longer dropped). Probe scripts deleted after use.
 ```
 
 ## Known limitations
 
-- Live Qwen Code acceptance PASSED 2026-08-14 (user-run): plain chat works through a real Qwen Code v0.21.11 install; captures traffic-verified the wire fixtures (docs/UPSTREAM_NOTES.md, "Live traffic verification"). Two captured observations remain unexplained and are flagged MONITOR there (a reduced-tool parallel request lineage; byte-identical re-submissions before success). Structured tool calling arrived in M6 (live smoke passed first try); the final M6 acceptance step — real Qwen Code executing one structured tool call — is user-run and prepared turnkey.
+- Live Qwen Code acceptance PASSED 2026-08-14 (user-run): plain chat works through a real Qwen Code v0.21.11 install; captures traffic-verified the wire fixtures (docs/UPSTREAM_NOTES.md, "Live traffic verification"). The M5-era MONITOR flag "byte-identical re-submissions before success" is now EXPLAINED for tool-history turns: the first attempt 422'd on the parent_message_id wire bug (ADR-025) and the client retried — the retry/rebuild path then created the visible duplicate DeepSeek chat. Structured tool calling arrived in M6 (live smoke passed first try); the user's first tool-execution acceptance attempt surfaced the three live bugs fixed in the post-M6 hotfix (ADR-024/025/026) — the acceptance step is user-run again and prepared turnkey.
 - M6 tool calling is intentionally single-shot (ADR-023): one tool call per model turn; text after a valid envelope is discarded; an invalid/truncated envelope flushes as honest plain text with NO bounded repair (re-prompting) — repair, repeated tool-result/model cycles, and persistent cross-request tool-call id mapping are all M7 scope. `tool_choice: "none"` fully disables tools; any other value with valid tools enables the envelope protocol.
-- Live multi-turn acceptance against chat.deepseek.com is NOT yet proven: `tests/test_live_upstream.py::test_live_multi_turn_threads_parent_message_id` is written (marker `live`) but has not run — the delta+parent strategy is validated offline only. If upstream rejects parent threading, the rebuild path (fresh session + full-history prompt) remains correct and is the documented fallback.
+- Live multi-turn acceptance against chat.deepseek.com: the delta+parent strategy is NOW live-verified (post-M6 hotfix ADR-025 — upstream requires `parent_message_id` as a u32 number; after the fix, tool-history turn 2 succeeds on the session-reuse path). The formal pytest live test `tests/test_live_upstream.py::test_live_multi_turn_threads_parent_message_id` has still never run (marker `live`); the probe covered the same behavior. If upstream ever rejects parent threading again, the rebuild path (fresh session + full-history prompt) remains correct and is the documented fallback.
+- Qwen Code agent turns carry ~69 tools; the `[available tools]` block is compacted to fit the upstream prompt budget (ADR-024: first-line descriptions capped at 150 chars, schema `description` keys stripped). The total prompt for a full agent turn is still ~85KB (dominated by the client's own history) — if DeepSeek Web's prompt budget shrinks or history grows, history-side budgeting becomes necessary (not before).
 - Conversation state is in-memory only (bounded 256, least-recently-updated eviction) and dies with the process; continuity self-heals because every request carries its own history. SQLite persistence deferred (ADR-020).
 - Live error paths (429/5xx/Cloudflare) were not triggered during probing; classification is unit-tested offline only.
 - Upstream deepseek4free is dormant since 2025-02-09; its stream parser was fully obsolete (protocol changed). Further drift is possible at any time; probe captures are the early-warning mechanism.
@@ -82,7 +99,7 @@ round trip works live. Script deleted after use (established pattern).
 
 ## Next action
 
-M6 is complete and live-verified on the gateway side. Remaining M6 acceptance is user-run: start the gateway (`python -m app.main`, `.env` configured) and give real Qwen Code one task that needs a single tool — the gateway emits the structured call, Qwen Code executes it and sends the result back, the gateway compiles it and answers (docs/QWEN_CODE_INTEGRATION.md, "M6 acceptance"). After that, if the user approves, start M7 (multi-turn tool loop: persistent tool-call id mapping, repeated cycles, bounded repair, history validation). Do not start M7 without explicit instruction.
+M6 is complete and live-verified on the gateway side, including the three post-M6 hotfix bugs the user's acceptance attempt surfaced (ADR-024/025/026). Remaining M6 acceptance is user-run AGAIN: restart the gateway (`python -m app.main`, `.env` configured) and give real Qwen Code one task that needs a single tool — the gateway emits the structured call, Qwen Code executes it and sends the result back, the gateway compiles it and answers (docs/QWEN_CODE_INTEGRATION.md, "M6 acceptance"). Turn 2 no longer creates a duplicate DeepSeek chat and no longer stalls. After that, if the user approves, start M7 (multi-turn tool loop: persistent tool-call id mapping, repeated cycles, bounded repair, history validation). Do not start M7 without explicit instruction.
 
 ---
 
@@ -100,6 +117,7 @@ M6 is complete and live-verified on the gateway side. Remaining M6 acceptance is
 - Flipped M5-era tests: the fixtured tool-history turn now compiles and streams 200 with correct `[assistant tool call]`/`[tool result]` blocks and `[available tools]` instructions appended (was pinned 400 as the M6 target); tools-with-plain-answer stays plain text; diagnostics capture test updated for exclude_none null-content omission.
 - Docs synchronized: ADR-023, API_CONTRACT.md (tools/tool_choice, tool-history acceptance, streaming tool-call chunks, tool-call response example), QWEN_CODE_INTEGRATION.md capability table + M6 acceptance checklist, fixture README status line, this file.
 - LIVE SMOKE PASSED (real DeepSeek backend via `.env`, same day): streaming turn 1 with two declared tools followed the envelope FIRST TRY — `finish_reason: tool_calls`, `call_dsqg_57e118c6d48147efb02ad96d72b37f72`, `list_project_files`, `{"path":"."}`, zero content chars; the non-stream round trip with that exact tool history answered `README.md` with `finish_reason: stop`. Script deleted after use (established pattern). Remaining M6 acceptance is user-run: real Qwen Code executes one structured tool call.
+- Post-M6 hotfix addendum (user acceptance attempt, fixed next session): the user's first real Qwen Code tool-execution run stalled and produced a duplicate DeepSeek chat; forensics on the diagnostics capture (records 9–15) + offline replay + live wire probes found and fixed THREE bugs, each with an ADR and live re-verification. (1) ADR-024: the 69-tool `[available tools]` block inflated the prompt to 165KB and stalled DeepSeek Web >6 min — `build_tool_instructions` now compacts (first-line descriptions ≤150 chars, schema `description` keys stripped; validation untouched) → 25,727 instruction chars (−76%), live first token 2.6 s. (2) ADR-025: DeepSeek Web 422s a string `parent_message_id` (requires u32) — every session-reuse delta turn failed fast and the client's retry rebuilt a fresh session (the duplicate chat); the adapter now converts numeric ids to int at the backend boundary → turn 2 succeeds on the reuse path live (first live verification of the M4 delta strategy). (3) ADR-026: the wire adapter dropped the first streamed chunk when upstream placed it inside the initial `{"v":{"response":{...}}}` snapshot — the snapshot branch now emits `content`/`thinking_content`. Files: app/tools.py, app/backends/deepseek_web/backend.py, app/backends/deepseek_web/wire.py; tests: test_m6_tools.py (+6), test_backend_offline.py (+3), test_wire.py (+3); docs: DECISIONS.md (ADR-024/025/026), API_CONTRACT.md note, this file. Suite 370 → 382 passed, 3 deselected.
 
 ### Files changed
 

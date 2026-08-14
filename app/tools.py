@@ -182,6 +182,15 @@ def build_tool_instructions(
     reuse). ``required`` reflects ``tool_choice: 'required'`` — Qwen
     Code's only other value, ``'none'``, disables tools entirely upstream
     of this function (ADR-023).
+
+    Rendering is COMPACTED for the upstream prompt budget (ADR-024): a
+    real Qwen Code agent turn can carry ~70 tools whose full descriptions
+    and schema prose inflate the block to 100 KB+ — a prompt DeepSeek Web
+    stalls on (live evidence). Each description is reduced to its first
+    non-empty line capped at a fixed length, and ``description`` keys are
+    stripped from the rendered schema (types/required/enum are kept).
+    Validation is unaffected: the envelope parser still checks arguments
+    against the FULL un-compacted schema.
     """
     lines: list[str] = ["[available tools]"]
     if required:
@@ -199,13 +208,16 @@ def build_tool_instructions(
     lines.append("Available tools:")
     lines.append("")
     for tool in tools:
-        if tool.description:
-            lines.append(f"- {tool.name}: {tool.description}")
+        description = _compact_description(tool.description)
+        if description:
+            lines.append(f"- {tool.name}: {description}")
         else:
             lines.append(f"- {tool.name}")
         if tool.schema is not None:
             schema_json = json.dumps(
-                tool.schema, ensure_ascii=False, separators=(",", ":")
+                _strip_schema_descriptions(tool.schema),
+                ensure_ascii=False,
+                separators=(",", ":"),
             )
             lines.append(f"  parameters: {schema_json}")
     lines.append("")
@@ -232,3 +244,44 @@ def build_tool_instructions(
         "- If no tool is needed, answer normally without any envelope."
     )
     return "\n".join(lines)
+
+
+#: First-line description cap for the rendered instruction block
+#: (ADR-024). Long enough to keep the tool-selection signal for Qwen
+#: Code's verbose tool descriptions, short enough to keep a 70-tool block
+#: within the upstream prompt budget.
+_DESCRIPTION_MAX_CHARS = 150
+
+
+def _compact_description(description: str) -> str:
+    """First non-empty line of a tool description, length-capped."""
+    for line in description.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if len(stripped) > _DESCRIPTION_MAX_CHARS:
+            return stripped[: _DESCRIPTION_MAX_CHARS - 1].rstrip() + "\u2026"
+        return stripped
+    return ""
+
+
+def _strip_schema_descriptions(schema: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy a JSON schema without its ``description`` members.
+
+    Keeps every validation-relevant member (type/properties/required/
+    items/enum/default/...) — the rendered block only loses prose
+    (ADR-024). Non-dict/list values pass through unchanged.
+    """
+
+    def _clean(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: _clean(item)
+                for key, item in value.items()
+                if key != "description"
+            }
+        if isinstance(value, list):
+            return [_clean(item) for item in value]
+        return value
+
+    return _clean(schema)

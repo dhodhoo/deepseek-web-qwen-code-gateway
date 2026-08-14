@@ -282,6 +282,46 @@ Keep historical decisions. Mark superseded entries instead of deleting them.
 
 **Alternatives considered:** native-style function calling via a separate model or proxy (rejected — the whole point is the Web backend); parsing the envelope out of compiled history too (rejected — turns tool results and user quotes into an injection vector, violating the protocol's data/tool-decision boundary); silently dropping invalid envelopes (rejected — honest plain text preserves the "never silently pretend" rule and keeps failures debuggable); emitting `tool_calls` with best-effort arguments despite schema mismatch (rejected — fabricated calls send Qwen Code into loops the gateway cannot serve); a union route annotation `ChatCompletionResponse | JSONResponse` (rejected — breaks FastAPI route registration; the route returns `JSONResponse` instances, which FastAPI passes through untouched, with the annotation staying `ChatCompletionResponse`).
 
+## ADR-024 — Compacted tool instruction block for the upstream prompt budget (post-M6 hotfix)
+
+**Status:** Accepted (live-verified against DeepSeek Web)
+
+**Context:** The first real Qwen Code agent turn through the gateway stalled for over six minutes until the user interrupted it. Diagnostics capture + offline replay proved why: Qwen Code's harness ships ~69 tools, and `build_tool_instructions` rendered them VERBATIM — full multi-paragraph descriptions (62,375 chars) plus full JSON schemas including every property description (40,610 chars) — inflating the `[available tools]` block to 106,333 chars and the compiled prompt to 165,262 chars. DeepSeek Web handled the ~59KB history-only part in seconds (M5 live evidence) but stalled on the 165KB total; Qwen Code timed out (~6 min) and auto-retried. The gateway pipeline itself was proven clean: replaying the captured request through the real app with a FakeBackend returned 200 + `[DONE]` in 0.112 s.
+
+**Decision:** `build_tool_instructions` renders a COMPACTED block (app/tools.py):
+
+1. **Descriptions reduce to the first non-empty line, capped at 150 chars** (`_DESCRIPTION_MAX_CHARS`) with a trailing ellipsis when truncated. The first line of Qwen Code's tool descriptions carries the selection signal; the remaining paragraphs are usage prose the model does not need to pick and call a tool.
+2. **`description` keys are stripped from rendered schemas at every nesting depth** (`_strip_schema_descriptions`, a deep copy — the caller's schema object is never mutated). Every validation-relevant member survives: type / properties / required / items / enum / default.
+3. **Validation is unchanged.** The envelope parser still checks emitted arguments against the FULL un-compacted schema from `normalize_tools`; compaction only affects what the upstream model sees, never what the gateway accepts.
+
+**Consequences:** The same captured 69-tool turn now compiles to 25,727 instruction chars (−76%) and 84,656 total prompt chars (−49%). Live verification against the real backend: first token in 2.6 s (previously >6 min stall), coherent answer. The envelope protocol still works live after compaction (probe turn finished `tool_calls` with correct name + arguments). Suite 376 passed at this step. Trade-off accepted: the model sees less prose per tool; if tool selection quality ever degrades, the cap is one constant and the stripping is one function — both trivially tunable without wire changes.
+
+**Alternatives considered:** truncating the tool LIST (rejected — Qwen Code expects every declared tool to be callable; hiding tools invites unknown-name envelopes); aggressive schema stripping beyond descriptions (rejected — enum/default/items are selection signals too, and the description keys alone accounted for the bulk); moving tool descriptions to a retrieval step (rejected — out of scope, adds latency and a new failure mode for a problem a rendering rule solves); doing nothing and hoping DeepSeek catches up (rejected — the user-visible symptom is a >6-minute hang).
+
+## ADR-025 — Serialize `parent_message_id` as an upstream number (post-M6 hotfix)
+
+**Status:** Accepted (live-verified against DeepSeek Web)
+
+**Context:** The same user session also showed a NEW DeepSeek chat appearing with the full prompt re-sent after turn 1. Forensics: capture records showed the turn-2 request failing within ~1 s and the client re-sending a byte-identical body; the retry took the M4 rebuild path (fresh backend session + full history) — by design self-heal, but triggered every time. A wire-level live probe reproduced the first-attempt failure and captured the upstream 422 body: `Failed to deserialize the JSON body into the target type: parent_message_id: invalid type: string "2", expected u32`. DeepSeek Web requires `parent_message_id` as a JSON NUMBER; the vendored client serializes whatever it is given, and the gateway's conversation store holds ids as strings — so EVERY session-reuse delta turn 422'd and the M4 delta strategy (ADR-020) never actually worked live until now.
+
+**Decision:** `DeepSeekWebBackend.stream_turn` converts a numeric-string `parent_message_id` to `int` at the adapter boundary before calling the vendored client (`str.isdigit()` guard; non-numeric strings and None pass through unchanged). The stable `LLMBackend` interface, the conversation store, and all canonical state keep their string representation — the conversion is an upstream wire-format concern and lives exactly where upstream-specific concerns belong (the backend adapter, per AGENTS.md). The vendored code is untouched.
+
+**Consequences:** Live verification: turn 2 with tool history now succeeds ON THE REUSE PATH (1.1–1.5 s, finish `stop`, context-aware answer "README.md") — no rebuild, no duplicate chat in the user's DeepSeek account. The earlier 422 body is preserved as a code comment at the conversion site. Suite 379 passed at this step. The M4 delta+parent strategy is now live-verified for the first time; the duplicate-session symptom the user reported is explained end-to-end (client retry after 422 → rebuild path → new visible chat + full prompt).
+
+**Alternatives considered:** patching the vendored client's `json_data` construction (rejected — vendor churn; the adapter boundary exists precisely for this); storing ids as ints in the conversation store (rejected — leaks an upstream serialization detail into stable, backend-agnostic state; other backends may have non-numeric ids); dropping `parent_message_id` and always rebuilding (rejected — the rebuild path compiles the FULL history every turn: that is exactly the prompt-size regression ADR-024 fights, and it creates a new DeepSeek chat per turn).
+
+## ADR-026 — Emit the initial snapshot's content in the wire adapter (post-M6 hotfix)
+
+**Status:** Accepted (live-verified against DeepSeek Web)
+
+**Context:** The delta-turn probe answers were missing their first tokens ("README.md" arrived as ".md" once, "The first file…" as " first file…"). Raw upstream capture showed why: DeepSeek Web's initial `{"v": {"response": {...}}}` snapshot event can already carry generated text (`"content": "The"`, status WIP) BEFORE any `response/content` APPEND op. The adapter (wire.py) extracted only `message_id` from that snapshot and discarded the content — silently dropping the first chunk of every affected answer.
+
+**Decision:** The snapshot branch of `WireSession.adapt` now emits non-empty `content` (type `text`) — or `thinking_content` (type `thinking`) when content is empty — as part of the snapshot chunk, alongside the `response_message_id`. `content` wins when both are present (the one-chunk-per-line contract cannot carry both). Empty snapshots behave exactly as before.
+
+**Consequences:** Live re-verification: the delta turn's answer arrives complete ("README.md", 9/9 chars). The M0 protocol notes in wire.py's docstring record the snapshot-content fact. Suite 382 passed. The bug had been invisible to all offline fixtures (the M0 live captures happened to start with empty snapshots) — which is why the fix ships with synthetic snapshot-content tests in tests/test_wire.py.
+
+**Alternatives considered:** buffering the snapshot and merging it with the first APPEND (rejected — adds state and latency for a case the chunk contract already handles); treating snapshot content as authoritative and ignoring APPENDs (rejected — APPENDs carry the rest of the stream).
+
 # Template
 
 ## ADR-XXX — Title

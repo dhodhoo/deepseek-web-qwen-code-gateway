@@ -134,6 +134,21 @@ class DeepSeekWebBackend(LLMBackend):
         """
         api = self._api
 
+        # Wire-format fix (live-verified post-M6): DeepSeek Web's
+        # /chat/completion deserializes ``parent_message_id`` as a JSON
+        # NUMBER (u32) and rejects the string the vendored client would
+        # otherwise serialize — "invalid type: string ..., expected u32",
+        # HTTP 422 — which silently broke EVERY session-reuse delta turn
+        # (ADR-020/M4) and forced the rebuild path on each retry. Numeric
+        # ids are converted here at the adapter boundary; the stable
+        # LLMBackend interface and the conversation store keep their
+        # string representation.
+        upstream_parent: str | int | None
+        if isinstance(parent_message_id, str) and parent_message_id.isdigit():
+            upstream_parent = int(parent_message_id)
+        else:
+            upstream_parent = parent_message_id
+
         # Protocol seam: the vendored _parse_chunk implements the *legacy*
         # (pre-2026) wire format, which DeepSeek Web no longer serves. M0
         # live probing verified the current protocol; we replace the parser
@@ -157,7 +172,7 @@ class DeepSeekWebBackend(LLMBackend):
                 chunks = api.chat_completion(
                     session_id,
                     prompt,
-                    parent_message_id=parent_message_id,
+                    parent_message_id=upstream_parent,
                     thinking_enabled=thinking_enabled,
                     search_enabled=search_enabled,
                 )

@@ -99,6 +99,51 @@ class TestBackendOffline:
         assert sink == list(raw_lines)
         assert "_parse_chunk" not in backend._api.__dict__
 
+    def test_numeric_parent_message_id_is_sent_upstream_as_int(
+        self, backend: DeepSeekWebBackend
+    ) -> None:
+        # DeepSeek Web deserializes parent_message_id as u32 and 422s the
+        # string form (live evidence) — the adapter must convert.
+        captured: dict = {}
+
+        def fake_chat_completion(*args, **kwargs):
+            captured.update(kwargs)
+            yield {"content": "ok", "type": "text", "finish_reason": "stop"}
+
+        backend._api.chat_completion = fake_chat_completion  # type: ignore[method-assign]
+        events = list(
+            backend.stream_turn("sess-1", "hi", parent_message_id="42")
+        )
+        assert events == [TextDelta("ok"), MessageFinished("stop")]
+        assert captured["parent_message_id"] == 42
+        assert isinstance(captured["parent_message_id"], int)
+
+    def test_non_numeric_parent_message_id_passes_through(
+        self, backend: DeepSeekWebBackend
+    ) -> None:
+        captured: dict = {}
+
+        def fake_chat_completion(*args, **kwargs):
+            captured.update(kwargs)
+            yield {"content": "ok", "type": "text", "finish_reason": "stop"}
+
+        backend._api.chat_completion = fake_chat_completion  # type: ignore[method-assign]
+        list(backend.stream_turn("sess-1", "hi", parent_message_id="abc-1"))
+        assert captured["parent_message_id"] == "abc-1"
+
+    def test_absent_parent_message_id_stays_none(
+        self, backend: DeepSeekWebBackend
+    ) -> None:
+        captured: dict = {}
+
+        def fake_chat_completion(*args, **kwargs):
+            captured.update(kwargs)
+            yield {"content": "ok", "type": "text", "finish_reason": "stop"}
+
+        backend._api.chat_completion = fake_chat_completion  # type: ignore[method-assign]
+        list(backend.stream_turn("sess-1", "hi"))
+        assert captured["parent_message_id"] is None
+
     def test_upstream_rate_limit_mapped(self, backend: DeepSeekWebBackend) -> None:
         def fake_chat_completion(*args, **kwargs):
             raise RateLimitError("API rate limit exceeded")

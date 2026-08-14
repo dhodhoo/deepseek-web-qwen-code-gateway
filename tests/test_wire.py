@@ -56,6 +56,38 @@ class TestAdaptRawLineSynthetic:
         assert chunk["response_message_id"] == "resp-1"
         assert chunk["content"] == ""
 
+    def test_snapshot_with_content_emits_the_first_text_chunk(self) -> None:
+        # Live evidence (post-M6): upstream can place the first generated
+        # tokens in the initial snapshot, before any APPEND op.
+        chunk = adapt_raw_line(
+            b'data: {"v": {"response": {"message_id": 4, "parent_id": 3, '
+            b'"role": "ASSISTANT", "status": "WIP", "content": "The"}}}'
+        )
+        assert chunk is not None
+        assert chunk["response_message_id"] == "4"
+        assert chunk["content"] == "The"
+        assert chunk["type"] == "text"
+        events = chunk_dict_to_events(chunk)
+        assert events == [BackendMessageId("4"), TextDelta("The")]
+
+    def test_snapshot_with_thinking_only_emits_thinking_chunk(self) -> None:
+        chunk = adapt_raw_line(
+            b'data: {"v": {"response": {"message_id": "m", "status": "WIP", '
+            b'"content": "", "thinking_content": "hmm"}}}'
+        )
+        assert chunk is not None
+        assert chunk["content"] == "hmm"
+        assert chunk["type"] == "thinking"
+
+    def test_snapshot_content_wins_over_thinking(self) -> None:
+        chunk = adapt_raw_line(
+            b'data: {"v": {"response": {"message_id": "m", "status": "WIP", '
+            b'"content": "answer", "thinking_content": "hmm"}}}'
+        )
+        assert chunk is not None
+        assert chunk["content"] == "answer"
+        assert chunk["type"] == "text"
+
     def test_content_append_becomes_text_delta(self) -> None:
         chunk = adapt_raw_line(
             b'data: {"p": "response/content", "o": "APPEND", "v": "Hello"}'

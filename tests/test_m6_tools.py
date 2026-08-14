@@ -246,3 +246,89 @@ class TestBuildToolInstructions:
     def test_deterministic(self) -> None:
         tools = [CanonicalTool("a", "x", None), CanonicalTool("b", "y", None)]
         assert build_tool_instructions(tools) == build_tool_instructions(tools)
+
+    def test_multiline_description_compacts_to_first_nonempty_line(self) -> None:
+        description = "\n  First line of the tool.\nSecond line.\nThird line."
+        text = build_tool_instructions([CanonicalTool("t", description, None)])
+        assert "- t: First line of the tool." in text
+        assert "Second line." not in text
+        assert "Third line." not in text
+
+    def test_long_first_line_is_capped_with_ellipsis(self) -> None:
+        text = build_tool_instructions(
+            [CanonicalTool("t", "x" * 200, None)]
+        )
+        compacted = next(
+            line[len("- t: ") :]
+            for line in text.splitlines()
+            if line.startswith("- t: ")
+        )
+        assert compacted == "x" * 149 + "\u2026"
+        assert len(compacted) == 150
+
+    def test_whitespace_only_description_renders_name_only(self) -> None:
+        text = build_tool_instructions(
+            [CanonicalTool("ws", "   \n  \n", None)]
+        )
+        assert "\n- ws\n" in text
+
+    def test_schema_descriptions_are_stripped_at_every_depth(self) -> None:
+        schema = {
+            "type": "object",
+            "description": "Top-level prose.",
+            "properties": {
+                "path": {"type": "string", "description": "Nested prose."},
+                "mode": {
+                    "type": "string",
+                    "enum": ["a", "b"],
+                    "description": "More prose.",
+                },
+            },
+            "required": ["path"],
+        }
+        text = build_tool_instructions([CanonicalTool("t", "d", schema)])
+        stripped = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "mode": {"type": "string", "enum": ["a", "b"]},
+            },
+            "required": ["path"],
+        }
+        assert (
+            "  parameters: "
+            + json.dumps(stripped, ensure_ascii=False, separators=(",", ":"))
+            in text
+        )
+        assert "Top-level prose." not in text
+        assert "Nested prose." not in text
+
+    def test_schema_compaction_does_not_mutate_the_input(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "p"}},
+        }
+        build_tool_instructions([CanonicalTool("t", "d", schema)])
+        assert schema["properties"]["path"]["description"] == "p"
+
+    def test_validation_members_survive_compaction(self) -> None:
+        # The rendered block loses only prose; every member the envelope
+        # parser validates against (type/required/enum) must stay intact.
+        schema = {
+            "type": "object",
+            "description": "prose",
+            "properties": {
+                "file_path": {"type": "string", "description": "p"},
+            },
+            "required": ["file_path"],
+        }
+        text = build_tool_instructions([CanonicalTool("read", "d", schema)])
+        rendered = next(
+            line[len("  parameters: ") :]
+            for line in text.splitlines()
+            if line.startswith("  parameters: ")
+        )
+        parsed = json.loads(rendered)
+        assert parsed["required"] == ["file_path"]
+        assert parsed["properties"]["file_path"] == {"type": "string"}
+        assert "prose" not in rendered
