@@ -191,13 +191,30 @@ Never place a real token, cookie, account identifier, or sensitive response into
 
 ## Qwen Code current verification
 
-Docs verified 2026-08-14 against the live documentation site; source-level wire
-verification in progress (M5 will complete it with a real installation).
+Docs verified 2026-08-14 against the live documentation site.
+**Source-level wire verification completed 2026-08-14** against the public
+repository (static source inspection; a real-installation traffic capture
+still happens in M5).
 
 ### Version tested
 
-Docs current as of 2026-08-07/2026-08-12 (auth / model-providers pages). Sidebar
-references `qwen serve (v0.16-alpha)`. Installed-version checks happen in M5.
+Docs current as of 2026-08-07/2026-08-12 (auth / model-providers pages).
+Source inspected at `github.com/QwenLM/qwen-code`, branch `main`, commit
+**`a669957f`** (2026-08-14); repo version **0.21.11** (`package.json`;
+CHANGELOG 2026-08-13).
+
+### Provider implementation files (source-level)
+
+- Routing: `packages/core/src/core/contentGenerator.ts` — `AuthType.USE_OPENAI`
+  dynamically imports `./openaiContentGenerator/index.js`.
+- Implementation: `packages/core/src/core/openaiContentGenerator/` —
+  `openaiContentGenerator.ts` (facade), `pipeline.ts` (request construction +
+  stream consumption), `converter.ts` (messages/tools serialization, chunk
+  conversion), `streamingToolCallParser.ts`, `errorHandler.ts`,
+  `constants.ts`, `taggedThinkingParser.ts`, plus `provider/` sub-module
+  (`default.ts` base + per-vendor providers incl. `deepseek.ts`, selected by
+  `determineProvider()` on hostname/model).
+- User `modelProviders` config processing: `packages/core/src/providers/provider-config.ts`.
 
 ### Provider settings format
 
@@ -225,37 +242,191 @@ New since starter: custom provider ids possible via top-level `"providerProtocol
 
 Confirmed: `baseUrl` is passed to the official `openai` Node SDK, which appends resource paths — `http://127.0.0.1:8000/v1` (not `.../v1/chat/completions`). Models are unique by `id + baseUrl` within a provider.
 
+Source-level (2026-08-14): `provider/default.ts → buildClient()` passes
+`baseUrl` verbatim as `new OpenAI({ baseURL })`. The SDK is **pinned exactly**
+at `"openai": "5.11.0"` (`packages/core/package.json`, no `^`). All default
+base URLs end in `/v1`, and resource paths (`/chat/completions`,
+`/embeddings`) are appended by the SDK (SDK-internal behavior; byte-level
+UNVERIFIED outside the default-URL evidence).
+
 ### Plain request body
 
-Source-level verification pending (M5). Documented knobs that shape it: provider `generationConfig` is **impermeable** (applied atomically; top-level `model.generationConfig` is NOT inherited for provider models); `samplingParams`/`customHeaders`/`extra_body` are atomic replacements; `extra_body` is only honored for OpenAI-compatible providers.
+**Source-verified (pipeline.ts → buildRequest(), commit a669957f):**
+
+```jsonc
+{
+  "model": "<configured model id>",
+  "messages": [
+    /* serialized by converter.ts, see below */
+  ],
+  // sampling fields ONLY when defined (priority: samplingParams config >
+  // request > provider default): temperature, top_p, max_tokens, top_k,
+  // repetition_penalty, presence_penalty, frequency_penalty
+  "stream": true, // explicit; false on non-stream path
+  "stream_options": { "include_usage": true }, // streaming only
+}
+```
+
+- `stream` is ALWAYS explicit: agent turns stream (`true` + `stream_options`);
+  the separate non-stream path (`pipeline.execute()`, used by side queries
+  such as session titles) sends explicit `false` — code comment: some gateways
+  wrongly default to SSE when the field is absent.
+- `max_tokens` is ALWAYS injected by `default.ts → applyOutputTokenLimit()`
+  unless `samplingParams` is set: env `QWEN_CODE_MAX_OUTPUT_TOKENS` or a 64K
+  output ceiling; user-supplied values are honored verbatim even on unknown
+  models (can be very large). `max_completion_tokens` is never produced by
+  default (samplingParams pass-through only).
+- `extra_body` is merged into the TOP-LEVEL request body, last (wins).
+- `tools` only when non-empty; `tool_choice` only `'required'`/`'none'`
+  (see below). Headers: `User-Agent: QwenCode/<version> (<platform>; <arch>)`
+  plus user `customHeaders`.
+- `embedContent()` calls `{baseURL}/embeddings` with model HARDCODED to
+  `text-embedding-ada-002`.
+- Documented config knobs (docs level): provider `generationConfig` is
+  **impermeable** (applied atomically; top-level `model.generationConfig` is
+  NOT inherited for provider models); `samplingParams`/`customHeaders`/
+  `extra_body` are atomic replacements; `extra_body` is only honored for
+  OpenAI-compatible providers.
 
 ### tools[] body
 
-Source-level verification pending (M5).
+**Source-verified (converter.ts → convertGeminiToolsToOpenAI):**
+
+```jsonc
+{
+  "type": "function",
+  "function": {
+    "name": "<tool>",
+    "description": "<or ''>",
+    "parameters": {
+      /* JSON Schema */
+    },
+  },
+}
+```
+
+- `parameters` from MCP `parametersJsonSchema` directly, or converted Gemini
+  schemas; then `convertSchema(...)` + `relaxSchemaForFunctionCalling()`
+  (issue #7315: gateways enforcing OpenAI's structured-output contract
+  promote every property to required when `additionalProperties: false`, so
+  Qwen Code relaxes the wire schema).
+- **No `strict` flag is ever set.** `parallel_tool_calls` is never sent
+  (verified in every inspected request builder; GitHub repo-wide code search
+  unavailable without auth — UNVERIFIED outside those files). Tool
+  parallelism is executed client-side.
 
 ### tool_choice behavior
 
-Source-level verification pending (M5).
+**Source-verified:** only `'required'` (mode ANY) or `'none'` (mode NONE) —
+`'auto'` is never sent. (DashScope provider drops `'required'` while thinking
+is active; irrelevant to this gateway.)
 
 ### assistant tool_calls history
 
-Source-level verification pending (M5).
+**Source-verified (converter.ts):** assistant messages serialize as:
+`content` = concatenated text parts; **`null`** when the message is
+tool-calls-only; **`''`** when reasoning is present without text (Ollama
+compatibility). Tool calls:
+
+```jsonc
+"tool_calls": [{ "id": "<callId or 'call_<i>'>", "type": "function",
+  "function": { "name": "<normalizeMcpToolName(...)>",
+                "arguments": "<JSON.stringify(args)>" } }]
+```
+
+Thought parts serialize to `reasoning_content` (also mirrored to a
+`reasoning` field for qwen3 models via default.ts). Post-processing
+`mergeConsecutiveAssistantMessages` + `cleanOrphanedToolCalls` run by
+default.
 
 ### role=tool result shape
 
-Source-level verification pending (M5).
+**Source-verified:** `{ "role": "tool", "tool_call_id": "<response.id or ''>",
+"content": [...] }` — content defaults to an ARRAY of text parts; a plain
+string when `toolResultContentFormat: 'string'`; empty result → `content: ''`.
+`splitToolMedia` (default true) moves media out of tool messages into a
+follow-up user message ("OpenAI spec only permits string/text-part content on
+tool messages").
 
 ### Streaming tool-call expectations
 
-Source-level verification pending (M5).
+**Source-verified (pipeline.ts, streamingToolCallParser.ts):**
+
+- SSE parsing is done by the openai SDK; there is NO explicit `[DONE]`
+  handling in application code (SDK behavior; UNVERIFIED at SDK level).
+- `delta.content` → text part; `delta.reasoning_content` (or
+  `delta.reasoning`) → thought part; if empty, tagged `<think>` parsing
+  (TaggedThinkingParser) is used as leak fallback.
+- `delta.tool_calls` → `StreamingToolCallParser.addChunk(index, argsFragment,
+id, name)`, keyed by `index`: the opener chunk carries `id`+`name`
+  (arguments may be `""`); subsequent fragments on the same index continue
+  with or without repeated ids. Arguments are parsed with `JSON.parse` plus
+  brace/bracket/string depth tracking and orphan-closing-brace repair;
+  duplicate ids across indices are detected and remapped. Missing ids fall
+  back to `call_<index>`.
+- Stream end: SDK iterator completion (after `[DONE]`). The pipeline defers
+  yielding the finish chunk to merge it with a trailing usage chunk
+  (requested via `stream_options: {include_usage: true}`) and flushes a
+  pending finish chunk at stream end if usage never arrives — **a missing
+  usage chunk is tolerated**. Duplicate finish chunks are tolerated
+  (OpenRouter-style providers).
+- `finish_reason === 'error_finish'` → `StreamContentError`. A streaming
+  response with non-SSE content-type (e.g. an HTML 200 page) →
+  `NonSSEResponseError`.
 
 ### Finish-reason expectations
 
-Source-level verification pending (M5).
+**Source-verified (converter.ts → mapFinishReason):** `stop`→STOP;
+`length`→MAX_TOKENS; `content_filter`→SAFETY; `function_call`/`tool_calls`→
+STOP; null/undefined/unknown→UNSPECIFIED (tolerated). Tool execution is
+decided from functionCall parts, NOT from finish_reason. Override: when
+`usage.completion_tokens` passes a threshold while a tool call is incomplete,
+the converter forces MAX_TOKENS ("tool call JSON is likely truncated" →
+repair flow).
+
+### Error/retry behavior
+
+**Source-verified (constants.ts, pipeline.ts, geminiChat.ts, utils/retry.ts):**
+
+- SDK level: `maxRetries = 3`, `timeout = 120000 ms` defaults passed to
+  `new OpenAI({...})` (`timeout: 0` disables). The SDK's own 408/409/429/5xx
+  retries are SDK behavior (UNVERIFIED in-repo).
+- Stream guards: idle-without-chunk 240 s (`QWEN_STREAM_IDLE_TIMEOUT_MS`) and
+  lifetime cap 900 s (`QWEN_STREAM_MAX_LIFETIME_MS`) → retryable `ETIMEDOUT`.
+- App level (`retryWithBackoff` predicate): 429 retried; 5xx retried;
+  **400 NEVER retried** (single exception: a 400 demanding
+  `enable_thinking ... must be true` rebuilds the request once without the
+  thinking-disable field); exponential backoff 1.5 s → 30 s (×2), honors
+  `Retry-After` on 429/503; unattended/persistent mode retries 429/529
+  indefinitely with a 5-minute backoff cap.
+- Mid-stream transport retries for `ECONNRESET`/`ETIMEDOUT`/`UND_ERR_*`:
+  up to 2 full replays when nothing was delivered yet, else up to 3
+  "continuation" retries (model asked to continue truncated output).
+- Retry amplification: SDK(3) × app backoff × transport replay — a 429/5xx
+  can produce many repeat requests; the gateway's own retries (M9) must stay
+  bounded to avoid compounding.
+- Errors must arrive as HTTP status codes for correct classification; an
+  error delivered as a 200 SSE chunk is only recognized via
+  `finish_reason: 'error_finish'`.
 
 ### Extra fields/extensions
 
 Documented: `reasoning` handling on OpenAI-compatible paths (honored unless `samplingParams` set; `samplingParams.reasoning_effort`/`extra_body` sent verbatim; DeepSeek-specific rewrites apply only to `api.deepseek.com`, not self-hosted endpoints). `customHeaders` supported per provider entry.
+
+Source-verified (2026-08-14): depending on config/model/provider, NON-STANDARD
+fields may appear in request bodies: `reasoning` (top-level `{effort,
+budget_tokens}`), `reasoning_effort`, `enable_thinking`, `thinking_budget`,
+`thinking: {"type": "disabled"}` (emitted when reasoning is disabled, gated
+to DeepSeek hostnames — V4+ comment), `chat_template_kwargs:
+{enable_thinking: false}` (qwen-family models on non-DashScope providers),
+`preserve_thinking`, `metadata`, `cache_control`, `vl_high_resolution_images`.
+**The gateway must tolerate and ignore unknown request-body fields** (no
+strict body validation). The built-in DeepSeek provider (`provider/deepseek.
+ts`, active only for hostname `api.deepseek.com` or deepseek-named models)
+flattens content arrays to plain strings, defaults `temperature: 0`, and maps
+reasoning effort → top-level `reasoning_effort`; none of those hostname-gated
+paths apply to this gateway (127.0.0.1), which is served by the default
+provider path.
 
 ### Qwen Code deviations from starter assumptions
 
@@ -263,3 +434,9 @@ Documented: `reasoning` handling on OpenAI-compatible paths (honored unless `sam
 2. `generationConfig` semantics are stricter than the starter sample implied (impermeable, atomic fields) — the gateway-facing Qwen Code config doc in `QWEN_CODE_INTEGRATION.md` must keep the whole generation config inside the provider entry.
 3. Qwen OAuth free tier discontinued 2026-04-15 — irrelevant to the gateway but confirms API-key/OpenAI-compatible is the supported path.
 4. QWEN.md memory behavior confirmed: root `QWEN.md`, `.qwen/QWEN.local.md`, `~/.qwen/QWEN.md`, and `AGENTS.md` (if present) are all loaded; `/memory` lists them. Starter layout is compatible.
+5. `stream` is always sent explicitly (`true` + `stream_options:{include_usage:true}` on agent turns; explicit `false` on side queries) — the gateway must not default to SSE when the field is absent (their code comment explicitly warns about gateways that do).
+6. `tool_choice` is only ever `'required'` or `'none'` — never `'auto'`; no `parallel_tool_calls`; no `strict` tool schemas. The tool emulator (M6+) must not rely on any of these.
+7. `max_tokens` is always present and may exceed backend limits (user values honored verbatim) — the gateway should clamp silently and document it, rather than reject.
+8. The client is highly tolerant of wire quirks (missing/null `finish_reason`, duplicate finish chunks, `content: null` on tool-only assistant messages, missing tool*call ids with `call*<index>` fallback) — emitting standard OpenAI shapes is safe.
+9. `embedContent()` hardcodes model `text-embedding-ada-002` against `{baseURL}/embeddings` — if embeddings are ever exercised, the gateway must alias that model or fail clearly (out of core milestones).
+10. openai Node SDK is pinned exactly at `5.11.0` — wire expectations are stable per that SDK version.
