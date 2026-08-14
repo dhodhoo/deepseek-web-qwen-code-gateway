@@ -12,7 +12,7 @@ Primary prefix:
 
 ## Implementation status
 
-Last synchronized: M6 + post-M6 hotfix (ADR-024..026). See also docs/PROGRESS.md and docs/DECISIONS.md (ADR-017..026).
+Last synchronized: M6 + post-M6 hotfix (ADR-024..027). See also docs/PROGRESS.md and docs/DECISIONS.md (ADR-017..027).
 
 - `GET /health` — implemented (M2). Unauthenticated by design; exposes no secrets.
 - `GET /v1/models` — implemented (M2). One gateway alias (`GATEWAY_MODEL_ID`, default `deepseek-web`).
@@ -26,6 +26,7 @@ Last synchronized: M6 + post-M6 hotfix (ADR-024..026). See also docs/PROGRESS.md
 - Authentication (M2): `Authorization: Bearer <DEEPSEEK_GATEWAY_API_KEY>` on `/v1/*`. Secure-by-default: unconfigured key → `503 GATEWAY_API_KEY_NOT_CONFIGURED` unless `GATEWAY_ALLOW_NO_AUTH=1` (ADR-017).
 - Error envelope (M2): `{"error": {"message", "type", "code"}}`; `BackendFailure` categories map per the suggested HTTP table with `code` = category value (`app/error_mapping.py`).
 - Conversation continuity (M4, ADR-020): resolved from the request's own message history — no conversation header exists or is required. A request whose history STRICTLY extends a stored canonical history continues that conversation: the gateway reuses the backend session, sends only the new trailing messages upstream, and threads `parent_message_id` (serialized to DeepSeek Web as the numeric u32 it requires, ADR-025 — live-verified). New, divergent, or duplicate (equal-history) requests start a fresh conversation compiled from the request's full history. Canonical history advances only when a turn completes; failures invalidate the backend link and the next request rebuilds from canonical state. State is in-memory only (bounded; lost on restart — continuity self-heals because requests carry their own history).
+- Backend call serialization (ADR-027): the DeepSeek Web backend is single-flight — concurrent `/v1/chat/completions` requests are queued at the backend boundary (the vendored client's shared wasmtime PoW solver and parser seam are not thread-safe; racing them crashed the process). Clients see normal responses, just serialized latency.
 - Streaming tool-call chunks: implemented (M6, ADR-023) — see "Tool calls in streaming mode" below. Responses serialize with null fields omitted (`exclude_none`), so plain responses keep the exact M2 shape and tool-call responses omit a null `content`.
 - Qwen Code wire format (M5, ADR-021): the exact current agent request/history format is documented in docs/UPSTREAM_NOTES.md (source verification, Qwen Code v0.21.11) and covered by fixtures in `tests/fixtures/qwen_code_wire/` plus tests (`test_m5_wire_fixtures.py`, SDK-driven `test_m5_sdk_compat.py`). Wiring steps: docs/QWEN_CODE_INTEGRATION.md.
 - Diagnostic capture (M5, ADR-021): opt-in via `GATEWAY_DIAGNOSTICS_DIR`; appends one sanitized record per authenticated `/v1/chat/completions` request (before validation) to `<dir>/requests.jsonl`. The Authorization header VALUE is never written; request bodies are (that is the purpose of the layer). Disabled by default (app/diagnostics.py).

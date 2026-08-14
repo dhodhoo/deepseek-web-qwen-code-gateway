@@ -144,6 +144,88 @@ class TestBackendOffline:
         list(backend.stream_turn("sess-1", "hi"))
         assert captured["parent_message_id"] is None
 
+    def test_concurrent_turns_are_serialized_by_the_call_gate(
+        self, backend: DeepSeekWebBackend
+    ) -> None:
+        # The vendored client shares one wasmtime PoW solver and one
+        # parser-seam attribute across requests (ADR-027); concurrent
+        # turns must NEVER overlap inside chat_completion.
+        import threading
+        import time
+
+        active = 0
+        max_active = 0
+        bookkeeping = threading.Lock()
+
+        def fake_chat_completion(*args, **kwargs):
+            nonlocal active, max_active
+            with bookkeeping:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            yield {"content": "ok", "type": "text", "finish_reason": "stop"}
+            with bookkeeping:
+                active -= 1
+
+        backend._api.chat_completion = fake_chat_completion  # type: ignore[method-assign]
+
+        results: list = []
+        errors: list = []
+
+        def consume():
+            try:
+                events = list(backend.stream_turn("sess-1", "hi"))
+                results.append(events)
+            except Exception as exc:  # noqa: BLE001 - test helper
+                errors.append(exc)
+
+        threads = [threading.Thread(target=consume) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not errors
+        assert len(results) == 3
+        assert all(r == [TextDelta("ok"), MessageFinished("stop")] for r in results)
+        assert max_active == 1
+        assert active == 0
+
+    def test_call_gate_releases_when_the_stream_is_closed_early(
+        self, backend: DeepSeekWebBackend
+    ) -> None:
+        # A client disconnect closes the generator mid-stream from another
+        # thread; the gate must still be released for the next turn.
+        import threading
+
+        def endless_chat_completion(*args, **kwargs):
+            while True:
+                yield {"content": "x", "type": "text", "finish_reason": None}
+
+        backend._api.chat_completion = endless_chat_completion  # type: ignore[method-assign]
+
+        stream = backend.stream_turn("sess-1", "hi")
+        assert next(stream) == TextDelta("x")
+        closed = threading.Thread(target=stream.close)
+        closed.start()
+        closed.join(timeout=5)
+        assert not closed.is_alive()
+
+        def one_shot(*args, **kwargs):
+            yield {"content": "ok", "type": "text", "finish_reason": "stop"}
+
+        backend._api.chat_completion = one_shot  # type: ignore[method-assign]
+        done: list = []
+
+        def consume_next():
+            done.extend(backend.stream_turn("sess-1", "hi"))
+
+        waiter = threading.Thread(target=consume_next)
+        waiter.start()
+        waiter.join(timeout=5)
+        assert not waiter.is_alive(), "call gate was not released after close"
+        assert done == [TextDelta("ok"), MessageFinished("stop")]
+
     def test_upstream_rate_limit_mapped(self, backend: DeepSeekWebBackend) -> None:
         def fake_chat_completion(*args, **kwargs):
             raise RateLimitError("API rate limit exceeded")
