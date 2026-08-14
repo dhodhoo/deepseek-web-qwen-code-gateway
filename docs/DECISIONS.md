@@ -187,6 +187,25 @@ Keep historical decisions. Mark superseded entries instead of deleting them.
 
 **Alternatives considered:** silently returning empty `tool_calls`/stream responses (rejected — would corrupt client state invisibly); strict request validation (rejected — the verified client sends non-standard fields); holding one long-lived backend session in the server (rejected — belongs to M4 canonical state, not the M2 adapter).
 
+## ADR-019 — M3 streaming surface: single translator, primed HTTP-status errors, honest mid-stream failure
+
+**Status:** Accepted
+
+**Context:** M3's exit criterion is "incremental normal text works and raw DeepSeek SSE never leaks". ADR-011/014 deferred the `BackendError`-event-vs-exception question to this milestone ("re-decided at M3 async streaming"). Qwen source verification fixed the client-side expectations: explicit `stream:true` + `stream_options.include_usage` on agent turns, chunk accumulation by standard OpenAI rules, retries keyed off HTTP status (400 never retried; 429/5xx retried), missing usage chunk tolerated.
+
+**Decision:**
+
+1. `app/streaming.py` is the ONLY translator between normalized events and the public SSE wire. Rendering rules: `MessageStarted` → role chunk `{"role":"assistant","content":""}` (role is force-injected into the first rendered chunk if the backend skips `MessageStarted`); `TextDelta` → `{"content": ...}`; `MessageFinished` → empty delta + mapped finish reason (`length`→`length`, else `stop`); then `data: [DONE]`. All chunks share one `chatcmpl_local_*` id, `created`, `model`.
+2. **Nothing vendor-internal crosses the wire.** `ReasoningDelta`, `BackendMessageId`, `UnknownDelta` render to NOTHING in M3 (reasoning surfacing, if ever, is a later explicit decision). Upstream JSON-patch framing, ids and control events never appear in the public stream — this is the mechanical guarantee behind the exit criterion.
+3. **Errors before the first byte are HTTP statuses.** The route pulls the FIRST backend event synchronously ("priming") before returning the `StreamingResponse`, so `BackendFailure` (or a primed `BackendError` event) still answers 4xx/5xx with the OpenAI error body — preserving the client's status-keyed retry semantics.
+4. **Errors after headers are committed are in-stream.** A mid-stream `BackendFailure` emits `data: {"error": {message, type, code}}` and closes WITHOUT `[DONE]` (the openai SDK raises on the error event; a missing `[DONE]` unambiguously marks an incomplete stream). Re-decision per ADR-011/014: exceptions remain the canonical cross-boundary failure surface; `BackendError` events are defensively normalized into the same failure path on both sides of priming, but stay inventory-only types.
+5. **No usage chunk.** DeepSeek Web exposes no token counts; the verified client tolerates absence even with `include_usage:true`. Emitting fabricated zeros would violate "never silently pretend".
+6. **Threading/disconnect.** The blocking backend iterator is consumed via `starlette.concurrency.iterate_in_threadpool`; handlers stay sync `def`. On client disconnect Starlette closes the async generator; the in-flight upstream turn runs to completion in the threadpool (stateless session policy — nothing to roll back). Yielded exception instances are defensively raised. Cancellation of in-flight upstream work is M9 scope.
+
+**Consequences:** Streaming is fully testable offline (translator units + TestClient `stream()`); raw-leakage is guarded by construction and by explicit no-leak tests; error semantics match what the Qwen Code client actually does with statuses. Degenerate turns (empty stream) still emit a well-formed role + finish + `[DONE]` sequence.
+
+**Alternatives considered:** emitting `[DONE]` after a mid-stream error (rejected — `[DONE]` must mean "completed successfully"); fabricating a usage chunk (rejected — dishonest data); async route handlers (rejected — the backend is blocking; threadpool isolation is the established pattern); buffering the whole turn then emitting one chunk (rejected — defeats incremental delivery).
+
 # Template
 
 ## ADR-XXX — Title

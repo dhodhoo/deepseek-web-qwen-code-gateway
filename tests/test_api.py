@@ -168,13 +168,16 @@ class TestChatCompletionsSuccess:
 
 
 class TestChatCompletionsRejections:
-    def test_stream_true_is_501_until_m3(self) -> None:
-        client = _client(_settings(), FakeBackend())
-        response = client.post("/v1/chat/completions", json=_chat_body(stream=True), headers=AUTH)
-        assert response.status_code == 501
-        error = response.json()["error"]
-        assert error["code"] == "STREAMING_NOT_YET_SUPPORTED"
-        assert "M3" in error["message"]
+    def test_stream_true_now_streams_sse(self) -> None:
+        # M2 rejected stream=true with 501; M3 implemented streaming — the
+        # full behavior lives in tests/test_api_streaming.py.
+        backend = FakeBackend(turns=[fake_text_turn("ok")])
+        client = _client(_settings(), backend)
+        response = client.post(
+            "/v1/chat/completions", json=_chat_body(stream=True), headers=AUTH
+        )
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
 
     def test_tools_are_400_until_m6(self) -> None:
         client = _client(_settings(), FakeBackend())

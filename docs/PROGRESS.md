@@ -4,9 +4,9 @@ The coding agent must update this file after every milestone.
 
 ## Current status
 
-**Current milestone:** M2 — Basic OpenAI Chat Completions
+**Current milestone:** M3 — OpenAI SSE streaming
 
-**State:** COMPLETE (offline-verified + live curl smoke 2026-08-14). Awaiting user review; M3 not started.
+**State:** COMPLETE (offline-verified + live curl smoke 2026-08-14). Awaiting user review; M4 not started.
 
 ## Completed
 
@@ -14,16 +14,17 @@ The coding agent must update this file after every milestone.
 - M0 (2026-08-14): full upstream compatibility spike, including live probe.
 - M1 (2026-08-14): stable backend interface, FakeBackend, configuration boundary, import-boundary guard.
 - M2 (2026-08-14): FastAPI gateway surface — /health, /v1/models, non-streaming /v1/chat/completions with bearer auth, deterministic message compiler, OpenAI error mapping.
+- M3 (2026-08-14): OpenAI SSE streaming — event→chunk translator, primed pre-stream error handling, in-stream mid-failure envelope, [DONE], disconnect-safe generator.
 
 ## Tests run
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-195 passed, 2 deselected (live tests excluded by default marker)
+228 passed, 2 deselected (live tests excluded by default marker)
 
-Live curl smoke (GATEWAY_BACKEND=fake): plain chat via curl returned a valid
-chat.completion body; no-auth 401, stream:true 501, backend failure 500
-with the OpenAI error envelope.
+Live curl smoke (GATEWAY_BACKEND=fake): stream:true returned incremental
+chat.completion.chunk lines + data: [DONE]; pre-stream failure answered a
+real HTTP status with the OpenAI error body; non-stream chat unaffected.
 ```
 
 ## Known limitations
@@ -31,12 +32,70 @@ with the OpenAI error envelope.
 - Live error paths (429/5xx/Cloudflare) were not triggered during probing; classification is unit-tested offline only.
 - Multi-turn threading (parent_message_id = previous response_message_id) is captured but not yet exercised end-to-end (M4).
 - Upstream deepseek4free is dormant since 2025-02-09; its stream parser was fully obsolete (protocol changed). Further drift is possible at any time; probe captures are the early-warning mechanism.
-- M2 is non-streaming only; each request creates a fresh backend session (no conversation reuse until M4); sampling parameters are accepted but ignored.
-- Tool calling, streaming, Qwen Code provider wiring, multi-account, UI, Docker intentionally not started.
+- Each request creates a fresh backend session (no conversation reuse until M4); sampling parameters are accepted but ignored; no usage chunk in streams (no upstream token counts).
+- Reasoning/thinking content is intentionally NOT surfaced in M3 streams.
+- Tool calling, Qwen Code provider wiring, multi-account, UI, Docker intentionally not started.
 
 ## Next action
 
-User reviews the M2 report. If approved, start M3 (streaming chat completions, SSE out).
+User reviews the M3 report. If approved, start M4 (canonical conversation/session state, multi-turn).
+
+---
+
+## 2026-08-14 — M3: OpenAI SSE streaming
+
+### Completed
+
+- Single translator `app/streaming.py` (ADR-019): normalized events → OpenAI `chat.completion.chunk` SSE lines. `MessageStarted` → role chunk (role force-injected if the backend skips it), `TextDelta` → incremental content, `MessageFinished` → terminal chunk with mapped finish reason, then `data: [DONE]`. `ReasoningDelta`/`BackendMessageId`/`UnknownDelta` render to nothing — vendor-internal data never crosses the wire (the M3 exit criterion, guarded by construction + tests).
+- Pre-stream error handling via priming: the route pulls the first backend event before returning the `StreamingResponse`, so failures before the first byte still answer real HTTP statuses (client retry semantics preserved); mid-stream failures emit `data: {"error": ...}` and close WITHOUT `[DONE]`.
+- BackendError event re-decision (ADR-011/014 follow-through): exceptions remain the canonical failure surface; BackendError events are defensively normalized into the same failure path on both sides of priming.
+- Threading/disconnect: blocking backend iterator consumed via `iterate_in_threadpool`; client disconnect closes the async generator cleanly (aclose-tested); degenerate empty turns emit a well-formed role+finish+`[DONE]` sequence; `stream_options.include_usage` tolerated with no usage chunk (documented honesty).
+- Server wiring (`app/server.py`): `stream:true` now returns `StreamingResponse(text/event-stream)`; validation order unchanged (model 404 / tools 400 / compile 400 apply to both modes).
+
+### Files changed
+
+```text
+app/streaming.py (new)
+app/server.py (stream path: _start_stream_response + priming; 501 removed)
+tests/test_streaming.py (new), tests/test_api_streaming.py (new)
+tests/test_api.py (stream:true expectation updated from 501 to SSE)
+docs/DECISIONS.md (ADR-019), docs/API_CONTRACT.md (implementation status), docs/PROGRESS.md
+```
+
+### Tests executed
+
+```text
+.venv\Scripts\python.exe -m pytest -q
+228 passed, 2 deselected in 2.83s   (195 M0-M2 tests + 33 new M3 tests)
+
+Live curl smoke against uvicorn (GATEWAY_BACKEND=fake, stream:true):
+  data: {...delta:{"role":"assistant","content":""}...}
+  data: {...delta:{"content":"Hello "}...}   (incremental, same id/created/model)
+  data: {...delta:{"content":"from "}...}
+  data: {...delta:{"content":"SSE!"}...}
+  data: {...delta:{},"finish_reason":"stop"}
+  data: [DONE]
+  Second request (script exhausted) -> HTTP 500 + OpenAI error body (pre-stream failure as HTTP status)
+```
+
+### Upstream observations
+
+None new — M3 runs against `FakeBackend` only; no DeepSeek traffic. Live streaming against chat.deepseek.com becomes observable once M4 session state (or a manual probe) drives multi-event turns.
+
+### Known limitations
+
+- Client disconnect stops emission, but the in-flight upstream turn still runs to completion in the threadpool (stateless sessions — nothing to roll back); upstream cancellation is M9 scope.
+- No usage chunk (no upstream token counts; client tolerates absence — source-verified).
+- Reasoning content is dropped from public streams in M3 (surfacing it is a later explicit decision).
+- Streaming tool_calls are still rejected with the rest of tools (400, M6).
+
+### Decisions added/changed
+
+- ADR-019 streaming surface: single translator; primed HTTP-status errors before the first byte; in-stream error envelope without [DONE] mid-stream; no-leak rendering rules; no usage chunk; threadpool + disconnect semantics. Also closes the ADR-011/014 re-decision: exceptions remain canonical, BackendError events inventory-only.
+
+### Next milestone
+
+M4 — Canonical conversation/session state: normalized message history, backend session mapping, parent-message mapping, tool-history-capable representation, reconstruction tests; exit "multi-turn plain chat is correct and locally reconstructable" (awaiting explicit user approval).
 
 ---
 

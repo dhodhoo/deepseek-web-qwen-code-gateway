@@ -12,19 +12,20 @@ Primary prefix:
 
 ## Implementation status
 
-Last synchronized: M2 (2026-08-14). See also docs/PROGRESS.md and docs/DECISIONS.md (ADR-017/018).
+Last synchronized: M3 (2026-08-14). See also docs/PROGRESS.md and docs/DECISIONS.md (ADR-017..019).
 
 - `GET /health` — implemented (M2). Unauthenticated by design; exposes no secrets.
 - `GET /v1/models` — implemented (M2). One gateway alias (`GATEWAY_MODEL_ID`, default `deepseek-web`).
-- `POST /v1/chat/completions` — implemented (M2) for NON-STREAMING plain chat with `system` / `user` / `assistant` text messages:
-  - `stream: true` → `501`, `code: STREAMING_NOT_YET_SUPPORTED` (until M3).
-  - `tools` / `tool_choice` → `400`, `code: TOOLS_NOT_YET_SUPPORTED` (until M6).
+- `POST /v1/chat/completions` — implemented (M2 non-streaming; M3 OpenAI SSE streaming) for plain chat with `system` / `user` / `assistant` text messages:
+  - `stream: true` → implemented (M3): `chat.completion.chunk` SSE lines, role on the first chunk, incremental `content`, terminal chunk with mapped `finish_reason` (`length` passes through, else `stop`), terminated by `data: [DONE]`. No usage chunk is emitted (no upstream token counts; clients must tolerate absence).
+  - Streaming errors: failures BEFORE the first byte answer real HTTP statuses (4xx/5xx, OpenAI error body); failures MID-stream emit `data: {"error": {...}}` and close WITHOUT `[DONE]`.
+  - `tools` / `tool_choice` → `400`, `code: TOOLS_NOT_YET_SUPPORTED` (until M6; applies to both modes).
   - `role=tool`, assistant `tool_calls`, null-content assistant messages → `400`, `code: UNSUPPORTED_MESSAGE` (until M6).
-  - Unknown request fields (sampling knobs, vendor extras) are accepted and ignored (lenient parsing, `extra="allow"`).
+  - Unknown request fields (sampling knobs, `stream_options`, vendor extras) are accepted and ignored (lenient parsing, `extra="allow"`).
   - Unknown `model` → `404 model_not_found`; empty/missing `messages` or `model` → `422`.
 - Authentication (M2): `Authorization: Bearer <DEEPSEEK_GATEWAY_API_KEY>` on `/v1/*`. Secure-by-default: unconfigured key → `503 GATEWAY_API_KEY_NOT_CONFIGURED` unless `GATEWAY_ALLOW_NO_AUTH=1` (ADR-017).
 - Error envelope (M2): `{"error": {"message", "type", "code"}}`; `BackendFailure` categories map per the suggested HTTP table with `code` = category value (`app/error_mapping.py`).
-- Streaming responses, tool-call responses, conversation identity: NOT yet implemented (M3 / M6 / M4).
+- Streaming tool-call chunks, conversation identity: NOT yet implemented (M6 / M4).
 
 ## Authentication
 

@@ -1,21 +1,22 @@
-"""FastAPI application — OpenAI-compatible HTTP surface (M2 subset).
+"""FastAPI application — OpenAI-compatible HTTP surface (M2/M3 subset).
 
 Endpoints (docs/API_CONTRACT.md):
 
 * ``GET  /health``              — service health (unauthenticated by design;
   exposes no secrets)
 * ``GET  /v1/models``           — gateway model alias list (auth required)
-* ``POST /v1/chat/completions`` — NON-STREAMING plain chat (auth required);
-  ``stream=true`` answers 501 until M3, ``tools``/``tool_choice`` answer 400
-  until M6
+* ``POST /v1/chat/completions`` — plain chat, non-streaming (M2) and OpenAI
+  SSE streaming (M3); ``tools``/``tool_choice`` answer 400 until M6
 
 Threading note: the DeepSeek backend is synchronous/blocking (vendored
 curl-cffi). All route handlers are therefore plain ``def`` — Starlette runs
 them in its threadpool so the event loop is never blocked (master prompt:
 "isolate blocking upstream calls with a safe worker/thread boundary").
+Streaming additionally consumes the blocking event iterator through
+``starlette.concurrency.iterate_in_threadpool`` (see app/streaming.py).
 
-Session policy (M2): each request creates a fresh backend session. Canonical
-conversation state and session reuse arrive in M4.
+Session policy (M2/M3): each request creates a fresh backend session.
+Canonical conversation state and session reuse arrive in M4.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import time
 import uuid
 
 from fastapi import Depends, FastAPI, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
 from .backends.base import LLMBackend
@@ -42,6 +43,7 @@ from .openai_types import (
     ModelList,
 )
 from .prompt_compiler import UnsupportedMessageError, compile_messages_to_prompt
+from .streaming import STREAM_EMPTY, sse_stream
 
 __all__ = ["create_app", "GatewayHttpError"]
 
@@ -74,6 +76,50 @@ def _category_or_internal(kind: str) -> BackendErrorCategory:
         return BackendErrorCategory.INTERNAL
 
 
+def _start_stream_response(
+    backend_: LLMBackend, cfg: GatewaySettings, prompt: str
+) -> StreamingResponse:
+    """Begin an SSE streaming turn (M3).
+
+    The FIRST event is pulled synchronously (this handler runs in
+    Starlette's threadpool) BEFORE any response byte is committed: failures
+    raised while priming therefore still answer with a real HTTP status —
+    the Qwen Code client keys its retry behavior off HTTP status
+    (docs/UPSTREAM_NOTES.md). Mid-stream failures become an in-stream error
+    envelope instead (app/streaming.py, ADR-019).
+    """
+    session = backend_.create_session()
+    events = backend_.stream_turn(session.session_id, prompt)
+    try:
+        primed = next(events)
+    except StopIteration:
+        primed = STREAM_EMPTY
+    except BackendFailure as failure:
+        status, error_body = backend_failure_to_response(failure)
+        raise GatewayHttpError(status, error_body) from failure
+    if isinstance(primed, BackendError):
+        # Headers are not committed yet: convert to an HTTP status too.
+        failure = BackendFailure(
+            category=_category_or_internal(primed.kind),
+            message=primed.message,
+            retryable=primed.retryable,
+            status_code=primed.status_code,
+        )
+        status, error_body = backend_failure_to_response(failure)
+        raise GatewayHttpError(status, error_body) from failure
+    return StreamingResponse(
+        sse_stream(
+            primed,
+            events,
+            chunk_id=f"chatcmpl_local_{uuid.uuid4().hex}",
+            created=int(time.time()),
+            model=cfg.model_id,
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 def create_app(
     settings: GatewaySettings | None = None,
     backend: LLMBackend | None = None,
@@ -94,7 +140,8 @@ def create_app(
         version=__version__,
         description=(
             "Local-first OpenAI-compatible gateway exposing DeepSeek Web to "
-            "Qwen Code. M2 subset: non-streaming chat completions."
+            "Qwen Code. M2/M3 subset: chat completions, non-streaming and "
+            "OpenAI SSE streaming."
         ),
     )
     app.state.settings = settings
@@ -205,16 +252,6 @@ def create_app(
                     "model_not_found",
                 ),
             )
-        if body.stream:
-            raise GatewayHttpError(
-                501,
-                openai_error_body(
-                    "Streaming is not implemented yet (milestone M3). "
-                    "Send stream=false for now.",
-                    "server_error",
-                    "STREAMING_NOT_YET_SUPPORTED",
-                ),
-            )
         if body.tools or body.tool_choice is not None:
             raise GatewayHttpError(
                 400,
@@ -234,6 +271,9 @@ def create_app(
                     str(exc), "invalid_request_error", "UNSUPPORTED_MESSAGE"
                 ),
             ) from exc
+
+        if body.stream:
+            return _start_stream_response(backend_, cfg, prompt)
 
         try:
             session = backend_.create_session()
