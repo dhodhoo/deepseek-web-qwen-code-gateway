@@ -29,6 +29,10 @@ Environment variables (see .env.example):
 * ``GATEWAY_HOST``/``GATEWAY_PORT`` — bind address for ``python -m app.main``
 * ``GATEWAY_DIAGNOSTICS_DIR``  — optional directory for the opt-in M5
   diagnostic request capture (sanitized JSONL; see app/diagnostics.py)
+
+``python -m app.main`` additionally merges the repository-root ``.env``
+file under the real environment via :func:`load_env_file` (ADR-022):
+variables already set in the environment always win.
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ __all__ = [
     "DeepSeekWebSettings",
     "GatewaySettings",
     "build_backend",
+    "load_env_file",
     "DEFAULT_BACKEND_TYPE",
     "FAKE_BACKEND_TYPE",
 ]
@@ -84,6 +89,48 @@ def _parse_port(raw: str | None) -> int:
     if not 1 <= port <= 65535:
         raise ConfigError("GATEWAY_PORT must be between 1 and 65535")
     return port
+
+
+def load_env_file(
+    path: Path | str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Merge a ``.env`` file's ``KEY=VALUE`` pairs under ``env`` (ADR-022).
+
+    Returns a new mapping: ``env`` (default ``os.environ``) with file
+    values added for keys that are NOT already set — an explicitly set
+    environment variable always wins (standard dotenv semantics). ``path``
+    defaults to the repository-root ``.env``, resolved from the ``app``
+    package location so it works regardless of the current working
+    directory. A missing/unreadable file simply yields ``env`` unchanged.
+
+    Parsing is deliberately minimal: one ``KEY=VALUE`` per line; blank
+    lines and ``#`` comments ignored; a leading ``export `` tolerated;
+    one pair of surrounding single/double quotes stripped from the value;
+    lines without ``=`` skipped; no variable expansion.
+    """
+    base: dict[str, str] = dict(os.environ if env is None else env)
+    if path is None:
+        path = Path(__file__).resolve().parent.parent / ".env"
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return base
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].lstrip()
+        key, separator, value = stripped.partition("=")
+        if not separator or not key.strip():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        base.setdefault(key.strip(), value)
+    return base
 
 
 class ConfigError(ValueError):

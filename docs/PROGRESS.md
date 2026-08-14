@@ -22,7 +22,11 @@ The coding agent must update this file after every milestone.
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-285 passed, 3 deselected (live tests excluded by default marker)
+289 passed, 3 deselected (live tests excluded by default marker)
+
+Post-M5 addendum (same day): repository-root .env loading for live runs
+(ADR-022) — user opted to configure via .env for the live acceptance;
++4 config tests (285 -> 289).
 
 M5 smoke (in-process uvicorn + real openai Python SDK 3.0.0 +
 GATEWAY_DIAGNOSTICS_DIR): env-parsed diagnostics_dir; health 200;
@@ -67,20 +71,24 @@ User reviews the M5 report. If approved, start M6 (one emulated tool call: norma
 - `docs/QWEN_CODE_INTEGRATION.md` rewritten as the turnkey wiring guide: source-verified settings.json provider entry (baseUrl ending /v1, envKey, generationConfig inside the entry — impermeable/atomic), env key setup, M5 capability table, diagnostics instructions, troubleshooting, live acceptance checklist (the 2-minute user-run step).
 - API_CONTRACT.md synchronized (M5, ADR-021 bullets: tools tolerance, wire-format references, diagnostic capture); existing tools-400 tests in test_api.py / test_api_streaming.py inverted to accepted-and-ignored.
 - End-to-end smoke (in-process uvicorn + real openai SDK + GATEWAY_DIAGNOSTICS_DIR): env parsing, health, non-stream chat with tools[], streaming chat, 2 sanitized capture records with no key value on disk — ALL PASS (script deleted after use, established pattern).
+- Post-M5 addendum (same day): repository-root `.env` loading for live runs (ADR-022) — `load_env_file` in `app/config.py` (minimal KEY=VALUE parser, no new dependency, real environment always wins, repo-root path resolved from the app package), wired ONLY in `app/main.py` so tests/embedders keep full environment control; `.env.example` documents the copy-to-`.env` workflow; `docs/QWEN_CODE_INTEGRATION.md` gained a "Starting the gateway" section. Prompted by the user choosing `.env` configuration for the live acceptance run.
 
 ### Files changed
 
 ```text
 app/diagnostics.py (new), app/server.py (tools tolerance + capture hook),
-app/config.py (diagnostics_dir), .env.example (GATEWAY_DIAGNOSTICS_DIR),
-pyproject.toml (dev extra: openai)
+app/config.py (diagnostics_dir; post-M5: load_env_file),
+app/main.py (post-M5: .env loading), .env.example (GATEWAY_DIAGNOSTICS_DIR;
+post-M5: copy-to-.env + precedence note), pyproject.toml (dev extra: openai)
 tests/fixtures/qwen_code_wire/{README.md, agent_turn_stream_with_tools.json,
   plain_chat_non_stream.json, tool_history_turn.json,
   non_standard_extras.json} (new)
 tests/test_m5_wire_fixtures.py, tests/test_m5_diagnostics.py,
   tests/test_m5_sdk_compat.py (new)
-tests/test_api.py, tests/test_api_streaming.py (tools tests inverted)
-docs/DECISIONS.md (ADR-021), docs/QWEN_CODE_INTEGRATION.md (rewritten),
+tests/test_api.py, tests/test_api_streaming.py (tools tests inverted),
+tests/test_config.py (post-M5: TestLoadEnvFile)
+docs/DECISIONS.md (ADR-021; post-M5: ADR-022),
+docs/QWEN_CODE_INTEGRATION.md (rewritten; post-M5: Starting the gateway),
 docs/API_CONTRACT.md (M5 sync), docs/PROGRESS.md
 ```
 
@@ -88,7 +96,7 @@ docs/API_CONTRACT.md (M5 sync), docs/PROGRESS.md
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-285 passed, 3 deselected (live tests excluded by default marker)
+289 passed, 3 deselected (live tests excluded by default marker)
 ```
 
 ### Honest gaps

@@ -61,11 +61,38 @@ Field notes (verified from source):
 - The built-in `openai` protocol needs no `providerProtocol` entry (that
   key is only for custom protocol ids).
 
-Store the actual key in the environment rather than committing it:
+Store the actual key where Qwen Code can read it — either in the settings
+`env` block (simplest; the file is local, never commit it):
+
+```json
+"env": {
+  "DEEPSEEK_GATEWAY_API_KEY": "<local-gateway-key>"
+}
+```
+
+or in the environment of the terminal that launches Qwen Code. The value
+must equal the gateway's `DEEPSEEK_GATEWAY_API_KEY`.
+
+## Starting the gateway
+
+Copy `.env.example` to `.env` in the repository root and fill it in.
+`python -m app.main` loads the repository-root `.env` at startup and
+merges it UNDER the real environment — variables already set in the
+environment always win (ADR-022). `.env` is gitignored.
 
 ```text
-DEEPSEEK_GATEWAY_API_KEY=<local-gateway-key>
+GATEWAY_BACKEND=deepseek_web      # or `fake` for a credential-free dry run
+DEEPSEEK_AUTH_TOKEN=<deepseek web token>
+DEEPSEEK_GATEWAY_API_KEY=<the same key as in Qwen Code settings>
+GATEWAY_DIAGNOSTICS_DIR=<optional private capture directory>
 ```
+
+```bash
+python -m app.main
+```
+
+The gateway listens on `http://127.0.0.1:8000` by default
+(`GATEWAY_HOST`/`GATEWAY_PORT`). Check `GET /health` once it is up.
 
 ## Important base URL rule
 
@@ -191,9 +218,9 @@ prompting; verify current flags before automating them.
 
 Everything above is verified offline. The remaining two-minute live step:
 
-1. Start the gateway with `GATEWAY_BACKEND=deepseek_web` and a real token
-   (`DEEPSEEK_GATEWAY_API_KEY` set on both sides; optionally
-   `GATEWAY_DIAGNOSTICS_DIR` for capture).
+1. Fill the gateway's `.env` (`GATEWAY_BACKEND=deepseek_web`, real
+   `DEEPSEEK_AUTH_TOKEN`, `DEEPSEEK_GATEWAY_API_KEY`, optionally
+   `GATEWAY_DIAGNOSTICS_DIR`) and start `python -m app.main`.
 2. Start Qwen Code with the settings above and ask one plain question.
 
 Expected: a normal streamed answer, and one sanitized record per request

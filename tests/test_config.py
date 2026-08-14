@@ -6,6 +6,8 @@ serialization, or error messages.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import SecretStr
 
@@ -15,6 +17,7 @@ from app.config import (
     ConfigError,
     GatewaySettings,
     build_backend,
+    load_env_file,
 )
 
 SECRET = "super-secret-token-abc123"
@@ -114,3 +117,48 @@ class TestBuildBackend:
         settings = GatewaySettings(backend_type="mystery")
         with pytest.raises(ConfigError):
             build_backend(settings)
+
+
+class TestLoadEnvFile:
+    """ADR-022: repository-root .env merged under the real environment."""
+
+    def test_parses_key_value_lines(self, tmp_path: Path) -> None:
+        dotenv = tmp_path / ".env"
+        dotenv.write_text(
+            "# comment\n"
+            "\n"
+            "GATEWAY_BACKEND=fake\n"
+            "export DEEPSEEK_GATEWAY_API_KEY=abc123\n"
+            "GATEWAY_MODEL_ID='quoted-alias'\n"
+            'DSQG_COOKIES_FILE="C:/tmp/c.json"\n'
+            "not a keyvalue line\n",
+            encoding="utf-8",
+        )
+        merged = load_env_file(dotenv, env={})
+        assert merged["GATEWAY_BACKEND"] == "fake"
+        assert merged["DEEPSEEK_GATEWAY_API_KEY"] == "abc123"
+        assert merged["GATEWAY_MODEL_ID"] == "quoted-alias"
+        assert merged["DSQG_COOKIES_FILE"] == "C:/tmp/c.json"
+        assert "not a keyvalue line" not in merged
+
+    def test_real_environment_wins(self, tmp_path: Path) -> None:
+        dotenv = tmp_path / ".env"
+        dotenv.write_text("GATEWAY_PORT=9999\nGATEWAY_BACKEND=fake\n", encoding="utf-8")
+        merged = load_env_file(dotenv, env={"GATEWAY_PORT": "8000"})
+        assert merged["GATEWAY_PORT"] == "8000"  # explicitly set → wins
+        assert merged["GATEWAY_BACKEND"] == "fake"  # absent → filled in
+
+    def test_missing_file_yields_env_unchanged(self, tmp_path: Path) -> None:
+        merged = load_env_file(tmp_path / "does-not-exist.env", env={"A": "1"})
+        assert merged == {"A": "1"}
+
+    def test_from_env_consumes_the_merged_mapping(self, tmp_path: Path) -> None:
+        dotenv = tmp_path / ".env"
+        dotenv.write_text(
+            f"GATEWAY_BACKEND=fake\nDEEPSEEK_GATEWAY_API_KEY={SECRET}\n",
+            encoding="utf-8",
+        )
+        settings = GatewaySettings.from_env(load_env_file(dotenv, env={}))
+        assert settings.backend_type == "fake"
+        assert settings.gateway_api_key is not None
+        assert settings.gateway_api_key.get_secret_value() == SECRET

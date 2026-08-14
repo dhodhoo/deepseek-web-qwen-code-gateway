@@ -243,6 +243,24 @@ Keep historical decisions. Mark superseded entries instead of deleting them.
 
 **Alternatives considered:** keeping the tools 400 until M6 (rejected — makes the M5 exit unreachable; Qwen Code agent turns ALWAYS send tools); faking a `tool_calls` response or a usage chunk to look more complete (rejected — fabricated structured output would send Qwen Code down a tool loop the gateway cannot serve, violating "never silently pretend"); raw-byte request capture via middleware (rejected for M5 — parsed-body capture already covers the semantic wire shape; revisit only if real captures show fidelity gaps); capturing unauthenticated requests (rejected — auth runs before the handler, keeping capture scoped to legitimate traffic is simpler and privacy-friendlier).
 
+## ADR-022 — Repository-root `.env` loading for live runs
+
+**Status:** Accepted (post-M5 live-acceptance enabler)
+
+**Context:** The M5 live-acceptance step asks the user to run the gateway with a real token. Per-variable `set` commands in a terminal are error-prone and must be repeated for every new shell; the user asked to configure via `.env`. `.env` is already gitignored and `.env.example` documents every variable, but nothing loaded the file (`from_env` reads only `os.environ`).
+
+**Decision:**
+
+1. `app/config.py::load_env_file(path=None, env=None)` merges a `.env` file's `KEY=VALUE` pairs under `env` (default `os.environ`) and returns a NEW mapping; `app/main.py` calls `GatewaySettings.from_env(load_env_file())`. Parsing is deliberately minimal: one pair per line, `#` comments and blanks ignored, leading `export ` tolerated, one pair of surrounding quotes stripped, no `=` → skipped, no variable expansion.
+2. **Real environment variables always win** (standard dotenv `override=False` semantics) — an explicit `set`/`export` is the escape hatch and the file can never shadow it.
+3. The default path is the repository-root `.env` resolved from the `app` package location (`Path(__file__).resolve().parent.parent / ".env"`), so startup works from any working directory. A missing file is a no-op, not an error.
+4. Loading happens ONLY in `app/main.py` (the runtime entry). `GatewaySettings.from_env()` itself is unchanged — tests and embedders keep full control of their environment and a local `.env` can never leak into the test suite.
+5. No new dependency: a ~30-line parser instead of `python-dotenv` (the needed subset is tiny; dependency budget stays lean per ADR-015 spirit).
+
+**Consequences:** `python -m app.main` after copying `.env.example` → `.env` and filling in the token is the whole live-run story; documented in `.env.example`, `docs/QWEN_CODE_INTEGRATION.md`, and PROGRESS. Covered by `tests/test_config.py::TestLoadEnvFile` (parsing, precedence, missing file, from_env integration).
+
+**Alternatives considered:** `python-dotenv` dependency (rejected — only KEY=VALUE is needed); loading inside `from_env()` when `env is None` (rejected — a local `.env` would silently alter test behavior and any embedder's defaults); cwd-relative `.env` only (rejected — breaks when the gateway is started from another directory).
+
 # Template
 
 ## ADR-XXX — Title
