@@ -4,20 +4,21 @@ The coding agent must update this file after every milestone.
 
 ## Current status
 
-**Current milestone:** M0 — Upstream compatibility spike
+**Current milestone:** M1 — Backend abstraction
 
-**State:** COMPLETE (live-verified 2026-08-14). Awaiting user review; M1 not started.
+**State:** COMPLETE (offline-verified 2026-08-14). Awaiting user review; M2 not started.
 
 ## Completed
 
 - Starter architecture/specification created.
 - M0 (2026-08-14): full upstream compatibility spike, including live probe.
+- M1 (2026-08-14): stable backend interface, FakeBackend, configuration boundary, import-boundary guard.
 
 ## Tests run
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-95 passed, 2 deselected (live tests excluded by default marker)
+129 passed, 2 deselected (live tests excluded by default marker)
 ```
 
 ## Known limitations
@@ -29,7 +30,63 @@ The coding agent must update this file after every milestone.
 
 ## Next action
 
-User reviews the M0 report. If approved, start M1 (backend abstraction: formal interface, FakeBackend, configuration boundary).
+User reviews the M1 report. If approved, start M2 (basic OpenAI-compatible chat endpoint).
+
+---
+
+## 2026-08-14 — M1: Backend abstraction
+
+### Completed
+
+- Defined the stable backend contract `app/backends/base.py`: `LLMBackend` ABC with `backend_type`, `health_check() -> BackendHealth`, `create_session() -> BackendSession`, `stream_turn(...) -> Iterator[BackendEvent]` (ADR-014).
+- Conformed `DeepSeekWebBackend` to the contract: typed returns, first positional renamed `chat_session_id` → `session_id`; `raw_sink` documented as a non-portable backend extension.
+- Implemented `FakeBackend` (`app/backends/fake.py`): scripted deterministic turns, recorded calls, sequential fake sessions, strict script-exhausted failure; plus `fake_text_turn()` helper (ADR-014/015).
+- Configuration boundary `app/config.py`: `GatewaySettings.from_env()` (injectable env mapping), `SecretStr` token masking, `ConfigError` messages without values, `build_backend()` registry with lazy backend imports; `GATEWAY_BACKEND` selects `deepseek_web` (default) or `fake` (ADR-015). Added `pydantic>=2` runtime dependency; `.env.example` documents `GATEWAY_BACKEND`.
+- Import-boundary guard `tests/test_import_boundary.py`: AST scan of `app/` + `scripts/` fails on any `dsk` import outside `app/backends/deepseek_web/`; `tests/` exempt by documented design; detector self-tested (ADR-016).
+- Adapted probe script, offline backend tests, and live tests to the typed interface.
+
+### Files changed
+
+```text
+app/backends/base.py (new), app/backends/fake.py (new), app/config.py (new)
+app/backends/__init__.py (public exports), app/backends/deepseek_web/backend.py (interface conformance)
+scripts/probe_deepseek.py (BackendSession usage)
+tests/test_backend_interface.py (new), tests/test_fake_backend.py (new),
+tests/test_config.py (new), tests/test_import_boundary.py (new)
+tests/test_backend_offline.py, tests/test_live_upstream.py (typed interface)
+pyproject.toml (pydantic>=2), .env.example (GATEWAY_BACKEND)
+docs/DECISIONS.md (ADR-014..016), docs/ARCHITECTURE.md (concrete interface), docs/PROGRESS.md
+```
+
+### Tests executed
+
+```text
+.venv\Scripts\python.exe -m pytest -q
+129 passed, 2 deselected in 1.29s   (95 M0 tests + 34 new M1 tests)
+
+.venv\Scripts\python.exe scripts\probe_deepseek.py --help
+OK (import/parse smoke test after interface change; no live run in M1)
+```
+
+### Upstream observations
+
+None new — M1 is internal refactoring; no upstream traffic. `docs/UPSTREAM_NOTES.md` unchanged (Qwen source-level verification still pending from the paused research task; feeds M5).
+
+### Known limitations
+
+- `BackendError` events remain inventory-only; the canonical failure surface across the interface is `BackendFailure` exceptions (re-decision due at M3 async streaming, per ADR-011/014).
+- `FakeBackend` validates nothing about session ids passed to `stream_turn` (deliberate simplicity).
+- No HTTP surface exists yet — `build_backend`/`GatewaySettings` are exercised only by tests until M2.
+
+### Decisions added/changed
+
+- ADR-014 stable `LLMBackend` ABC + typed value returns
+- ADR-015 configuration boundary (pydantic v2 + SecretStr + factory registry)
+- ADR-016 import-boundary guard with documented tests exemption
+
+### Next milestone
+
+M2 — Basic OpenAI-compatible chat: FastAPI app, `POST /v1/chat/completions` (non-stream first), `GET /health`, `GET /v1/models`, gateway API key auth, OpenAI error mapping — all against the stable `LLMBackend` interface (developable fully offline via `GATEWAY_BACKEND=fake`).
 
 ---
 

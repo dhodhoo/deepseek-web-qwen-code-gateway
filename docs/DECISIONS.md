@@ -108,6 +108,49 @@ Keep historical decisions. Mark superseded entries instead of deleting them.
 
 **Alternatives considered:** patching vendored `api.py` (rejected — destroys clean diff against upstream and spreads private-API parsing across vendor code); reimplementing the whole HTTP request in gateway code (rejected for M0 — unnecessary duplication while vendored transport works; reconsider if transport also drifts).
 
+## ADR-014 — Stable LLMBackend interface: ABC with typed value returns
+
+**Status:** Accepted
+
+**Context:** M1's core deliverable is a stable backend contract. ARCHITECTURE.md sketches it "conceptually similar to" a `typing.Protocol` with `create_session -> BackendSession`, `stream_turn -> Iterator[BackendEvent]`, `health_check -> BackendHealth`, noting exact signatures may evolve. The M0 spike returned bare `str`/`dict` and used a `chat_session_id` parameter.
+
+**Decision:**
+
+1. `app/backends/base.py` defines `LLMBackend` as an **ABC** (not a `Protocol`), with abstract `backend_type` (satisfied by a plain class attribute), `health_check() -> BackendHealth`, `create_session() -> BackendSession`, and `stream_turn(session_id, prompt, *, parent_message_id=None, thinking_enabled=False, search_enabled=False) -> Iterator[BackendEvent]`.
+2. `BackendSession(session_id)` and `BackendHealth(backend_type, ready, details)` are frozen dataclasses named by ARCHITECTURE.md, replacing bare `str`/`dict` so later milestones can extend them without breaking the signature. `session_id` is opaque above the backend layer.
+3. Backend-specific extras stay OUT of the contract: `DeepSeekWebBackend.stream_turn` keeps its `raw_sink` capture extension, documented as non-portable; `FakeBackend` implements exactly the interface.
+4. Failures cross the interface as `BackendFailure` exceptions (reaffirming ADR-011 for the stable contract; `BackendError` events remain inventory-only until the async streaming surface is re-decided in M3).
+
+**Consequences:** All layers above backends (API, compiler, tool emulation) program against `base.py` only; missing methods fail at instantiation; `isinstance(x, LLMBackend)` is meaningful. `DeepSeekWebBackend` renamed its first positional `chat_session_id` → `session_id` (all in-tree callers updated; probe and live tests included).
+
+**Alternatives considered:** `typing.Protocol` (rejected — all backends live in this repo, so nominal subtyping gives fail-fast enforcement and explicit conformance without losing anything); keeping `str`/`dict` returns (rejected — no extension headroom, weaker docs/tests).
+
+## ADR-015 — Configuration boundary: pydantic v2 + SecretStr + factory registry
+
+**Status:** Accepted
+
+**Context:** M1 requires a configuration boundary: one place where environment settings become gateway objects, without ever leaking the DeepSeek token (credentials rule). The default architecture mandates pydantic v2.
+
+**Decision:**
+
+1. `app/config.py` is the single env→settings→backend path: `GatewaySettings.from_env(env=None)` parses `GATEWAY_BACKEND` (`deepseek_web` default, or `fake`), `DEEPSEEK_AUTH_TOKEN` (required for `deepseek_web`), and optional `DSQG_COOKIES_FILE`. The token is stored as `pydantic.SecretStr` so masking in `repr`/JSON dumps is by construction (and tested). `ConfigError` (a `ValueError`) names variables only, never values.
+2. `build_backend(settings) -> LLMBackend` is the backend selection registry. It imports backend implementations **lazily**, so `GATEWAY_BACKEND=fake` development and tests never pull the vendored private-API stack.
+3. `FakeBackend` is a first-class selectable backend for credential-free development of later milestones (M2/M3), not only a test fixture.
+
+**Consequences:** New backends register in exactly one function; secret hygiene is mechanical + regression-tested; settings objects are immutable. Adds `pydantic>=2` to runtime dependencies (already required by the default architecture).
+
+**Alternatives considered:** `pydantic-settings` (rejected for now — one extra dependency for a single injectable `from_env` classmethod; reconsider if settings grow); plain dataclasses with manual masking (rejected — hand-rolled secret masking is exactly the bug class SecretStr prevents).
+
+## ADR-016 — Import-boundary guard: AST scan with a documented tests exemption
+
+**Status:** Accepted
+
+**Context:** AGENTS.md/QWEN.md require that nothing outside `app/backends/deepseek_web` imports the vendored `dsk` namespace. M0 already has intentional `dsk` imports in two test modules (`test_errors.py`, `test_backend_offline.py`) — they import vendored exception classes to prove the taxonomy mapping itself.
+
+**Decision:** `tests/test_import_boundary.py` statically scans `app/` and `scripts/` (AST-based, so lazy/local imports inside functions are caught too) and fails on any `dsk` import outside `app/backends/deepseek_web/`. `tests/` is exempt by documented design. The guard includes a self-test of its detector so refactors cannot silently neuter it.
+
+**Consequences:** The isolation rule is mechanically enforced on every default test run instead of relying on review. Any future exemption needs an ADR note.
+
 # Template
 
 ## ADR-XXX — Title

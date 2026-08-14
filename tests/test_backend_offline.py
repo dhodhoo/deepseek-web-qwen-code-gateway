@@ -25,9 +25,9 @@ def backend() -> DeepSeekWebBackend:
 class TestBackendOffline:
     def test_health_check_shape(self, backend: DeepSeekWebBackend) -> None:
         health = backend.health_check()
-        assert health["type"] == "deepseek_web"
-        assert health["client_ready"] is True
-        assert "cookies_loaded" in health
+        assert health.backend_type == "deepseek_web"
+        assert health.ready is True
+        assert "cookies_loaded" in health.details
 
     def test_empty_token_rejected(self) -> None:
         with pytest.raises(BackendFailure) as excinfo:
@@ -135,7 +135,7 @@ class TestBackendOffline:
         cookies_file = tmp_path / "cookies.json"
         cookies_file.write_text('{"cookies": {"cf_clearance": "placeholder"}}')
         backend = DeepSeekWebBackend("dummy", cookies_file=cookies_file)
-        assert backend.health_check()["cookies_loaded"] is True
+        assert backend.health_check().details["cookies_loaded"] is True
         # The cookie value itself must be held, but never appear in health output.
         assert "placeholder" not in str(backend.health_check())
 

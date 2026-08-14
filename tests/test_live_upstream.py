@@ -15,6 +15,7 @@ import os
 
 import pytest
 
+from app.backends import BackendSession
 from app.backends.deepseek_web import DeepSeekWebBackend
 from app.backends.errors import BackendFailure
 from app.backends.events import MessageFinished, TextDelta
@@ -32,12 +33,15 @@ skip_no_token = pytest.mark.skipif(
 def test_live_session_and_simple_prompt() -> None:
     backend = DeepSeekWebBackend(TOKEN)
 
-    session_id = backend.create_session()
-    assert isinstance(session_id, str) and session_id
+    session = backend.create_session()
+    assert isinstance(session, BackendSession)
+    assert session.session_id
 
     events = list(
         backend.stream_turn(
-            session_id, "Reply with exactly one word: OK", thinking_enabled=False
+            session.session_id,
+            "Reply with exactly one word: OK",
+            thinking_enabled=False,
         )
     )
     text = "".join(e.text for e in events if isinstance(e, TextDelta))

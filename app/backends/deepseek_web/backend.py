@@ -1,20 +1,22 @@
-"""DeepSeekWebBackend — M0 spike adapter around vendored deepseek4free.
+"""DeepSeekWebBackend — adapter around vendored deepseek4free.
 
 This module is the ONLY place in the application that touches the private
 DeepSeek Web API client. Everything upstream-specific (endpoints, headers,
 PoW, cookies, Cloudflare quirks, SSE framing) stays behind this boundary, as
 required by AGENTS.md.
 
-M0 scope (per 00_MASTER_PROMPT.md):
+Originating milestones (per 00_MASTER_PROMPT.md):
 
-* client initialization
-* session creation
-* one prompt, streamed
-* normalized events + finish behavior observation
-* upstream exception normalization
+* M0: client initialization, session creation, one streamed prompt,
+  normalized events + finish behavior observation, upstream exception
+  normalization.
+* M1: explicit conformance to the stable :class:`app.backends.base.LLMBackend`
+  interface (typed ``BackendSession``/``BackendHealth`` returns).
 
-Stable backend interface work (formal Protocol, FakeBackend, config boundary)
-is M1 and intentionally not anticipated here beyond keeping the surface small.
+The ``raw_sink`` keyword of :meth:`DeepSeekWebBackend.stream_turn` is a
+backend-specific extension used by the probe for sanitized fixture capture;
+it is NOT part of the stable interface and nothing above the backend layer
+may rely on it.
 """
 
 from __future__ import annotations
@@ -22,8 +24,9 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Iterator
 
+from ..base import BackendHealth, BackendSession, LLMBackend
 from ..errors import BackendFailure
 from ..events import BackendEvent
 from . import _vendor  # noqa: F401  (ensures vendored dsk is importable)
@@ -35,7 +38,7 @@ __all__ = ["DeepSeekWebBackend"]
 logger = logging.getLogger(__name__)
 
 
-class DeepSeekWebBackend:
+class DeepSeekWebBackend(LLMBackend):
     """Thin, normalized wrapper over the vendored ``DeepSeekAPI`` client."""
 
     backend_type = "deepseek_web"
@@ -79,18 +82,18 @@ class DeepSeekWebBackend:
 
     # ------------------------------------------------------------------ info
 
-    def health_check(self) -> dict[str, Any]:
+    def health_check(self) -> BackendHealth:
         """Local (no-network) health information. Secrets are never included."""
-        return {
-            "type": self.backend_type,
-            "client_ready": True,
-            "cookies_loaded": bool(getattr(self._api, "cookies", {})),
-        }
+        return BackendHealth(
+            backend_type=self.backend_type,
+            ready=True,
+            details={"cookies_loaded": bool(getattr(self._api, "cookies", {}))},
+        )
 
     # -------------------------------------------------------------- session
 
-    def create_session(self) -> str:
-        """Create a DeepSeek chat session and return its id.
+    def create_session(self) -> BackendSession:
+        """Create a DeepSeek chat session.
 
         Raises :class:`app.backends.errors.BackendFailure` on any upstream
         problem, normalized into the error taxonomy.
@@ -105,13 +108,13 @@ class DeepSeekWebBackend:
                 message="Session creation returned no usable session id",
             )
         logger.info("deepseek_web session created")
-        return session_id
+        return BackendSession(session_id=session_id)
 
     # --------------------------------------------------------------- stream
 
     def stream_turn(
         self,
-        chat_session_id: str,
+        session_id: str,
         prompt: str,
         *,
         parent_message_id: str | None = None,
@@ -152,7 +155,7 @@ class DeepSeekWebBackend:
         try:
             try:
                 chunks = api.chat_completion(
-                    chat_session_id,
+                    session_id,
                     prompt,
                     parent_message_id=parent_message_id,
                     thinking_enabled=thinking_enabled,

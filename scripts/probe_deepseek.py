@@ -119,7 +119,7 @@ def main() -> int:
 
         # -- 2. session creation -----------------------------------------
         t0 = time.perf_counter()
-        session_id = backend.create_session()
+        session = backend.create_session()
         t_session = time.perf_counter() - t0
         log(f"[2/6] session created: yes (id hidden, {t_session * 1000:.0f} ms)")
 
@@ -138,7 +138,7 @@ def main() -> int:
         first_chunk_at: float | None = None
 
         for event in backend.stream_turn(
-            session_id,
+            session.session_id,
             args.prompt,
             thinking_enabled=args.thinking,
             search_enabled=args.search,

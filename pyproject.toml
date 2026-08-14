@@ -20,6 +20,8 @@ dependencies = [
     "curl-cffi>=0.13",
     "wasmtime>=3",
     "numpy>=2",
+    # M1 configuration boundary (validated settings, SecretStr masking).
+    "pydantic>=2",
 ]
 
 [project.optional-dependencies]

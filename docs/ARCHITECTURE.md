@@ -44,16 +44,33 @@
 
 The rest of the application must not understand private DeepSeek endpoint details.
 
-Define an internal backend interface conceptually similar to:
+The internal backend interface is concrete since M1 in `app/backends/base.py`
+(see docs/DECISIONS.md ADR-014):
 
 ```python
-class LLMBackend(Protocol):
-    def create_session(...) -> BackendSession: ...
-    def stream_turn(...) -> Iterator[BackendEvent]: ...
-    def health_check(...) -> BackendHealth: ...
+class LLMBackend(ABC):
+    @property
+    def backend_type(self) -> str: ...          # class attribute suffices
+    def health_check(self) -> BackendHealth: ...
+    def create_session(self) -> BackendSession: ...
+    def stream_turn(
+        self,
+        session_id: str,
+        prompt: str,
+        *,
+        parent_message_id: str | None = None,
+        thinking_enabled: bool = False,
+        search_enabled: bool = False,
+    ) -> Iterator[BackendEvent]: ...
 ```
 
-Exact signatures may evolve.
+`BackendSession(session_id)` and `BackendHealth(backend_type, ready, details)`
+are frozen value types in the same module. Backends raise `BackendFailure`
+(normalized taxonomy) for all failures. Backend-specific extras (e.g.
+`DeepSeekWebBackend`'s `raw_sink` probe capture) are not part of the
+contract. `app/config.py::build_backend` constructs the configured backend
+(ADR-015); an AST-based test enforces that nothing outside
+`app/backends/deepseek_web` imports the vendored `dsk` namespace (ADR-016).
 
 The important requirement is that upstream events become stable internal types before reaching API/tool logic.
 
@@ -77,6 +94,7 @@ This keeps the backend replaceable.
 ## Public API boundary
 
 The API layer handles:
+
 - request authentication,
 - OpenAI request validation,
 - model alias resolution,
@@ -93,6 +111,7 @@ The upstream may accept only a prompt string.
 Create a deterministic compiler from normalized OpenAI messages into backend input.
 
 The compiler must understand:
+
 - `system`
 - `user`
 - `assistant`
@@ -118,6 +137,7 @@ normalized message history or reconstructable representation
 ```
 
 Important:
+
 - A backend remote session is an optimization/state link, not the sole source of truth.
 - Later failover should be able to rebuild a remote session from canonical state.
 
@@ -174,6 +194,7 @@ Initial storage: SQLite.
 Potential tables:
 
 ### accounts
+
 - id
 - label
 - encrypted_auth_token
@@ -186,6 +207,7 @@ Potential tables:
 - updated_at
 
 ### conversations
+
 - id
 - backend
 - account_id
@@ -196,12 +218,15 @@ Potential tables:
 - updated_at
 
 ### messages
+
 Only if persistent canonical history is required.
 
 Be privacy-conscious. Avoid storing full content by default unless necessary for failover. An alternative is bounded in-memory state for v1 with optional persistence. Record the final decision in `DECISIONS.md`.
 
 ### request_metrics
+
 Store metadata, not raw content:
+
 - request id
 - conversation id
 - account id
@@ -233,6 +258,7 @@ Every category should indicate whether retry/failover is appropriate.
 Admin UI is intentionally outside the core milestones.
 
 When added it may expose:
+
 - account health,
 - add/disable account,
 - cooldown state,
