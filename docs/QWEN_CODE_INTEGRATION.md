@@ -10,15 +10,16 @@ HTTP protocol.
 
 **Status (M6):** plain chat works end-to-end (live-accepted 2026-08-14, a
 real Qwen Code v0.21.11 install answered through the gateway), and
-**prompt-emulated tool calling is now implemented** (ADR-023): the gateway
-teaches DeepSeek a control-envelope protocol, parses the answer, and emits
-real OpenAI structured `tool_calls`. The gateway side is live-verified —
-the M6 live smoke produced a valid tool call on the first try and answered
-the tool-history round trip correctly. The final M6 acceptance step is
-user-run: let real Qwen Code execute one structured tool call (checklist
-below). The verified wire facts live in `docs/UPSTREAM_NOTES.md`; the
-fixtured request shapes live in `tests/fixtures/qwen_code_wire/`; the tool
-protocol lives in `docs/TOOL_CALLING_PROTOCOL.md`.
+**prompt-emulated tool calling is implemented AND live-accepted** (ADR-023):
+the gateway teaches DeepSeek a control-envelope protocol, parses the
+answer, and emits real OpenAI structured `tool_calls`. **M6 acceptance
+PASSED (user-run, 2026-08-15):** real Qwen Code executed a multi-call loop
+of `list_directory` / `read_file` tool calls through the gateway and
+answered from the results. Four post-M6 live bugs found during the first
+attempt were fixed and live-re-verified (ADR-024/025/026/027). The
+verified wire facts live in `docs/UPSTREAM_NOTES.md`; the fixtured request
+shapes live in `tests/fixtures/qwen_code_wire/`; the tool protocol lives
+in `docs/TOOL_CALLING_PROTOCOL.md`.
 
 ## Recommended `~/.qwen/settings.json`
 
@@ -253,6 +254,12 @@ stop`. The model follows the control-envelope protocol; the canonical
 round trip works live.
 
 ## M6 acceptance (user-run checklist)
+
+**Status: PASSED (2026-08-15, user-run).** Real Qwen Code v0.21.11 on
+model `deepseek-web` executed a multi-call loop of `list_directory` /
+`read_file` through the gateway and answered from the results (diagnostics
+capture records 32–56). The checklist below is retained as the repro
+procedure.
 
 The final M6 exit step — real Qwen Code receives and executes one
 structured tool call:

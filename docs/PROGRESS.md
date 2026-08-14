@@ -6,7 +6,7 @@ The coding agent must update this file after every milestone.
 
 **Current milestone:** M6 — One emulated tool call
 
-**State:** COMPLETE (offline-verified AND gateway-side live-verified: the M6 live smoke against the real DeepSeek backend produced a valid structured tool call on the first try, and the tool-history round trip answered correctly). The user's first real Qwen Code acceptance attempt surfaced FOUR live bugs — all four are now DIAGNOSED, FIXED, and live-re-verified (post-M6 hotfix addendum below; ADR-024/025/026/027): the 69-tool instruction block stalled DeepSeek Web (>6 min); `parent_message_id` was serialized as a string where upstream requires a u32 number (every session-reuse turn 422'd); the wire adapter dropped the first streamed chunk when it arrived inside the initial snapshot event; and concurrent requests raced the shared wasmtime PoW solver and crashed the whole gateway process (the Rust panic the user reported). Final acceptance step is user-run again: connect real Qwen Code and let it execute one structured tool call. M7 (multi-turn tool loop) not started — awaits explicit instruction.
+**State:** COMPLETE — **M6 ACCEPTANCE PASSED (user-run, 2026-08-15)**. Real Qwen Code v0.21.11 executed structured tool calls through the gateway: a multi-turn loop of `list_directory` / `read_file` calls (7 calls across successive turns, incl. adapting after a permission denial), tool results compiled back, final answers incorporating the results; Qwen Code's background memory agent ran its own tool loop through the same gateway concurrently without issue. The four live bugs from the first attempt are fixed and live-verified (post-M6 hotfix addendum below; ADR-024/025/026/027). Remaining honest wrinkles are recorded in Known limitations (model sometimes answers plain text instead of an envelope — bounded repair is M7 scope). M7 (multi-turn tool loop hardening) not started — awaits explicit instruction.
 
 ## Completed
 
@@ -86,10 +86,31 @@ agent turn fired in the same second) now completes BOTH requests and
 the process survives (previously: wasmtime PoW race -> Rust panic ->
 python.exe abort; crash dumps at the exact request timestamps).
 Probe scripts deleted after use.
+
+M6 LIVE ACCEPTANCE (user-run, 2026-08-15 ~07:34 local, AFTER the four
+hotfixes): real Qwen Code v0.21.11 on model deepseek-web. Captures
+records 32-56: the main agent turn produced tool calls; a 7-call loop
+(list_directory/read_file pattern "lrllrrr", records 36-42) ran across
+successive turns with results compiled back each turn; the agent even
+adapted mid-loop (run_shell_command denied by the user's permission
+rules -> switched to read_file). Qwen Code's background "managed
+memory dream" agent ran its own tool loop through the same gateway
+concurrently (serialized by the ADR-027 call gate, no crash, no
+duplicate behavior). No python.exe crash dumps after the fix (last
+dump 06:28:18 = pre-fix paired requests; dozens of requests since,
+incl. same-second pairs, all clean). One wrinkle: the follow-up
+"Baca file QWEN.md" was auto-retried 5x byte-identical by the client
+before a rephrase with an @file reference succeeded via inlined
+content — response-side failure mode unobservable (capture is
+request-only by design); the model also answered the first question
+as plain text (with a hallucinated shell block) instead of an
+envelope. Both are M7 repair/instrumentation territory, not gateway
+regressions.
 ```
 
 ## Known limitations
 
+- **M6 ACCEPTANCE PASSED 2026-08-15 (user-run)** — see the "Tests run" entry for the full capture evidence. Residual wrinkles observed during the acceptance run (all M7 territory, none a gateway regression): (a) DeepSeek sometimes answers in plain text instead of emitting the envelope (the first turn produced a hallucinated shell block; one follow-up needed client retries + an @file rephrase) — bounded repair (re-prompt once on a missing/malformed envelope) is M7 scope; (b) diagnostics capture is REQUEST-only, so response-side failure modes of a retried turn cannot be forensically reconstructed — response-side opt-in capture is an M7 instrumentation candidate; (c) Qwen Code's background agents (memory "dream" passes) share the serialized backend — expected queueing under the ADR-027 call gate, observed working.
 - Live Qwen Code acceptance PASSED 2026-08-14 (user-run): plain chat works through a real Qwen Code v0.21.11 install; captures traffic-verified the wire fixtures (docs/UPSTREAM_NOTES.md, "Live traffic verification"). The M5-era MONITOR flag "byte-identical re-submissions before success" is now EXPLAINED: first attempts failed on the parent_message_id wire bug (ADR-025, 422) and/or the gateway crashing under concurrent requests (ADR-027, wasmtime PoW race), and the client's retry then hit the rebuild path — creating the visible duplicate DeepSeek chat with the full prompt re-sent. Structured tool calling arrived in M6 (live smoke passed first try); the user's first tool-execution acceptance attempt surfaced the FOUR live bugs fixed in the post-M6 hotfix (ADR-024/025/026/027) — the acceptance step is user-run again and prepared turnkey.
 - Backend calls are serialized by a process-wide call gate (ADR-027): the vendored client is not thread-safe (shared wasmtime PoW solver + per-turn parser seam), so concurrent OpenAI requests queue at the adapter boundary. A long turn delays any concurrent request until it finishes — expected for a single-account backend; before the gate, the same traffic killed the process.
 - M6 tool calling is intentionally single-shot (ADR-023): one tool call per model turn; text after a valid envelope is discarded; an invalid/truncated envelope flushes as honest plain text with NO bounded repair (re-prompting) — repair, repeated tool-result/model cycles, and persistent cross-request tool-call id mapping are all M7 scope. `tool_choice: "none"` fully disables tools; any other value with valid tools enables the envelope protocol.
@@ -105,7 +126,7 @@ Probe scripts deleted after use.
 
 ## Next action
 
-M6 is complete and live-verified on the gateway side, including the four post-M6 hotfix bugs the user's acceptance attempt surfaced (ADR-024/025/026/027). Remaining M6 acceptance is user-run AGAIN: restart the gateway (`python -m app.main`, `.env` configured) and give real Qwen Code one task that needs a single tool — the gateway emits the structured call, Qwen Code executes it and sends the result back, the gateway compiles it and answers (docs/QWEN_CODE_INTEGRATION.md, "M6 acceptance"). Turn 2 no longer creates a duplicate DeepSeek chat, no longer stalls, and the gateway no longer crashes when Qwen Code sends paired requests. After that, if the user approves, start M7 (multi-turn tool loop: persistent tool-call id mapping, repeated cycles, bounded repair, history validation). Do not start M7 without explicit instruction.
+**M6 is CLOSED — acceptance passed (user-run, 2026-08-15).** Real Qwen Code executed structured `list_directory`/`read_file` tool calls through the gateway and answered from the results; the four post-M6 hotfix bugs (ADR-024/025/026/027) held up under real traffic. The only remaining work in this milestone band is optional polish the acceptance surfaced (all M7-scoped): bounded repair for turns where the model answers plain text instead of an envelope, and opt-in response-side capture for forensics. Next milestone is M7 (multi-turn tool loop hardening: persistent tool-call id mapping, repeated cycles, bounded repair policy, history validation) — but per the milestone gate, do NOT start M7 without the user's explicit go-ahead.
 
 ---
 
@@ -156,8 +177,8 @@ M6 live smoke against the real DeepSeek backend: PASSED first try
 
 ### Honest gaps
 
-- The final M6 acceptance — a real Qwen Code executing the structured tool call — is user-run and has not happened yet (gateway side is live-proven; the client side is turnkey-prepared).
-- One tool call per turn only; malformed envelopes are flushed honestly but NOT repaired (bounded repair, repeated cycles, persistent ids = M7 by design).
+- ~~The final M6 acceptance — a real Qwen Code executing the structured tool call — is user-run and has not happened yet~~ — RESOLVED: acceptance PASSED 2026-08-15 (user-run; multi-call loop of list_directory/read_file through the gateway, results compiled back, answers incorporated — see the "Tests run" M6 LIVE ACCEPTANCE entry).
+- One tool call per turn only; malformed envelopes are flushed honestly but NOT repaired (bounded repair, repeated cycles, persistent ids = M7 by design). The acceptance run showed exactly this wrinkle live: one turn got a plain-text answer instead of an envelope and needed client retries + an @file rephrase.
 - Live multi-turn probe (`pytest -m live`) still has never run (unchanged from M5).
 
 ---
