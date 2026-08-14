@@ -6,7 +6,7 @@ The coding agent must update this file after every milestone.
 
 **Current milestone:** M5 — Real Qwen Code wire compatibility
 
-**State:** COMPLETE (offline-verified 2026-08-14: fixture-driven wire tests + real openai SDK against real uvicorn + end-to-end smoke; live Qwen Code connection prepared turnkey). Awaiting user review; M6 not started.
+**State:** COMPLETE (offline-verified AND live-accepted 2026-08-14: a real Qwen Code v0.21.11 install answered through the gateway; the 9 captured requests were diffed against the fixtures and every source-verified wire fact confirmed). Awaiting user decision on M6; M6 not started.
 
 ## Completed
 
@@ -22,11 +22,14 @@ The coding agent must update this file after every milestone.
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-289 passed, 3 deselected (live tests excluded by default marker)
+290 passed, 3 deselected (live tests excluded by default marker)
 
-Post-M5 addendum (same day): repository-root .env loading for live runs
-(ADR-022) — user opted to configure via .env for the live acceptance;
-+4 config tests (285 -> 289).
+Post-M5 addenda (same day):
+1. Repository-root .env loading for live runs (ADR-022) — user opted to
+   configure via .env for the live acceptance; +4 config tests (285->289).
+2. Live traffic verification fold-back: fixtures corrected to captured
+   values (max_tokens 32000, temperature 0) + new traffic-shaped fixture
+   side_query_respond_in_schema.json; +1 fixture test (289->290).
 
 M5 smoke (in-process uvicorn + real openai Python SDK 3.0.0 +
 GATEWAY_DIAGNOSTICS_DIR): env-parsed diagnostics_dir; health 200;
@@ -38,11 +41,17 @@ M5 SDK wire-compat tests run a real uvicorn gateway per module and
 drive it through the real openai SDK: models.list, non-stream,
 streaming with stream_options.include_usage, tools tolerance,
 extra_body non-standard fields — all green offline (FakeBackend).
+
+M5 LIVE ACCEPTANCE (user-run, 2026-08-14): real Qwen Code v0.21.11
+connected via .env-configured gateway; plain questions answered with
+normal streamed text; 9 requests captured sanitized and structurally
+diffed against tests/fixtures/qwen_code_wire/ (details in
+docs/UPSTREAM_NOTES.md, "Live traffic verification").
 ```
 
 ## Known limitations
 
-- Live Qwen Code acceptance is PREPARED but not executed: no real Qwen Code install has been connected yet (user test sessions have not happened). docs/QWEN_CODE_INTEGRATION.md contains the turnkey 2-minute live checklist; the offline proof is the real-SDK wire-compat suite. Wire fixtures are SOURCE-verified (Qwen Code v0.21.11), not traffic-captured — the diagnostic capture layer exists to convert them into traffic-verified ones on first live connection.
+- Live Qwen Code acceptance PASSED 2026-08-14 (user-run): plain chat works through a real Qwen Code v0.21.11 install; captures traffic-verified the wire fixtures (docs/UPSTREAM_NOTES.md, "Live traffic verification"). Two captured observations remain unexplained and are flagged MONITOR there (a reduced-tool parallel request lineage; byte-identical re-submissions before success). Structured tool calls remain M6.
 - `tools[]`/`tool_choice` are accepted but IGNORED (ADR-021): answers are plain text until M6 implements prompt-emulated tool calling. Tool-shaped history (assistant tool_calls / role=tool) still answers 400 UNSUPPORTED_MESSAGE until M6 (unreachable in plain chat — the gateway emits no tool calls yet).
 - Live multi-turn acceptance against chat.deepseek.com is NOT yet proven: `tests/test_live_upstream.py::test_live_multi_turn_threads_parent_message_id` is written (marker `live`) but has not run — the delta+parent strategy is validated offline only. If upstream rejects parent threading, the rebuild path (fresh session + full-history prompt) remains correct and is the documented fallback.
 - Conversation state is in-memory only (bounded 256, least-recently-updated eviction) and dies with the process; continuity self-heals because every request carries its own history. SQLite persistence deferred (ADR-020).
@@ -55,7 +64,7 @@ extra_body non-standard fields — all green offline (FakeBackend).
 
 ## Next action
 
-User reviews the M5 report. If approved, start M6 (one emulated tool call: normalize incoming tools, tool prompt compiler, control-envelope parser, structured tool_calls output, role=tool compilation).
+M5 is fully accepted (offline suite + live traffic). If the user approves, start M6 (one emulated tool call: normalize incoming tools, tool prompt compiler, control-envelope parser, structured tool_calls output, role=tool compilation). Do not start M6 without explicit instruction.
 
 ---
 
@@ -72,6 +81,7 @@ User reviews the M5 report. If approved, start M6 (one emulated tool call: norma
 - API_CONTRACT.md synchronized (M5, ADR-021 bullets: tools tolerance, wire-format references, diagnostic capture); existing tools-400 tests in test_api.py / test_api_streaming.py inverted to accepted-and-ignored.
 - End-to-end smoke (in-process uvicorn + real openai SDK + GATEWAY_DIAGNOSTICS_DIR): env parsing, health, non-stream chat with tools[], streaming chat, 2 sanitized capture records with no key value on disk — ALL PASS (script deleted after use, established pattern).
 - Post-M5 addendum (same day): repository-root `.env` loading for live runs (ADR-022) — `load_env_file` in `app/config.py` (minimal KEY=VALUE parser, no new dependency, real environment always wins, repo-root path resolved from the app package), wired ONLY in `app/main.py` so tests/embedders keep full environment control; `.env.example` documents the copy-to-`.env` workflow; `docs/QWEN_CODE_INTEGRATION.md` gained a "Starting the gateway" section. Prompted by the user choosing `.env` configuration for the live acceptance run.
+- LIVE ACCEPTANCE PASSED (same day, user-run): a real Qwen Code v0.21.11 (win32; x64) session answered plain questions through the gateway with normal streamed text. The diagnostics layer captured 9 requests; the structural diff confirmed every source-verified wire fact and folded three corrections back into the fixtures (max_tokens 32000, temperature 0 always sent, new `respond_in_schema` structured side-query shape — fixtured + regression-tested). Two observations flagged MONITOR in docs/UPSTREAM_NOTES.md ("Live traffic verification"): a reduced-tool parallel request lineage (origin unconfirmed), and byte-identical re-submissions before success on both user turns.
 
 ### Files changed
 
@@ -82,13 +92,16 @@ app/main.py (post-M5: .env loading), .env.example (GATEWAY_DIAGNOSTICS_DIR;
 post-M5: copy-to-.env + precedence note), pyproject.toml (dev extra: openai)
 tests/fixtures/qwen_code_wire/{README.md, agent_turn_stream_with_tools.json,
   plain_chat_non_stream.json, tool_history_turn.json,
-  non_standard_extras.json} (new)
+  non_standard_extras.json} (new; post-M5: agent fixture corrected to
+  traffic values, side_query_respond_in_schema.json added)
 tests/test_m5_wire_fixtures.py, tests/test_m5_diagnostics.py,
-  tests/test_m5_sdk_compat.py (new)
+  tests/test_m5_sdk_compat.py (new; post-M5: respond_in_schema test)
 tests/test_api.py, tests/test_api_streaming.py (tools tests inverted),
 tests/test_config.py (post-M5: TestLoadEnvFile)
 docs/DECISIONS.md (ADR-021; post-M5: ADR-022),
-docs/QWEN_CODE_INTEGRATION.md (rewritten; post-M5: Starting the gateway),
+docs/QWEN_CODE_INTEGRATION.md (rewritten; post-M5: Starting the gateway;
+  live acceptance PASSED),
+docs/UPSTREAM_NOTES.md (post-M5: Live traffic verification section),
 docs/API_CONTRACT.md (M5 sync), docs/PROGRESS.md
 ```
 
@@ -96,13 +109,13 @@ docs/API_CONTRACT.md (M5 sync), docs/PROGRESS.md
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-289 passed, 3 deselected (live tests excluded by default marker)
+290 passed, 3 deselected (live tests excluded by default marker)
 ```
 
 ### Honest gaps
 
-- No real Qwen Code install was connected (no user test session this milestone); offline proof = fixtures + real-SDK suite, live step prepared turnkey in docs/QWEN_CODE_INTEGRATION.md.
-- Fixtures are source-verified, not traffic-captured (drift check = diagnostics capture on first live connection).
+- Live multi-turn acceptance against chat.deepseek.com is still not run (the `live`-marked probe test exists; the user has not run it yet).
+- Two captured traffic observations are not yet explained (see MONITOR in docs/UPSTREAM_NOTES.md, "Live traffic verification"); request-side capture cannot determine the first attempts' outcomes.
 
 ---
 

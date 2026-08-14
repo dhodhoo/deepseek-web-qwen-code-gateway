@@ -14,7 +14,8 @@
   "stream_options": {
     "include_usage": true
   },
-  "max_tokens": 32768,
+  "max_tokens": 32000,
+  "temperature": 0,
   "tools": [
     {
       "type": "function",

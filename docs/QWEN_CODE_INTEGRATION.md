@@ -8,9 +8,11 @@ protocol it uses the official OpenAI Node.js SDK (pinned exactly at
 standards-correct OpenAI Chat Completions API rather than a Qwen-specific
 HTTP protocol.
 
-**Status (M5):** plain chat works end-to-end offline (SDK-driven wire
-tests, fixture tests). Structured tool calls arrive in M6 — until then the
-gateway accepts the `tools[]` Qwen Code always sends but answers plain
+**Status (M5):** plain chat works end-to-end — offline (SDK-driven wire
+tests, fixture tests) AND live: a real Qwen Code v0.21.11 install answered
+through the gateway on 2026-08-14, and the captured traffic confirmed the
+source-verified wire facts. Structured tool calls arrive in M6 — until then
+the gateway accepts the `tools[]` Qwen Code always sends but answers plain
 text (ADR-021). The verified wire facts live in
 `docs/UPSTREAM_NOTES.md`; the fixtured request shapes live in
 `tests/fixtures/qwen_code_wire/`.
@@ -123,24 +125,29 @@ The OpenAI SDK appends the resource path.
 | `max_tokens` (always sent, possibly huge)                                                                             | Accepted; DeepSeek applies its own upstream limits                                                                        |
 | Embeddings (`/v1/embeddings`, client hardcodes `text-embedding-ada-002`)                                              | Not implemented — out of core milestones; the endpoint 404s                                                               |
 
-## Wire verification status (M5)
+## Wire verification status (M5 — traffic-verified)
 
-The checklist from the M0-era plan is now covered without live capture,
-because no live Qwen Code session has run yet:
+The checklist from the M0-era plan is covered; since the 2026-08-14 live
+acceptance run the plain-chat path is also **traffic-verified**:
 
 - plain chat request fields, `stream` behavior, `tools[]` shape,
   `tool_choice`, assistant `tool_calls` history, `role: "tool"` shape,
-  finish expectations, extra fields — all **source-verified** from Qwen
-  Code v0.21.11 and fixtured in `tests/fixtures/qwen_code_wire/` (see the
+  finish expectations, extra fields — **source-verified** from Qwen Code
+  v0.21.11 and fixtured in `tests/fixtures/qwen_code_wire/` (see the
   fixture README for provenance); regression-covered by
   `tests/test_m5_wire_fixtures.py` and SDK-driven
   `tests/test_m5_sdk_compat.py`.
-- When a real Qwen Code IS connected, enable the diagnostic capture layer
-  (`GATEWAY_DIAGNOSTICS_DIR`, `app/diagnostics.py`): every authenticated
+- Live capture diff (9 requests, diagnostics layer enabled): every
+  source-verified fact confirmed; corrections folded back into the
+  fixtures — `max_tokens` 32000, `temperature: 0` present, and a new
+  request class (`respond_in_schema` structured side query:
+  `tool_choice: 'required'` + single tool, answered plain text and
+  tolerated). Details in `docs/UPSTREAM_NOTES.md`, "Live traffic
+  verification".
+- The diagnostic capture layer (`GATEWAY_DIAGNOSTICS_DIR`,
+  `app/diagnostics.py`) stays available for future drift checks: every
   request is appended sanitized (Authorization value never written; bodies
   ARE written — use a private directory) to `<dir>/requests.jsonl`.
-  Compare captures against the fixtures and record drift in
-  `UPSTREAM_NOTES.md`.
 
 ## Tool-history invariant
 
@@ -214,14 +221,11 @@ active provider/model using Qwen Code's current commands such as:
 For scripted tests, Qwen Code also supports non-interactive/headless
 prompting; verify current flags before automating them.
 
-## Live acceptance (M5, prepared, user-run)
+## Live acceptance (M5 — PASSED 2026-08-14)
 
-Everything above is verified offline. The remaining two-minute live step:
-
-1. Fill the gateway's `.env` (`GATEWAY_BACKEND=deepseek_web`, real
-   `DEEPSEEK_AUTH_TOKEN`, `DEEPSEEK_GATEWAY_API_KEY`, optionally
-   `GATEWAY_DIAGNOSTICS_DIR`) and start `python -m app.main`.
-2. Start Qwen Code with the settings above and ask one plain question.
-
-Expected: a normal streamed answer, and one sanitized record per request
-in the diagnostics directory when capture is enabled.
+Executed exactly as prepared: `.env` filled (`GATEWAY_BACKEND=deepseek_web`,
+real token, gateway key, diagnostics dir), `python -m app.main`, a new Qwen
+Code session, `/model` → DeepSeek Web Gateway, plain questions. Result:
+normal streamed answers; 9 sanitized captures recorded and diffed against
+the fixtures (see "Wire verification status" above). Rollback is `/model`
+back to the previous provider.

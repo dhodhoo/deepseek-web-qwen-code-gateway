@@ -193,8 +193,9 @@ Never place a real token, cookie, account identifier, or sensitive response into
 
 Docs verified 2026-08-14 against the live documentation site.
 **Source-level wire verification completed 2026-08-14** against the public
-repository (static source inspection; a real-installation traffic capture
-still happens in M5).
+repository (static source inspection). **Real-installation traffic captured
+2026-08-14** during the M5 live acceptance run — see "Live traffic
+verification" at the end of this section.
 
 ### Version tested
 
@@ -440,3 +441,57 @@ provider path.
 8. The client is highly tolerant of wire quirks (missing/null `finish_reason`, duplicate finish chunks, `content: null` on tool-only assistant messages, missing tool*call ids with `call*<index>` fallback) — emitting standard OpenAI shapes is safe.
 9. `embedContent()` hardcodes model `text-embedding-ada-002` against `{baseURL}/embeddings` — if embeddings are ever exercised, the gateway must alias that model or fail clearly (out of core milestones).
 10. openai Node SDK is pinned exactly at `5.11.0` — wire expectations are stable per that SDK version.
+
+### Live traffic verification (M5 acceptance, 2026-08-14)
+
+A real Qwen Code **v0.21.11 (win32; x64)** installation was connected to the
+gateway with the diagnostic capture layer enabled; 9 requests were recorded
+during a successful plain-chat session. Structural diff against the
+source-verified expectations above:
+
+**Confirmed as source-verified:**
+
+- User-Agent `QwenCode/0.21.11 (win32; x64)`; `Authorization: Bearer`
+  present on every request.
+- Agent turns: explicit `stream: true` + `stream_options:
+{"include_usage": true}`; side queries send explicit `stream: false`
+  with NO `stream_options` key.
+- `tools[]` shape uniform `{type: "function", function: {name, description,
+parameters}}`; no `strict`, no `parallel_tool_calls` — observed at scale
+  (up to 69 tools in one request, including MCP-provided tools).
+- `tool_choice` observed only as `'required'` (structured side queries);
+  absent on agent turns. Never `'auto'`.
+- `max_tokens` always present (value 32000 on this install — a user
+  setting, honored verbatim per `applyOutputTokenLimit`).
+- Multi-turn assistant history carried plain string content (the gateway
+  never emitted tool_calls, so the tool-history 400 stayed unreachable, as
+  designed in M5).
+- Non-standard extras: NONE observed in this session (the leniency fixtures
+  remain defensive).
+- All 9 requests answered 200; Qwen Code functioned normally end-to-end.
+
+**Corrections folded back into fixtures:**
+
+1. `max_tokens` was 32000, not the 32768 used in the synthesized fixture.
+2. `temperature: 0` present on every request (fixtures had omitted it).
+3. New request class: a **structured side query** fires alongside each user
+   submission — `stream: false` + `tool_choice: 'required'` + a single
+   `respond_in_schema` tool with a small system prompt. The gateway answers
+   plain text (tools ignored, ADR-021) and Qwen Code tolerates that.
+   Fixtured as `side_query_respond_in_schema.json`.
+
+**Observations not yet fully explained (monitor):**
+
+- A parallel request lineage ran with a different (smaller) system prompt
+  and a reduced 7-tool set (read_file, grep_search, glob, list_directory,
+  run_shell_command, write_file, edit), inheriting the parent conversation
+  messages — ORIGIN-UNCONFIRMED, probably a Qwen Code delegation/subagent
+  pipeline. Served fine (200 plain text).
+- Both user turns were re-submitted byte-identically 1–5 s after the first
+  attempt before succeeding. Capture is request-side only, so the first
+  attempt's outcome is unknown; consistent with an SDK/app retry after a
+  5xx/stream interruption or the client's SSE auto-resume. If this
+  reproduces with visible errors, check gateway logs for the first attempt.
+
+Privacy: raw captures remain in the user's private diagnostics directory
+(they contain real prompts); only structural facts are recorded here.

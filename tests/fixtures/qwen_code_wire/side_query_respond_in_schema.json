@@ -1,0 +1,43 @@
+{
+  "model": "deepseek-web",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a metadata extraction assistant. Respond only through the provided tool schema."
+    },
+    {
+      "role": "user",
+      "content": "Extract the topic of this conversation:\n\nUser: What files are in the current directory?"
+    }
+  ],
+  "stream": false,
+  "max_tokens": 32000,
+  "temperature": 0,
+  "tool_choice": "required",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "respond_in_schema",
+        "description": "Respond using the required schema.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "A short title for the conversation topic."
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional topic tags."
+            }
+          },
+          "required": ["title"]
+        }
+      }
+    }
+  ]
+}

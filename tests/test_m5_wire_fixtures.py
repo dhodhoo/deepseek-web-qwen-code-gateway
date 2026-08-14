@@ -9,6 +9,10 @@ format is covered:
 * agent turn with tools[] + stream_options     → plain-text 200 (tools
   accepted and ignored until M6, ADR-021);
 * side query (stream: false, no tools)         → 200 non-stream JSON;
+* structured side query (stream: false,
+  tool_choice 'required' + single
+  respond_in_schema tool; traffic-verified
+  2026-08-14)                                  → 200 non-stream plain text;
 * tool-loop history (assistant tool_calls /
   role=tool)                                   → deterministic 400
   UNSUPPORTED_MESSAGE until M6 implements tool-history compilation;
@@ -154,6 +158,35 @@ class TestPlainChatNonStream:
         assert body["model"] == "deepseek-web"
         assert body["choices"][0]["finish_reason"] == "stop"
         assert body["choices"][0]["message"]["content"] == answer
+
+
+class TestSideQueryRespondInSchema:
+    """Fixture: side_query_respond_in_schema.json.
+
+    Traffic-verified shape (2026-08-14): alongside each user submission
+    Qwen Code fires a non-streaming side query with ``tool_choice:
+    'required'`` and a single ``respond_in_schema`` tool. Until M6 the
+    gateway ignores tools and answers plain text, which the client
+    tolerates (observed live: the session continued normally).
+    """
+
+    def test_plain_text_200_despite_required_single_tool(self) -> None:
+        answer = "Listing directory contents"
+        backend = FakeBackend(turns=[fake_text_turn(answer)])
+        client = _client(_settings(), backend)
+        response = client.post(
+            "/v1/chat/completions",
+            json=_load_fixture("side_query_respond_in_schema.json"),
+            headers=AUTH,
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["object"] == "chat.completion"
+        assert body["choices"][0]["finish_reason"] == "stop"
+        assert body["choices"][0]["message"] == {
+            "role": "assistant",
+            "content": answer,
+        }
 
 
 class TestToolHistoryTurn:
