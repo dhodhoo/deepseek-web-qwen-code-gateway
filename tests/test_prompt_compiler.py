@@ -1,14 +1,24 @@
-"""M2 tests: deterministic OpenAI-messages → prompt compiler."""
+"""M2 tests: deterministic OpenAI-messages → prompt compiler.
+
+Extended in M4: the compiler now splits into ``messages_to_canonical``
+(validate + normalize into canonical state) and
+``compile_canonical_to_prompt`` (render canonical messages), so the
+conversation manager can compile per-turn deltas through the exact same
+code path (ADR-020). ``compile_messages_to_prompt`` keeps its M2 behavior.
+"""
 
 from __future__ import annotations
 
 import pytest
 
+from app.conversation import CanonicalMessage, CanonicalToolCall
 from app.openai_types import ChatMessage
 from app.prompt_compiler import (
     UnsupportedMessageError,
+    compile_canonical_to_prompt,
     compile_messages_to_prompt,
     extract_text,
+    messages_to_canonical,
 )
 
 
@@ -116,3 +126,106 @@ class TestCompileMessages:
     def test_error_message_identifies_the_offending_index(self) -> None:
         with pytest.raises(UnsupportedMessageError, match=r"messages\[1\]"):
             compile_messages_to_prompt([_msg("user", "hi"), _msg("tool", "x")])
+
+
+class TestMessagesToCanonical:
+    """M4: validation + normalization into the canonical state shape."""
+
+    def test_plain_history_normalizes_to_canonical_messages(self) -> None:
+        canonical = messages_to_canonical(
+            [_msg("system", "Be brief."), _msg("user", "Hello")]
+        )
+        assert canonical == [
+            CanonicalMessage(role="system", content="Be brief."),
+            CanonicalMessage(role="user", content="Hello"),
+        ]
+
+    def test_content_lists_are_reduced_to_text(self) -> None:
+        canonical = messages_to_canonical(
+            [
+                _msg(
+                    "user",
+                    [
+                        {"type": "text", "text": "a"},
+                        {"type": "image_url", "image_url": {"url": "x"}},
+                        {"type": "text", "text": "b"},
+                    ],
+                )
+            ]
+        )
+        assert canonical == [CanonicalMessage(role="user", content="a\nb")]
+
+    def test_rejections_match_the_m2_compiler_exactly(self) -> None:
+        # Same gate, same messages — canonicalization is the validation path
+        # now taken by the API layer before conversation resolution.
+        with pytest.raises(UnsupportedMessageError, match="must not be empty"):
+            messages_to_canonical([])
+        with pytest.raises(UnsupportedMessageError, match="M6"):
+            messages_to_canonical([_msg("tool", "r", tool_call_id="c")])
+        with pytest.raises(UnsupportedMessageError, match="unsupported role"):
+            messages_to_canonical([_msg("developer", "hi")])
+        with pytest.raises(UnsupportedMessageError, match="M6"):
+            messages_to_canonical(
+                [
+                    _msg(
+                        "assistant",
+                        "x",
+                        tool_calls=[
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {"name": "run", "arguments": "{}"},
+                            }
+                        ],
+                    )
+                ]
+            )
+        with pytest.raises(UnsupportedMessageError, match="M6"):
+            messages_to_canonical([_msg("assistant", None)])
+        with pytest.raises(UnsupportedMessageError, match=r"messages\[1\]"):
+            messages_to_canonical([_msg("user", "hi"), _msg("tool", "x")])
+
+
+class TestCompileCanonical:
+    """M4: rendering canonical messages (full histories AND deltas)."""
+
+    def test_canonical_history_compiles_to_labeled_blocks(self) -> None:
+        canonical = [
+            CanonicalMessage(role="user", content="Hello"),
+            CanonicalMessage(role="assistant", content="Hi there"),
+        ]
+        assert (
+            compile_canonical_to_prompt(canonical)
+            == "[user]\nHello\n\n[assistant]\nHi there"
+        )
+
+    def test_delta_subsequences_compile_through_the_same_path(self) -> None:
+        # The conversation manager compiles per-turn deltas (ADR-020): a
+        # single-message tail must render exactly like the M2 compiler would.
+        assert (
+            compile_canonical_to_prompt(
+                [CanonicalMessage(role="user", content="two")]
+            )
+            == compile_messages_to_prompt([_msg("user", "two")])
+        )
+
+    def test_empty_canonical_is_rejected(self) -> None:
+        with pytest.raises(UnsupportedMessageError, match="must not be empty"):
+            compile_canonical_to_prompt([])
+
+    def test_tool_shaped_canonical_is_rejected_until_m6(self) -> None:
+        call = CanonicalToolCall(
+            id="c1", function_name="run", arguments_json="{}"
+        )
+        with pytest.raises(UnsupportedMessageError, match="M6"):
+            compile_canonical_to_prompt(
+                [CanonicalMessage(role="tool", content="r", tool_call_id="c1")]
+            )
+        with pytest.raises(UnsupportedMessageError, match="M6"):
+            compile_canonical_to_prompt(
+                [CanonicalMessage(role="assistant", content=None, tool_calls=(call,))]
+            )
+        with pytest.raises(UnsupportedMessageError, match="M6"):
+            compile_canonical_to_prompt(
+                [CanonicalMessage(role="assistant", content=None)]
+            )

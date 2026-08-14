@@ -4,9 +4,9 @@ The coding agent must update this file after every milestone.
 
 ## Current status
 
-**Current milestone:** M3 — OpenAI SSE streaming
+**Current milestone:** M4 — Canonical conversation/session state
 
-**State:** COMPLETE (offline-verified + live curl smoke 2026-08-14). Awaiting user review; M4 not started.
+**State:** COMPLETE (offline-verified + live HTTP smoke 2026-08-14). Awaiting user review; M5 not started.
 
 ## Completed
 
@@ -15,30 +15,96 @@ The coding agent must update this file after every milestone.
 - M1 (2026-08-14): stable backend interface, FakeBackend, configuration boundary, import-boundary guard.
 - M2 (2026-08-14): FastAPI gateway surface — /health, /v1/models, non-streaming /v1/chat/completions with bearer auth, deterministic message compiler, OpenAI error mapping.
 - M3 (2026-08-14): OpenAI SSE streaming — event→chunk translator, primed pre-stream error handling, in-stream mid-failure envelope, [DONE], disconnect-safe generator.
+- M4 (2026-08-14): canonical conversation state — bounded in-memory store, history-prefix resolution, backend session reuse, parent-message threading, commit-on-finish + rebuild-on-failure, reconstruction tests.
 
 ## Tests run
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-228 passed, 2 deselected (live tests excluded by default marker)
+265 passed, 3 deselected (live tests excluded by default marker)
 
-Live curl smoke (GATEWAY_BACKEND=fake): stream:true returned incremental
-chat.completion.chunk lines + data: [DONE]; pre-stream failure answered a
-real HTTP status with the OpenAI error body; non-stream chat unaffected.
+Live HTTP smoke (scripted FakeBackend behind real uvicorn, port 8144):
+turn1 -> 200; turn2 -> 200; ONE backend session reused; parent
+threading None -> 'resp-1'; delta prompts ('[user]\none' then
+'[user]\ntwo'); store: 1 conversation, 4 canonical messages,
+JSON snapshot round-trip.
 ```
 
 ## Known limitations
 
+- Live multi-turn acceptance against chat.deepseek.com is NOT yet proven: `tests/test_live_upstream.py::test_live_multi_turn_threads_parent_message_id` is written (marker `live`) but has not run — the delta+parent strategy is validated offline only. If upstream rejects parent threading, the rebuild path (fresh session + full-history prompt) remains correct and is the documented fallback.
+- Conversation state is in-memory only (bounded 256, least-recently-updated eviction) and dies with the process; continuity self-heals because every request carries its own history. SQLite persistence deferred (ADR-020).
 - Live error paths (429/5xx/Cloudflare) were not triggered during probing; classification is unit-tested offline only.
-- Multi-turn threading (parent_message_id = previous response_message_id) is captured but not yet exercised end-to-end (M4).
 - Upstream deepseek4free is dormant since 2025-02-09; its stream parser was fully obsolete (protocol changed). Further drift is possible at any time; probe captures are the early-warning mechanism.
-- Each request creates a fresh backend session (no conversation reuse until M4); sampling parameters are accepted but ignored; no usage chunk in streams (no upstream token counts).
-- Reasoning/thinking content is intentionally NOT surfaced in M3 streams.
+- Sampling parameters are accepted but ignored; no usage chunk in streams (no upstream token counts).
+- Reasoning/thinking content is intentionally NOT surfaced in streams.
 - Tool calling, Qwen Code provider wiring, multi-account, UI, Docker intentionally not started.
 
 ## Next action
 
-User reviews the M3 report. If approved, start M4 (canonical conversation/session state, multi-turn).
+User reviews the M4 report. If approved, start M5 (real Qwen Code wire compatibility, diagnostic fixtures).
+
+---
+
+## 2026-08-14 — M4: Canonical conversation/session state
+
+### Completed
+
+- Canonical state module `app/conversation.py` (ADR-020): `CanonicalMessage` / `CanonicalToolCall` (tool-history-capable representation — tool fields exist now, populated from M6), `Conversation` with every ARCHITECTURE.md field (`conversation_id`, `backend_type`, `backend_account_id`, `backend_session_id`, `backend_parent_message_id`, timestamps, `status`, normalized history) plus JSON-serializable `to_dict`/`from_dict` (the reconstructable representation), and `ConversationStore` — bounded in-memory (default 256, least-recently-updated eviction), lock-guarded (threadpool-safe).
+- Storage decision recorded per ARCHITECTURE.md: bounded in-memory only for v1 — nothing written to disk (privacy default "never persist raw prompts by default"); SQLite reconsidered with multi-account (M10). After a restart the client's re-sent history IS the reconstruction path.
+- Conversation resolution from the request's own message history (no header, per contract): longest STRICT prefix match on canonical history returns the conversation + trailing delta; equal histories (duplicate re-sends) and divergent histories fall back to a new conversation compiled from the request's full history.
+- Session reuse + parent threading: matched conversations with a live backend link reuse the backend session, send ONLY the delta prompt, and pass the stored `backend_parent_message_id`. The id comes from captured `BackendMessageId` events — the DeepSeek ready frame already emits it since M0 (wire.py → chunk_dict_to_events), so NO backend changes were needed; FakeBackend scripts it in tests. New/unlinked conversations rebuild: fresh backend session + full-history prompt — canonical state is always sufficient to rebuild a remote session (ARCHITECTURE failover requirement).
+- Failure semantics (both response modes): history advances ONLY on `MessageFinished` via a shared `_TurnRecorder`; `BackendFailure` leaves history untouched and invalidates the backend link (session + parent), so the next request rebuilds. Partial assistant text is never stored.
+- Compiler split (`app/prompt_compiler.py`): `messages_to_canonical` (validation gate) + `compile_canonical_to_prompt` (renders full histories AND per-turn deltas through one code path); `compile_messages_to_prompt` unchanged in behavior (all M2 tests green).
+- `create_app(settings, backend, store)` — the store is injectable; reconstruction proven end-to-end: snapshot → dict → fresh store → follow-up request continues the SAME backend session + parent.
+- Live multi-turn acceptance test written (`tests/test_live_upstream.py`, marker `live`): second turn on the same session parented under the first turn's `response_message_id`, with a context-recall assertion (word remembered across turns). Not executed this round (user declined manual testing); it is the acceptance check for the delta+parent strategy.
+
+### Files changed
+
+```text
+app/conversation.py (new)
+app/prompt_compiler.py (split: messages_to_canonical + compile_canonical_to_prompt)
+app/server.py (conversation resolution, session reuse, parent threading,
+               _TurnRecorder + commit/invalidate, injectable store)
+tests/test_conversation.py (new), tests/test_api_multi_turn.py (new)
+tests/test_prompt_compiler.py (canonical tests)
+tests/test_api.py, tests/test_api_streaming.py (renamed duplicate-request tests + M4 notes)
+tests/test_live_upstream.py (live multi-turn probe)
+docs/DECISIONS.md (ADR-020), docs/API_CONTRACT.md (implementation status +
+conversation identity), docs/PROGRESS.md
+```
+
+### Tests executed
+
+```text
+.venv\Scripts\python.exe -m pytest -q
+265 passed, 3 deselected in 3.06s   (228 M0-M3 tests + 37 new M4 tests)
+
+Live HTTP smoke (scripted FakeBackend behind real uvicorn, 127.0.0.1:8144):
+  turn1 [user one]                            -> 200 'First reply.' (session fake-session-1)
+  turn2 [user one, assistant ..., user two]   -> 200 'Second reply.'
+  sessions_created=1 (reused); parent_message_id None -> 'resp-1'
+  prompts: '[user]\none' then '[user]\ntwo' (delta only — session holds context)
+  store: 1 conversation, 4 canonical messages, JSON snapshot 466 bytes
+```
+
+### Upstream observations
+
+None new — M4 runs against `FakeBackend` only; no DeepSeek traffic. The deferred-from-M0 "live multi-turn acceptance" is now codified as `test_live_multi_turn_threads_parent_message_id` (marker `live`), ready for the next credential run.
+
+### Known limitations
+
+- Live multi-turn against chat.deepseek.com unverified (probe written, not run). Fallback if upstream rejects threading: the rebuild path (fresh session + full-history prompt) is already implemented as the invalidation path and is always correct.
+- In-memory state dies on restart; continuity self-heals from client history (ADR-020 trade-off). Concurrent duplicate requests may create duplicate conversation rows (single-user local gateway; accepted).
+- Re-sending an exactly-completed history starts a NEW conversation (duplicate ≠ continuation) — deliberate and tested.
+
+### Decisions added/changed
+
+- ADR-020 canonical conversation state: bounded in-memory store (the v1 storage decision ARCHITECTURE.md asked to record), history-prefix resolution, delta-vs-rebuild prompt rule, commit-on-finish + invalidate-on-failure, parent threading from `BackendMessageId`.
+
+### Next milestone
+
+M5 — Real Qwen Code wire compatibility: diagnostic fixtures from real Qwen Code traffic, request/response validation against the verified client behavior (awaiting explicit user approval).
 
 ---
 

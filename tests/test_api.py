@@ -154,7 +154,12 @@ class TestChatCompletionsSuccess:
         assert client.post("/v1/chat/completions", json=payload, headers=AUTH).status_code == 200
         assert backend.turn_calls[0].prompt == "[user]\na\nb"
 
-    def test_each_request_creates_a_fresh_backend_session(self) -> None:
+    def test_repeated_identical_request_is_a_new_conversation_and_session(self) -> None:
+        # M4 note: session reuse applies to CONTINUATIONS (request history
+        # strictly extends stored history, ADR-020). Re-sending the same
+        # single user message is a duplicate, not a continuation — the
+        # stored history already contains the assistant reply — so it still
+        # starts a fresh conversation and backend session.
         backend = FakeBackend(turns=[fake_text_turn("1"), fake_text_turn("2")])
         client = _client(_settings(), backend)
         assert client.post("/v1/chat/completions", json=_chat_body(), headers=AUTH).status_code == 200

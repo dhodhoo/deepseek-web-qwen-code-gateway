@@ -12,7 +12,7 @@ Primary prefix:
 
 ## Implementation status
 
-Last synchronized: M3 (2026-08-14). See also docs/PROGRESS.md and docs/DECISIONS.md (ADR-017..019).
+Last synchronized: M4 (2026-08-14). See also docs/PROGRESS.md and docs/DECISIONS.md (ADR-017..020).
 
 - `GET /health` — implemented (M2). Unauthenticated by design; exposes no secrets.
 - `GET /v1/models` — implemented (M2). One gateway alias (`GATEWAY_MODEL_ID`, default `deepseek-web`).
@@ -25,7 +25,8 @@ Last synchronized: M3 (2026-08-14). See also docs/PROGRESS.md and docs/DECISIONS
   - Unknown `model` → `404 model_not_found`; empty/missing `messages` or `model` → `422`.
 - Authentication (M2): `Authorization: Bearer <DEEPSEEK_GATEWAY_API_KEY>` on `/v1/*`. Secure-by-default: unconfigured key → `503 GATEWAY_API_KEY_NOT_CONFIGURED` unless `GATEWAY_ALLOW_NO_AUTH=1` (ADR-017).
 - Error envelope (M2): `{"error": {"message", "type", "code"}}`; `BackendFailure` categories map per the suggested HTTP table with `code` = category value (`app/error_mapping.py`).
-- Streaming tool-call chunks, conversation identity: NOT yet implemented (M6 / M4).
+- Conversation continuity (M4, ADR-020): resolved from the request's own message history — no conversation header exists or is required. A request whose history STRICTLY extends a stored canonical history continues that conversation: the gateway reuses the backend session, sends only the new trailing messages upstream, and threads `parent_message_id`. New, divergent, or duplicate (equal-history) requests start a fresh conversation compiled from the request's full history. Canonical history advances only when a turn completes; failures invalidate the backend link and the next request rebuilds from canonical state. State is in-memory only (bounded; lost on restart — continuity self-heals because requests carry their own history).
+- Streaming tool-call chunks: NOT yet implemented (M6).
 
 ## Authentication
 
@@ -245,6 +246,11 @@ The gateway may infer conversation continuity from incoming message history.
 If an optional internal header is introduced, it must not be required for Qwen Code compatibility.
 
 Prefer correctness from the request's canonical message history.
+
+Implemented in M4 (ADR-020): continuity is inferred exclusively from the
+incoming canonical message history (longest strict prefix match against the
+local canonical store). No header exists, and conversation identity is
+internal gateway state only — it never appears in responses.
 
 ## Error responses
 

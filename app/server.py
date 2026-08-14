@@ -1,4 +1,4 @@
-"""FastAPI application — OpenAI-compatible HTTP surface (M2/M3 subset).
+"""FastAPI application — OpenAI-compatible HTTP surface (M2/M3/M4 subset).
 
 Endpoints (docs/API_CONTRACT.md):
 
@@ -6,7 +6,9 @@ Endpoints (docs/API_CONTRACT.md):
   exposes no secrets)
 * ``GET  /v1/models``           — gateway model alias list (auth required)
 * ``POST /v1/chat/completions`` — plain chat, non-streaming (M2) and OpenAI
-  SSE streaming (M3); ``tools``/``tool_choice`` answer 400 until M6
+  SSE streaming (M3) with multi-turn conversation continuity resolved from
+  the request's own message history (M4); ``tools``/``tool_choice`` answer
+  400 until M6
 
 Threading note: the DeepSeek backend is synchronous/blocking (vendored
 curl-cffi). All route handlers are therefore plain ``def`` — Starlette runs
@@ -15,8 +17,14 @@ them in its threadpool so the event loop is never blocked (master prompt:
 Streaming additionally consumes the blocking event iterator through
 ``starlette.concurrency.iterate_in_threadpool`` (see app/streaming.py).
 
-Session policy (M2/M3): each request creates a fresh backend session.
-Canonical conversation state and session reuse arrive in M4.
+Session policy (M4, ADR-020): every request is resolved against the local
+canonical state (:mod:`app.conversation`) — the source of truth. A matching
+conversation with a live backend link reuses its backend session, sends only
+the new (delta) messages, and threads the stored ``parent_message_id``.
+New conversations — or conversations whose backend link was invalidated
+after a failure — create a fresh backend session and rebuild the prompt
+from the request's FULL history. Canonical history advances only when a
+turn finishes (``MessageFinished``); partial turns never touch it.
 """
 
 from __future__ import annotations
@@ -24,6 +32,7 @@ from __future__ import annotations
 import hmac
 import time
 import uuid
+from dataclasses import dataclass
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -31,8 +40,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import __version__
 from .backends.base import LLMBackend
 from .backends.errors import BackendErrorCategory, BackendFailure
-from .backends.events import BackendError, MessageFinished, TextDelta
+from .backends.events import (
+    BackendError,
+    BackendMessageId,
+    MessageFinished,
+    TextDelta,
+)
 from .config import GatewaySettings, build_backend
+from .conversation import CanonicalMessage, Conversation, ConversationStore
 from .error_mapping import backend_failure_to_response, openai_error_body
 from .openai_types import (
     AssistantMessageOut,
@@ -42,7 +57,11 @@ from .openai_types import (
     ModelInfo,
     ModelList,
 )
-from .prompt_compiler import UnsupportedMessageError, compile_messages_to_prompt
+from .prompt_compiler import (
+    UnsupportedMessageError,
+    compile_canonical_to_prompt,
+    messages_to_canonical,
+)
 from .streaming import STREAM_EMPTY, sse_stream
 
 __all__ = ["create_app", "GatewayHttpError"]
@@ -76,10 +95,149 @@ def _category_or_internal(kind: str) -> BackendErrorCategory:
         return BackendErrorCategory.INTERNAL
 
 
+# ---------------------------------------------------------------------------
+# M4: per-request conversation resolution + canonical-state bookkeeping
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _TurnContext:
+    """One chat-completions request's resolved conversation state (ADR-020).
+
+    Created per request, never shared across requests. ``conversation`` is
+    ``None`` when the request starts a brand-new conversation (no stored
+    history matched); the conversation row is only born when the turn
+    commits (commit-on-finish), so failed first turns leave no debris.
+    """
+
+    store: ConversationStore
+    backend_type: str
+    incoming: list[CanonicalMessage]  # the request's full canonical history
+    conversation: Conversation | None
+    session_id: str
+    parent_message_id: str | None
+
+
+class _TurnRecorder:
+    """Accumulates one turn's canonical outcome from backend events.
+
+    ``observe`` is fed every event the backend yields (both response modes).
+    The recorder collects the assistant text and the last backend message id
+    (the next turn's ``parent_message_id``, M0 threading convention) and
+    notes whether the turn finished. Committing to the store is the caller's
+    decision — only on finish (ADR-020 point 5).
+    """
+
+    __slots__ = ("text_parts", "parent_message_id", "finished", "committed")
+
+    def __init__(self) -> None:
+        self.text_parts: list[str] = []
+        self.parent_message_id: str | None = None
+        self.finished = False
+        self.committed = False
+
+    def observe(self, event) -> None:
+        if isinstance(event, TextDelta):
+            self.text_parts.append(event.text)
+        elif isinstance(event, BackendMessageId):
+            self.parent_message_id = event.id
+        elif isinstance(event, MessageFinished):
+            self.finished = True
+
+    @property
+    def text(self) -> str:
+        return "".join(self.text_parts)
+
+    def assistant_message(self) -> CanonicalMessage:
+        return CanonicalMessage(role="assistant", content=self.text)
+
+
+def _prepare_turn(
+    request: Request,
+    backend_: LLMBackend,
+    canonical: list[CanonicalMessage],
+) -> tuple[_TurnContext, str]:
+    """Resolve the conversation; choose backend session and prompt (ADR-020).
+
+    Matched conversation with a live backend link → reuse its session and
+    compile ONLY the trailing delta messages (the upstream session already
+    holds prior context). Otherwise create a fresh backend session and
+    compile the request's FULL history (rebuild from canonical state —
+    always correct, and exactly what a restart requires). ``create_session``
+    may raise ``BackendFailure``; it crosses as an HTTP error through the
+    app-level handler.
+    """
+    store: ConversationStore = request.app.state.store
+    conversation, delta = store.resolve(backend_.backend_type, canonical)
+
+    if conversation is not None and conversation.backend_session_id is not None:
+        session_id = conversation.backend_session_id
+        parent_message_id = conversation.backend_parent_message_id
+        prompt_messages = delta
+    else:
+        session = backend_.create_session()
+        session_id = session.session_id
+        parent_message_id = None
+        prompt_messages = canonical
+
+    prompt = compile_canonical_to_prompt(prompt_messages)
+    context = _TurnContext(
+        store=store,
+        backend_type=backend_.backend_type,
+        incoming=canonical,
+        conversation=conversation,
+        session_id=session_id,
+        parent_message_id=parent_message_id,
+    )
+    return context, prompt
+
+
+def _commit_turn(context: _TurnContext, recorder: _TurnRecorder) -> None:
+    """Store a completed turn: history := incoming + assistant reply."""
+    context.store.commit_turn(
+        context.backend_type,
+        context.conversation,
+        context.incoming,
+        recorder.assistant_message(),
+        session_id=context.session_id,
+        parent_message_id=recorder.parent_message_id,
+    )
+    recorder.committed = True
+
+
+def _invalidate_turn(context: _TurnContext) -> None:
+    """Drop a failed turn's backend link; the next request rebuilds."""
+    if context.conversation is not None:
+        context.store.invalidate_backend_link(context.conversation)
+
+
+def _observed_events(events, *, context: _TurnContext, recorder: _TurnRecorder):
+    """Tap backend events for canonical-state bookkeeping (streaming, M4).
+
+    Yields every event unchanged — the SSE translator downstream sees
+    exactly the same stream (M3 no-leak rules untouched). A
+    ``MessageFinished`` commits the turn BEFORE the event is yielded, so
+    canonical state is consistent even if the client disconnects right
+    after; a ``BackendFailure`` invalidates the backend link first.
+    """
+    try:
+        for event in events:
+            recorder.observe(event)
+            if isinstance(event, MessageFinished) and not recorder.committed:
+                _commit_turn(context, recorder)
+            yield event
+    except BackendFailure:
+        _invalidate_turn(context)
+        raise
+
+
 def _start_stream_response(
-    backend_: LLMBackend, cfg: GatewaySettings, prompt: str
+    backend_: LLMBackend,
+    context: _TurnContext,
+    cfg: GatewaySettings,
+    prompt: str,
 ) -> StreamingResponse:
-    """Begin an SSE streaming turn (M3).
+    """Begin an SSE streaming turn (M3 priming + M4 state bookkeeping).
 
     The FIRST event is pulled synchronously (this handler runs in
     Starlette's threadpool) BEFORE any response byte is committed: failures
@@ -88,17 +246,27 @@ def _start_stream_response(
     (docs/UPSTREAM_NOTES.md). Mid-stream failures become an in-stream error
     envelope instead (app/streaming.py, ADR-019).
     """
-    session = backend_.create_session()
-    events = backend_.stream_turn(session.session_id, prompt)
+    recorder = _TurnRecorder()
+    events = _observed_events(
+        backend_.stream_turn(
+            context.session_id,
+            prompt,
+            parent_message_id=context.parent_message_id,
+        ),
+        context=context,
+        recorder=recorder,
+    )
     try:
         primed = next(events)
     except StopIteration:
         primed = STREAM_EMPTY
     except BackendFailure as failure:
+        _invalidate_turn(context)
         status, error_body = backend_failure_to_response(failure)
         raise GatewayHttpError(status, error_body) from failure
     if isinstance(primed, BackendError):
         # Headers are not committed yet: convert to an HTTP status too.
+        _invalidate_turn(context)
         failure = BackendFailure(
             category=_category_or_internal(primed.kind),
             message=primed.message,
@@ -123,12 +291,15 @@ def _start_stream_response(
 def create_app(
     settings: GatewaySettings | None = None,
     backend: LLMBackend | None = None,
+    store: ConversationStore | None = None,
 ) -> FastAPI:
     """Build the gateway application.
 
     ``settings`` defaults to :meth:`GatewaySettings.from_env`; ``backend``
-    defaults to :func:`build_backend(settings)`. Both are injectable for
-    tests (the whole M2 surface is testable offline with ``FakeBackend``).
+    defaults to :func:`build_backend(settings)`; ``store`` defaults to a
+    fresh bounded in-memory :class:`ConversationStore` (ADR-020). All three
+    are injectable for tests (the whole surface is testable offline with
+    ``FakeBackend``).
     """
     if settings is None:
         settings = GatewaySettings.from_env()
@@ -140,12 +311,13 @@ def create_app(
         version=__version__,
         description=(
             "Local-first OpenAI-compatible gateway exposing DeepSeek Web to "
-            "Qwen Code. M2/M3 subset: chat completions, non-streaming and "
-            "OpenAI SSE streaming."
+            "Qwen Code. M2/M3/M4 subset: chat completions, non-streaming "
+            "and OpenAI SSE streaming, canonical conversation state."
         ),
     )
     app.state.settings = settings
     app.state.backend = backend
+    app.state.store = store if store is not None else ConversationStore()
 
     # ------------------------------------------------------------- errors
 
@@ -263,7 +435,7 @@ def create_app(
             )
 
         try:
-            prompt = compile_messages_to_prompt(body.messages)
+            canonical = messages_to_canonical(body.messages)
         except UnsupportedMessageError as exc:
             raise GatewayHttpError(
                 400,
@@ -272,17 +444,21 @@ def create_app(
                 ),
             ) from exc
 
-        if body.stream:
-            return _start_stream_response(backend_, cfg, prompt)
+        context, prompt = _prepare_turn(request, backend_, canonical)
 
+        if body.stream:
+            return _start_stream_response(backend_, context, cfg, prompt)
+
+        recorder = _TurnRecorder()
         try:
-            session = backend_.create_session()
-            text_parts: list[str] = []
             finish_reason: str | None = None
-            for event in backend_.stream_turn(session.session_id, prompt):
-                if isinstance(event, TextDelta):
-                    text_parts.append(event.text)
-                elif isinstance(event, MessageFinished):
+            for event in backend_.stream_turn(
+                context.session_id,
+                prompt,
+                parent_message_id=context.parent_message_id,
+            ):
+                recorder.observe(event)
+                if isinstance(event, MessageFinished):
                     finish_reason = event.finish_reason
                 elif isinstance(event, BackendError):
                     # Defensive: current backends raise BackendFailure
@@ -294,10 +470,15 @@ def create_app(
                         status_code=event.status_code,
                     )
                 # ReasoningDelta / MessageStarted / BackendMessageId /
-                # UnknownDelta are intentionally ignored in M2.
+                # UnknownDelta need no response rendering; the recorder
+                # keeps whatever canonical state needs (M4).
         except BackendFailure as failure:
+            _invalidate_turn(context)
             status, error_body = backend_failure_to_response(failure)
             raise GatewayHttpError(status, error_body) from failure
+
+        if recorder.finished and not recorder.committed:
+            _commit_turn(context, recorder)
 
         return ChatCompletionResponse(
             id=f"chatcmpl_local_{uuid.uuid4().hex}",
@@ -305,7 +486,7 @@ def create_app(
             model=cfg.model_id,
             choices=[
                 Choice(
-                    message=AssistantMessageOut(content="".join(text_parts)),
+                    message=AssistantMessageOut(content=recorder.text),
                     finish_reason=_map_finish_reason(finish_reason),
                 )
             ],

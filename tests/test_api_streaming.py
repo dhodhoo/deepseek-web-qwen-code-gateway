@@ -128,7 +128,12 @@ class TestStreamingHappyPath:
         chunks = [_parse(line) for line in lines[:-1]]
         assert chunks[-1]["choices"][0]["finish_reason"] == "length"
 
-    def test_fresh_session_per_streaming_request(self) -> None:
+    def test_repeated_identical_streaming_request_is_a_new_conversation(self) -> None:
+        # M4 note: re-sending the same single user message is a duplicate
+        # (stored history already contains the assistant reply), not a
+        # continuation — so a fresh conversation/session is correct here
+        # (ADR-020; true continuations reuse sessions, see
+        # tests/test_api_multi_turn.py).
         backend = FakeBackend(turns=[SSE_TURN, SSE_TURN])
         client = _client(_settings(), backend)
         _stream_lines(client, _chat_body())
