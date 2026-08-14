@@ -10,6 +10,22 @@ Primary prefix:
 /v1
 ```
 
+## Implementation status
+
+Last synchronized: M2 (2026-08-14). See also docs/PROGRESS.md and docs/DECISIONS.md (ADR-017/018).
+
+- `GET /health` — implemented (M2). Unauthenticated by design; exposes no secrets.
+- `GET /v1/models` — implemented (M2). One gateway alias (`GATEWAY_MODEL_ID`, default `deepseek-web`).
+- `POST /v1/chat/completions` — implemented (M2) for NON-STREAMING plain chat with `system` / `user` / `assistant` text messages:
+  - `stream: true` → `501`, `code: STREAMING_NOT_YET_SUPPORTED` (until M3).
+  - `tools` / `tool_choice` → `400`, `code: TOOLS_NOT_YET_SUPPORTED` (until M6).
+  - `role=tool`, assistant `tool_calls`, null-content assistant messages → `400`, `code: UNSUPPORTED_MESSAGE` (until M6).
+  - Unknown request fields (sampling knobs, vendor extras) are accepted and ignored (lenient parsing, `extra="allow"`).
+  - Unknown `model` → `404 model_not_found`; empty/missing `messages` or `model` → `422`.
+- Authentication (M2): `Authorization: Bearer <DEEPSEEK_GATEWAY_API_KEY>` on `/v1/*`. Secure-by-default: unconfigured key → `503 GATEWAY_API_KEY_NOT_CONFIGURED` unless `GATEWAY_ALLOW_NO_AUTH=1` (ADR-017).
+- Error envelope (M2): `{"error": {"message", "type", "code"}}`; `BackendFailure` categories map per the suggested HTTP table with `code` = category value (`app/error_mapping.py`).
+- Streaming responses, tool-call responses, conversation identity: NOT yet implemented (M3 / M6 / M4).
+
 ## Authentication
 
 Support a local gateway API key:
@@ -86,6 +102,7 @@ Model IDs are gateway aliases, not necessarily official upstream model IDs.
 Support progressively:
 
 ### Required for core
+
 - `model`
 - `messages`
 - `stream`
@@ -93,6 +110,7 @@ Support progressively:
 - `tool_choice`
 
 ### Accept but initially may ignore/map with documented behavior
+
 - `temperature`
 - `top_p`
 - `max_tokens` / client equivalent
@@ -103,6 +121,7 @@ Support progressively:
 - `user`
 
 Never silently pretend an unsupported parameter is enforced. Either:
+
 - map it,
 - explicitly ignore it with internal trace/debug metadata,
 - or reject it if semantic correctness requires rejection.
@@ -119,10 +138,12 @@ tool
 ```
 
 Assistant messages may contain:
+
 - normal `content`,
 - `tool_calls`.
 
 Tool messages should contain:
+
 - `tool_call_id`,
 - `content`.
 
@@ -205,6 +226,7 @@ Do not leak the private backend's raw SSE framing.
 Reliability is more important than maximum incremental streaming.
 
 For v1:
+
 - stream normal prose promptly,
 - when output may be a tool-control envelope, buffer the candidate,
 - validate the envelope,

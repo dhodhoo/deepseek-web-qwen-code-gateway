@@ -151,6 +151,42 @@ Keep historical decisions. Mark superseded entries instead of deleting them.
 
 **Consequences:** The isolation rule is mechanically enforced on every default test run instead of relying on review. Any future exemption needs an ADR note.
 
+## ADR-017 — Gateway API auth: secure-by-default bearer key with explicit dev opt-out
+
+**Status:** Accepted
+
+**Context:** API_CONTRACT.md mandates `Authorization: Bearer <GATEWAY_API_KEY>` for the OpenAI surface, distinct from the DeepSeek token, and says authentication "may be configurable" for development but "secure-by-default behavior is preferred". The gateway binds locally, but a port on 127.0.0.1 is still reachable by every local process (and by LAN peers if rebound), and it proxies a valuable DeepSeek session.
+
+**Decision:**
+
+1. `/v1/models` and `/v1/chat/completions` require `Authorization: Bearer <DEEPSEEK_GATEWAY_API_KEY>`; comparison uses `hmac.compare_digest`; the bearer scheme prefix is case-insensitive. Failures answer 401 with OpenAI-style `code: "invalid_api_key"` (same for missing header, wrong scheme, wrong key — no enumeration hints).
+2. When no key is configured the gateway **refuses to serve**: 503 `code: "GATEWAY_API_KEY_NOT_CONFIGURED"` on `/v1/*`. The only escape hatch is the explicit opt-in `GATEWAY_ALLOW_NO_AUTH=1` (development convenience, documented as such in `.env.example`).
+3. `GET /health` stays unauthenticated: it reports only liveness, version, backend type/status — never secrets (contract rule "Do not expose secrets").
+4. The gateway key lives in `GatewaySettings.gateway_api_key` as `SecretStr` (ADR-015), so it inherits masking in repr/dumps.
+
+**Consequences:** A fresh checkout cannot accidentally expose an open proxying endpoint; misconfiguration fails loudly instead of silently open. Qwen Code wiring (M5) will set the key in the provider config. The constant-time compare is cheap insurance even for a local key.
+
+**Alternatives considered:** open-by-default with optional key (rejected — inverts the contract's stated preference and the threat of a silently open proxy); per-request signed tokens/JWT (rejected — no multi-user model exists; a shared local key is the right weight class).
+
+## ADR-018 — M2 HTTP surface: non-stream only, explicit honest rejections, lenient parsing
+
+**Status:** Accepted
+
+**Context:** M2's exit criterion is "curl/OpenAI-compatible client can complete plain chat". Qwen Code source verification (docs/UPSTREAM_NOTES.md) fixed several constraints: the client always sends `stream` explicitly (agent turns stream=true), may send non-standard request fields (`reasoning_effort`, `enable_thinking`, ...), never retries 400 but retries 429/5xx, and sends `max_tokens` on every turn.
+
+**Decision:**
+
+1. `POST /v1/chat/completions` implements NON-STREAMING plain chat only: `system`/`user`/`assistant` text messages compiled by `app/prompt_compiler.py` into one deterministic backend prompt; a fresh backend session per request (stateless; canonical conversation state is M4).
+2. Not-yet-implemented capabilities are rejected loudly and specifically instead of silently degraded: `stream: true` → 501 `STREAMING_NOT_YET_SUPPORTED` (points at M3); `tools`/`tool_choice` → 400 `TOOLS_NOT_YET_SUPPORTED` (points at M6); `role=tool`, assistant `tool_calls`, or null-content assistant messages → 400 `UNSUPPORTED_MESSAGE` (points at M6). 501 was chosen for streaming despite the client retrying 5xx (retries are bounded; the status is semantically honest; by the time Qwen Code is wired in M5, M3 streaming exists, so this path is transient).
+3. Request parsing is lenient: request models use pydantic `extra="allow"`, so unknown fields (sampling knobs, vendor extras) are accepted and ignored — documented in `app/openai_types.py`, per the contract's "accept but initially may ignore" rule. Sampling parameters are NOT enforced in M2 (the backend takes a single prompt; there is nothing to map them onto).
+4. `model` must equal the configured alias (`GATEWAY_MODEL_ID`, default `deepseek-web`) else 404 `model_not_found`. Empty/missing `messages`/`model` → 422 via pydantic.
+5. `BackendFailure` maps to OpenAI-style errors via `app/error_mapping.py` (status per contract table, `code` = stable category value). `BackendError` events are defensively converted to failures too.
+6. Handlers are plain `def` (synchronous); Starlette's threadpool isolates the blocking backend from the event loop. `finish_reason` mapping: `length` → `length`, everything else → `stop` (`tool_calls` arrives in M6).
+
+**Consequences:** The M2 surface is fully testable offline (TestClient + FakeBackend), every unimplemented feature announces its milestone, and lenient parsing means Qwen Code's real request bodies will not 422 on contact. Session-per-request spends one upstream session (and its PoW) per call until M4 adds reuse — an accepted interim cost.
+
+**Alternatives considered:** silently returning empty `tool_calls`/stream responses (rejected — would corrupt client state invisibly); strict request validation (rejected — the verified client sends non-standard fields); holding one long-lived backend session in the server (rejected — belongs to M4 canonical state, not the M2 adapter).
+
 # Template
 
 ## ADR-XXX — Title

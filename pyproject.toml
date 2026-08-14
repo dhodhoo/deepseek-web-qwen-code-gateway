@@ -22,11 +22,16 @@ dependencies = [
     "numpy>=2",
     # M1 configuration boundary (validated settings, SecretStr masking).
     "pydantic>=2",
+    # M2 OpenAI-compatible HTTP surface.
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    # FastAPI TestClient transport.
+    "httpx>=0.27",
 ]
 # Browser-assisted Cloudflare cookie refresh (upstream dsk/bypass.py path).
 # Intentionally NOT installed by default in M0; see docs/UPSTREAM_NOTES.md.

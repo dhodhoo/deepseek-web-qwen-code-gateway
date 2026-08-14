@@ -19,9 +19,14 @@ Security rules honored here:
 
 Environment variables (see .env.example):
 
-* ``GATEWAY_BACKEND``       — ``deepseek_web`` (default) or ``fake``
-* ``DEEPSEEK_AUTH_TOKEN``   — required for ``deepseek_web``
-* ``DSQG_COOKIES_FILE``     — optional cookies JSON path for ``deepseek_web``
+* ``GATEWAY_BACKEND``          — ``deepseek_web`` (default) or ``fake``
+* ``DEEPSEEK_AUTH_TOKEN``      — required for ``deepseek_web``
+* ``DSQG_COOKIES_FILE``        — optional cookies JSON path for ``deepseek_web``
+* ``DEEPSEEK_GATEWAY_API_KEY`` — client→gateway auth key for ``/v1/*``
+* ``GATEWAY_ALLOW_NO_AUTH``    — ``1/true/yes/on``: allow ``/v1/*`` without a
+  key when no key is configured (development opt-in; secure default is deny)
+* ``GATEWAY_MODEL_ID``         — advertised model alias (default ``deepseek-web``)
+* ``GATEWAY_HOST``/``GATEWAY_PORT`` — bind address for ``python -m app.main``
 """
 
 from __future__ import annotations
@@ -46,6 +51,38 @@ __all__ = [
 DEFAULT_BACKEND_TYPE = "deepseek_web"
 FAKE_BACKEND_TYPE = "fake"
 
+DEFAULT_MODEL_ID = "deepseek-web"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8000
+
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off", ""}
+
+
+def _parse_bool(raw: str | None, var_name: str) -> bool:
+    value = (raw or "").strip().lower()
+    if value in _TRUTHY:
+        return True
+    if value in _FALSY:
+        return False
+    raise ConfigError(
+        f"{var_name} must be a boolean (1/true/yes/on or 0/false/no/off), "
+        f"got a value of length {len(value)}"
+    )
+
+
+def _parse_port(raw: str | None) -> int:
+    value = (raw or "").strip() or str(DEFAULT_PORT)
+    try:
+        port = int(value)
+    except ValueError:
+        raise ConfigError(
+            f"GATEWAY_PORT must be an integer, got a value of length {len(value)}"
+        ) from None
+    if not 1 <= port <= 65535:
+        raise ConfigError("GATEWAY_PORT must be between 1 and 65535")
+    return port
+
 
 class ConfigError(ValueError):
     """Invalid or missing configuration. Messages never contain secrets."""
@@ -67,6 +104,12 @@ class GatewaySettings(BaseModel):
 
     backend_type: str = DEFAULT_BACKEND_TYPE
     deepseek_web: DeepSeekWebSettings | None = None
+    # --- HTTP surface (M2) ------------------------------------------------
+    gateway_api_key: SecretStr | None = None
+    allow_no_auth: bool = False
+    model_id: str = DEFAULT_MODEL_ID
+    host: str = DEFAULT_HOST
+    port: int = DEFAULT_PORT
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "GatewaySettings":
@@ -82,8 +125,21 @@ class GatewaySettings(BaseModel):
             source.get("GATEWAY_BACKEND") or DEFAULT_BACKEND_TYPE
         ).strip() or DEFAULT_BACKEND_TYPE
 
+        raw_key = (source.get("DEEPSEEK_GATEWAY_API_KEY") or "").strip()
+        common: dict[str, object] = {
+            "gateway_api_key": SecretStr(raw_key) if raw_key else None,
+            "allow_no_auth": _parse_bool(
+                source.get("GATEWAY_ALLOW_NO_AUTH"), "GATEWAY_ALLOW_NO_AUTH"
+            ),
+            "model_id": (source.get("GATEWAY_MODEL_ID") or DEFAULT_MODEL_ID).strip()
+            or DEFAULT_MODEL_ID,
+            "host": (source.get("GATEWAY_HOST") or DEFAULT_HOST).strip()
+            or DEFAULT_HOST,
+            "port": _parse_port(source.get("GATEWAY_PORT")),
+        }
+
         if backend_type == FAKE_BACKEND_TYPE:
-            return cls(backend_type=FAKE_BACKEND_TYPE)
+            return cls(backend_type=FAKE_BACKEND_TYPE, **common)  # type: ignore[arg-type]
 
         if backend_type == DEFAULT_BACKEND_TYPE:
             token = (source.get("DEEPSEEK_AUTH_TOKEN") or "").strip()
@@ -100,6 +156,7 @@ class GatewaySettings(BaseModel):
                     auth_token=SecretStr(token),
                     cookies_file=Path(cookies_raw) if cookies_raw else None,
                 ),
+                **common,  # type: ignore[arg-type]
             )
 
         raise ConfigError(

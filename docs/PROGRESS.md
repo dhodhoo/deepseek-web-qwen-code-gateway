@@ -4,21 +4,26 @@ The coding agent must update this file after every milestone.
 
 ## Current status
 
-**Current milestone:** M1 — Backend abstraction
+**Current milestone:** M2 — Basic OpenAI Chat Completions
 
-**State:** COMPLETE (offline-verified 2026-08-14). Awaiting user review; M2 not started.
+**State:** COMPLETE (offline-verified + live curl smoke 2026-08-14). Awaiting user review; M3 not started.
 
 ## Completed
 
 - Starter architecture/specification created.
 - M0 (2026-08-14): full upstream compatibility spike, including live probe.
 - M1 (2026-08-14): stable backend interface, FakeBackend, configuration boundary, import-boundary guard.
+- M2 (2026-08-14): FastAPI gateway surface — /health, /v1/models, non-streaming /v1/chat/completions with bearer auth, deterministic message compiler, OpenAI error mapping.
 
 ## Tests run
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-129 passed, 2 deselected (live tests excluded by default marker)
+195 passed, 2 deselected (live tests excluded by default marker)
+
+Live curl smoke (GATEWAY_BACKEND=fake): plain chat via curl returned a valid
+chat.completion body; no-auth 401, stream:true 501, backend failure 500
+with the OpenAI error envelope.
 ```
 
 ## Known limitations
@@ -26,11 +31,70 @@ The coding agent must update this file after every milestone.
 - Live error paths (429/5xx/Cloudflare) were not triggered during probing; classification is unit-tested offline only.
 - Multi-turn threading (parent_message_id = previous response_message_id) is captured but not yet exercised end-to-end (M4).
 - Upstream deepseek4free is dormant since 2025-02-09; its stream parser was fully obsolete (protocol changed). Further drift is possible at any time; probe captures are the early-warning mechanism.
-- Tool calling, Qwen Code provider wiring, multi-account, UI, Docker intentionally not started.
+- M2 is non-streaming only; each request creates a fresh backend session (no conversation reuse until M4); sampling parameters are accepted but ignored.
+- Tool calling, streaming, Qwen Code provider wiring, multi-account, UI, Docker intentionally not started.
 
 ## Next action
 
-User reviews the M1 report. If approved, start M2 (basic OpenAI-compatible chat endpoint).
+User reviews the M2 report. If approved, start M3 (streaming chat completions, SSE out).
+
+---
+
+## 2026-08-14 — M2: Basic OpenAI Chat Completions
+
+### Completed
+
+- OpenAI-compatible wire schemas (`app/openai_types.py`): request models lenient (`extra="allow"`, per Qwen source verification), response models strict standard shapes (ADR-018).
+- Deterministic message compiler (`app/prompt_compiler.py`): `system`/`user`/`assistant` text → labeled-block prompt; content lists reduced to text parts; tool-shaped messages rejected with milestone pointers (M6).
+- Error mapping (`app/error_mapping.py`): `BackendFailure` categories → OpenAI error envelope + contract HTTP statuses; `code` = stable category value.
+- Configuration extended (`app/config.py`): `DEEPSEEK_GATEWAY_API_KEY` (SecretStr), `GATEWAY_ALLOW_NO_AUTH`, `GATEWAY_MODEL_ID`, `GATEWAY_HOST`, `GATEWAY_PORT`.
+- FastAPI application (`app/server.py`) + entry point (`app/main.py`): `GET /health` (open), `GET /v1/models`, `POST /v1/chat/completions` (non-streaming only; 501 for `stream:true`, 400 for tools, 404 unknown model); secure-by-default bearer auth (ADR-017); sync handlers on Starlette's threadpool; fresh backend session per request.
+- Dependencies added: `fastapi`, `uvicorn` (runtime), `httpx` (dev, for TestClient).
+
+### Files changed
+
+```text
+app/openai_types.py (new), app/prompt_compiler.py (new), app/error_mapping.py (new)
+app/server.py (new), app/main.py (new)
+app/config.py (gateway key/auth/model/host/port settings)
+tests/test_prompt_compiler.py (new), tests/test_error_mapping.py (new), tests/test_api.py (new)
+pyproject.toml (fastapi, uvicorn; dev: httpx), .env.example (M2 variables)
+docs/DECISIONS.md (ADR-017..018), docs/API_CONTRACT.md (implementation status), docs/PROGRESS.md
+```
+
+### Tests executed
+
+```text
+.venv\Scripts\python.exe -m pytest -q
+195 passed, 2 deselected in 2.73s   (129 M0/M1 tests + 66 new M2 tests)
+
+Live curl smoke against uvicorn (GATEWAY_BACKEND=fake):
+  POST /v1/chat/completions (Bearer key, plain chat)
+    -> 200 {"object":"chat.completion","choices":[{"message":{"role":"assistant","content":"Hello from curl!"},"finish_reason":"stop"}],...}
+  GET /health -> 200 {"ok":true,...}; GET /v1/models -> 200 alias list
+  no auth -> 401 invalid_api_key; stream:true -> 501 STREAMING_NOT_YET_SUPPORTED
+  unscripted fake backend -> 500 INTERNAL (OpenAI error envelope)
+```
+
+### Upstream observations
+
+None new — M2 runs against `FakeBackend` only; no DeepSeek traffic. (Qwen Code client-side wire notes from the source verification remain the reference for M3/M5/M6.)
+
+### Known limitations
+
+- Non-streaming only: `stream:true` is rejected 501 (M3). Qwen Code agent turns always stream, so M3 is the next hard requirement before any client wiring.
+- One fresh backend session per request; no conversation continuity (M4 canonical state).
+- Sampling parameters (`temperature`, `max_tokens`, ...) are accepted and ignored — documented leniency, nothing to map onto upstream yet.
+- `tools: []` (empty list) is treated as plain chat, not rejected.
+
+### Decisions added/changed
+
+- ADR-017 gateway API auth: secure-by-default bearer key, 503 when unconfigured, explicit dev opt-out, constant-time compare.
+- ADR-018 M2 HTTP surface: non-stream only, explicit honest rejections (501/400 with milestone pointers), lenient request parsing, session-per-request.
+
+### Next milestone
+
+M3 — Streaming chat completions: OpenAI SSE chunks out (`chat.completion.chunk`), `data: [DONE]` termination, incremental text deltas from `LLMBackend.stream_turn`, streaming error handling (awaiting explicit user approval).
 
 ---
 
