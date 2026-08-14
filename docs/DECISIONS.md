@@ -96,6 +96,18 @@ Keep historical decisions. Mark superseded entries instead of deleting them.
 
 **Consequences:** Fixtures and later canonical state can carry real identifiers; parser behavior matches or exceeds vendored tolerance (non-object JSON payloads tolerated, malformed JSON fatal — same as vendored). Slightly more M0 surface, bounded and tested.
 
+## ADR-013 — Replace the vendored stream parser at runtime (WireSession)
+
+**Status:** Accepted
+
+**Context:** Live probing on 2026-08-14 proved DeepSeek Web changed its stream protocol: no more OpenAI-style `choices[].delta` payloads. The current wire format is an event + JSON-patch stream with sticky-path compression (`event: ready` ids, `{"p": path, "o": op, "v": value}` ops where `p`/`o` may be omitted after being set, terminal `response/status: FINISHED`). The vendored `_parse_chunk` matched zero lines of real traffic. The vendored _transport_ (HTTP request, headers, PoW, cookies, iteration loop, terminal break on `finish_reason == 'stop'`) still works.
+
+**Decision:** Keep the vendored transport untouched; install a stateful adapter (`app/backends/deepseek_web/wire.py::WireSession`, one instance per stream turn) as the runtime `_parse_chunk` replacement via the existing instance-attribute seam (restored exactly after each turn). The adapter translates the current protocol into the backend chunk contract (`content`/`type`/`finish_reason` + `response_message_id`/`request_message_id`), mapping `FINISHED` → `finish_reason='stop'` so the vendored loop's terminal break fires. Legacy-format handling stays in `parse_sse_line`/`payload_to_events` for regression coverage of the generic parser.
+
+**Consequences:** Minimal change surface; private-API transport stays isolated and replaceable; the adapter is fully unit-tested against sanitized live captures (parametrized over every capture, so future probes extend coverage automatically). Risk: further upstream protocol drift will surface as UPSTREAM_PROTOCOL failures or missing events — mitigated by raw-capture fixtures from every probe run.
+
+**Alternatives considered:** patching vendored `api.py` (rejected — destroys clean diff against upstream and spreads private-API parsing across vendor code); reimplementing the whole HTTP request in gateway code (rejected for M0 — unnecessary duplication while vendored transport works; reconsider if transport also drifts).
+
 # Template
 
 ## ADR-XXX — Title

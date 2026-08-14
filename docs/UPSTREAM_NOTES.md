@@ -50,25 +50,25 @@ Items marked **LIVE-PENDING** require a credential run of `scripts/probe_deepsee
 
 - Upstream pins `curl-cffi==0.8.1b9`. **Not installable** on Python 3.12+/3.14 on Windows: no wheels; sdist build downloads `libcurl-impersonate v0.8.2` from a GitHub release that now 404s.
 - Verified replacement: `curl-cffi==0.16.0` (cp310-abi3 wheel). All APIs used by the vendored client exist: `requests.request/post(..., impersonate='chrome120', stream=True, timeout=None)`, `response.iter_lines()`, `response.json()`, `requests.exceptions.RequestException`. `chrome120` is still an accepted impersonation target in 0.16.0.
-- Behavioral risk (LIVE-PENDING): TLS/HTTP2 fingerprint differences between curl-cffi 0.8.1b9 and 0.16.0 impersonation profiles; DeepSeek-side bot detection may react differently. The probe is the check.
+- Behavioral risk (RESOLVED 2026-08-14): TLS/HTTP2 fingerprint differences between curl-cffi 0.8.1b9 and 0.16.0 impersonation profiles were a concern; the live probe succeeded with 0.16.0 `chrome120` impersonation — no bot-detection rejection observed in three runs.
 
 ### Auth behavior
 
 - Bearer token in `authorization` header against `https://chat.deepseek.com/api/v0`. Token obtained from browser localStorage `userToken` (README method).
 - HTTP 401 → `AuthenticationError`; 429 → `RateLimitError`; >=500 → `APIError(status)`; other non-200 → `APIError(status)`. Mapped to the gateway taxonomy in `app/backends/deepseek_web/normalize.py::classify_upstream_exception` (unit-tested offline).
-- Whether a current DeepSeek Web token still authenticates against `/api/v0`: **LIVE-PENDING**.
+- Whether a current DeepSeek Web token still authenticates against `/api/v0`: **VERIFIED LIVE 2026-08-14** — a current 64-char token from `userToken.value` authenticated successfully; session creation and completion both worked with no cookies at all.
 
 ### Cookie/Cloudflare behavior
 
 - Cookies load from `dsk/cookies.json` (`{"cookies": {...}}`), package-relative; missing file is a warning, not an error. The gateway instead injects cookies from a user-supplied file via `DeepSeekWebBackend(..., cookies_file=...)` — nothing is written into the vendor tree.
 - `_make_request` detects Cloudflare interstitials ("Just a moment" HTML) on non-stream calls and then runs `dsk/bypass.py` **as a browser-launching subprocess** (nodriver/DrissionPage) to refresh `cf_clearance`, with max 2 retries. Because browser deps are not installed in the gateway venv, that path will fail loudly if triggered; the expected workaround is supplying a manually captured cookies file.
 - The streaming completion path (`chat_completion`) has **no** Cloudflare retry at all — an interstitial there surfaces as a protocol/API error.
-- Whether Cloudflare challenges appear for a given account/IP: **LIVE-PENDING**.
+- Whether Cloudflare challenges appear for a given account/IP: **VERIFIED LIVE 2026-08-14** — no Cloudflare challenge appeared for the probe account/IP without any cookies. CF behavior may still vary by IP/account; the cookies-file path exists for that case.
 
 ### Session creation request/response
 
 - `POST /chat_session/create` with body `{"character_id": null}`; session id read from `response['data']['biz_data']['id']`. `KeyError` → `APIError("Invalid session creation response format...")`.
-- Real response shape: **LIVE-PENDING** (probe will record sanitized evidence).
+- Real response shape: **VERIFIED LIVE 2026-08-14** — `data.biz_data.id` still present; session creation latency 0.55–1.2 s over three runs.
 
 ### Completion request shape
 
@@ -86,35 +86,81 @@ Items marked **LIVE-PENDING** require a credential run of `scripts/probe_deepsee
   ```
 - Notable headers: `x-app-version: 20241129.1`, `x-client-platform: web`, `x-client-version: 1.0.0-always`, Chrome-132-style user agent, `impersonate='chrome120'`.
 - No native OpenAI-style `tools`/`messages` parameters: **the endpoint takes a single prompt string** — tool emulation (M6+) must compile the whole OpenAI message history into one prompt. Confirms the starter assumption.
+- **VERIFIED LIVE 2026-08-14:** PoW challenge fetch + solve + streaming completion all succeeded. End-to-end turn latency ~1.6–2.3 s including PoW for one-word answers.
 
 ### Streaming event examples
 
-Wire framing (synthetic; matches vendored parser contract, **LIVE-PENDING** replacement with sanitized real captures):
+**MAJOR LIVE FINDING (2026-08-14): the wire protocol changed completely.**
+DeepSeek Web no longer streams OpenAI-style `choices[].delta` chunks — the
+format the vendored parser expects. The current protocol is an event +
+JSON-patch stream with sticky-path compression (full sanitized captures in
+`tests/fixtures/deepseek_web/live/`):
 
 ```text
-data: {"id": "...", "choices": [{"index": 0, "delta": {"content": "...", "type": "thinking"}, "finish_reason": null}], ...}
-data: {"id": "...", "choices": [{"index": 0, "delta": {"content": "...", "type": "text"}, "finish_reason": null}], ...}
-data: {"id": "...", "choices": [{"index": 0, "delta": {"content": "", "type": "text"}, "finish_reason": "stop"}], "usage": {...}}
+event: ready
+data: {"request_message_id": "...", "response_message_id": "...", "model_type": "default"}
+
+event: update_session
+data: {"updated_at": 1786711092.380996}
+
+data: {"v": {"response": {"message_id": "...", "parent_id": "...", "role": "ASSISTANT",
+      "thinking_enabled": false, "status": "WIP", "content": "", "thinking_content": null,
+      "search_status": null, "search_results": null, "tips": [], ...}}}
+
+data: {"p": "response/content", "o": "APPEND", "v": "OK"}
+data: {"p": "response/accumulated_token_usage", "o": "SET", "v": 39}
+data: {"p": "response/status", "v": "FINISHED"}
+
+event: finish
+data: {}
+event: title
+data: {"content": "OK"}
+event: close
+data: {"click_behavior": "none", "auto_resume": false}
 ```
 
-- Delta `type` values known: `text`, `thinking`. Unknown types are preserved as `UnknownDelta` events (ADR-010).
-- Terminal behavior in vendored code: loop breaks on `finish_reason == 'stop'`; `iter_lines()` otherwise consumes to connection close. Whether the real stream ever ends without a `stop` chunk (or uses other reasons, e.g. for search/thinking variants): **LIVE-PENDING**.
-- The vendored parser discards every field except `choices[].delta.content/type` and `choices[].finish_reason` (ids and usage included). The gateway re-parses raw lines (ADR-012) to keep them.
+Protocol rules observed:
+
+- Patch ops are `{"p": path, "o": op, "v": value}`. After a path is set,
+  subsequent ops may omit `p` (**sticky path**) and even `o` (implicit
+  APPEND on content paths). Verified with the thinking stream:
+  ```text
+  data: {"p": "response/thinking_content", "v": "1"}
+  data: {"o": "APPEND", "v": "."}
+  data: {"v": " The"}
+  ```
+- Text deltas: APPEND ops on `response/content` (short answers may arrive as
+  a single APPEND).
+- Thinking deltas: APPEND ops on `response/thinking_content` (token-level),
+  followed by `response/thinking_elapsed_secs` SET bookkeeping.
+- Terminal: `response/status` → `FINISHED` (only observed terminal value).
+  The gateway maps it to `finish_reason='stop'` (ADR-013).
+- Message ids: the `ready` event carries `request_message_id` +
+  `response_message_id`; the snapshot's `parent_id` equals the request id.
+- The vendored parser matched **zero** lines of real traffic. The gateway
+  replaces it at runtime with a stateful adapter
+  (`app/backends/deepseek_web/wire.py::WireSession`), keeping the vendored
+  transport (HTTP, PoW, cookies, iteration, terminal break) intact.
+- The legacy-format synthetic fixtures in
+  `tests/fixtures/deepseek_web/synthetic/` remain as regression tests for
+  the generic SSE/payload parser only; live captures are ground truth.
 
 ### Parent message behavior
 
 - `parent_message_id` is accepted by the API call and sent verbatim (default `null`).
-- The upstream README shows threaded follow-ups keyed on a `message_id` chunk field that the vendored parser **never emits** — the README example cannot work as written. Whether the real payloads expose a message id anywhere (payload-level `id`, final chunk, or a separate endpoint) is **LIVE-PENDING**; the gateway's raw parser captures payload `id` fields into `BackendMessageId` events so the probe can answer this.
-- Until verified, canonical local history (M4) must not depend on upstream threading; replaying compiled prompts into a fresh session remains the fallback.
+- The upstream README shows threaded follow-ups keyed on a `message_id` chunk field that the vendored parser **never emits** — the README example cannot work as written.
+- **VERIFIED LIVE 2026-08-14:** threading identifiers ARE exposed in the current protocol — the `ready` event carries `request_message_id`/`response_message_id`, and the snapshot carries `message_id`/`parent_id` (parent_id == request id). The gateway adapter surfaces them as `BackendMessageId` events. Expected threading convention for M4: next turn's `parent_message_id` = previous turn's `response_message_id`. Actual multi-turn threading acceptance is an M4 test.
+- Canonical local history (M4) still must not _depend_ on upstream memory; replaying compiled prompts into a fresh session remains the fallback.
 
 ### Thinking event behavior
 
-- `thinking_enabled=True` interleaves `type: "thinking"` deltas before/with text. The probe runs with thinking OFF by default (canned prompt) and can be re-run with `--thinking` to capture the shape.
-- Exact ordering/termination with thinking on: **LIVE-PENDING**.
+- **VERIFIED LIVE 2026-08-14:** with `thinking_enabled=true`, thinking tokens stream as APPEND ops on `response/thinking_content` (34 deltas for a two-line reasoning trace), then `response/thinking_elapsed_secs` SET (e.g. `0.5958`), then content APPEND(s), then `FINISHED`. Thinking text and answer text are cleanly separated by path; the probe normalized this to `ReasoningDelta` ×34 + `TextDelta` ×1 + terminal `MessageFinished('stop')`.
 
 ### Error behavior
 
-Verified offline (unit-tested), classification only — live triggering is **LIVE-PENDING**:
+Verified offline (unit-tested classification). Live probing hit no error paths
+(valid credential, no CF challenge, no rate limit across four runs), so live
+error triggering remains untested:
 
 | Upstream                                 | Gateway category   | Retryable         |
 | ---------------------------------------- | ------------------ | ----------------- |
@@ -129,13 +175,15 @@ Verified offline (unit-tested), classification only — live triggering is **LIV
 
 ### Deviations from starter assumptions
 
-1. **Upstream is dormant** (last push 2025-02-09) — the starter assumed an actively maintained integration; drift risk is higher than assumed.
-2. **Dependency pin is dead** (`curl-cffi==0.8.1b9` uninstallable on modern Python; its prebuilt lib release 404s). Relaxed pin adopted (ADR-009).
-3. **`pkg_resources` import broken** on current setuptools/Python — one minimal vendor patch applied (ADR-009).
-4. **Cookies path is package-relative** (`dsk/cookies.json` inside the vendor dir); gateway injects cookies by attribute instead so no secret file lives in the vendor tree.
-5. **Cloudflare auto-refresh launches a browser subprocess** (`dsk/bypass.py`) — not viable headless/by default; gateway treats cookies as user-supplied and the CF path as an explicit later feature (browser deps optional extra `cloudbypass`).
-6. **README threading example is inconsistent** with the vendored parser (relies on a `message_id` field the parser never yields) — parent-message support needs live verification before M4 relies on it.
-7. Starter assumption "client distinguishes authentication/rate-limit/network/API errors" — confirmed, plus a defined-but-unused `CloudflareError` (Cloudflare conditions surface via `APIError` message text instead).
+1. **THE WIRE PROTOCOL CHANGED** (most important): DeepSeek Web no longer streams OpenAI-style `choices[].delta` chunks. Current protocol is event + JSON-patch with sticky paths (see "Streaming event examples"). The vendored parser matched zero lines of real traffic; the gateway adapts the new protocol behind the backend boundary (ADR-013). This is exactly the drift risk the starter warned about.
+2. **Upstream is dormant** (last push 2025-02-09) — the starter assumed an actively maintained integration; drift risk was higher than assumed (and materialized, per item 1).
+3. **Dependency pin is dead** (`curl-cffi==0.8.1b9` uninstallable on modern Python; its prebuilt lib release 404s). Relaxed pin adopted (ADR-009).
+4. **`pkg_resources` import broken** on current setuptools/Python — one minimal vendor patch applied (ADR-009).
+5. **Cookies path is package-relative** (`dsk/cookies.json` inside the vendor dir); gateway injects cookies by attribute instead so no secret file lives in the vendor tree.
+6. **Cloudflare auto-refresh launches a browser subprocess** (`dsk/bypass.py`) — not viable headless/by default; gateway treats cookies as user-supplied and the CF path as an explicit later feature (browser deps optional extra `cloudbypass`).
+7. **README threading example is inconsistent** with the vendored parser (relies on a `message_id` field the parser never yields). Live verification showed threading ids ARE exposed via the `ready` event/snapshot; the gateway captures them (see Parent message behavior).
+8. Starter assumption "client distinguishes authentication/rate-limit/network/API errors" — confirmed, plus a defined-but-unused `CloudflareError` (Cloudflare conditions surface via `APIError` message text instead).
+9. **Transport/auth/PoW/session layers still work unchanged** — despite the protocol change, the vendored request path (headers, PoW WASM solver, endpoints, impersonation) succeeded live. Only the stream parser needed replacement.
 
 ## Rule
 

@@ -28,6 +28,7 @@ from ..errors import BackendFailure
 from ..events import BackendEvent
 from . import _vendor  # noqa: F401  (ensures vendored dsk is importable)
 from .normalize import chunk_dict_to_events, classify_upstream_exception
+from .wire import WireSession
 
 __all__ = ["DeepSeekWebBackend"]
 
@@ -120,28 +121,33 @@ class DeepSeekWebBackend:
     ) -> Iterator[BackendEvent]:
         """Run one prompt turn and yield normalized events.
 
-        ``raw_sink``: when a list is provided, every raw SSE line observed by
-        the vendored client is appended to it (bytes, without trailing
-        newline). The probe uses this to build sanitized fixtures; the
-        application itself never persists raw upstream bytes.
+        ``raw_sink``: when a list is provided, every raw SSE line observed
+        from upstream is appended to it (bytes, without trailing newline)
+        before protocol adaptation. The probe uses this to build sanitized
+        fixtures; the application itself never persists raw upstream bytes.
 
         Upstream failures are raised as
         :class:`app.backends.errors.BackendFailure`.
         """
         api = self._api
 
-        # Raw capture seam: wrap the instance's chunk parser without
-        # modifying vendored source. The previous __dict__ state (present or
-        # absent instance attribute) is restored exactly in finally.
+        # Protocol seam: the vendored _parse_chunk implements the *legacy*
+        # (pre-2026) wire format, which DeepSeek Web no longer serves. M0
+        # live probing verified the current protocol; we replace the parser
+        # at runtime with wire.adapt_raw_line (optionally capturing raw
+        # lines first). The previous __dict__ state is restored exactly in
+        # finally, so the vendored object is left untouched.
         _sentinel = object()
         previous_parse_attr = api.__dict__.get("_parse_chunk", _sentinel)
-        original_parse = api._parse_chunk
-        if raw_sink is not None:
-            def _capturing_parse(chunk: bytes):  # type: ignore[no-untyped-def]
-                raw_sink.append(chunk)
-                return original_parse(chunk)
 
-            api._parse_chunk = _capturing_parse  # type: ignore[method-assign]
+        wire_session = WireSession()
+
+        def _backend_parse(chunk: bytes):  # type: ignore[no-untyped-def]
+            if raw_sink is not None:
+                raw_sink.append(chunk)
+            return wire_session.adapt(chunk)
+
+        api._parse_chunk = _backend_parse  # type: ignore[method-assign]
 
         try:
             try:

@@ -17,6 +17,9 @@ htmlcov/
 .env
 .env.*
 !.env.example
+*.token
+*.token.txt
+ds_token.txt
 *.cookies.json
 cookies.json
 dsk/cookies.json

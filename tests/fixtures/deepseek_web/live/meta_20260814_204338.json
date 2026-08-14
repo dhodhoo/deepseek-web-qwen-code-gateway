@@ -1,0 +1,21 @@
+{
+  "captured_at": "2026-08-14T20:43:38",
+  "sanitized": true,
+  "prompt": "What is 2+2? Answer briefly.",
+  "thinking_enabled": true,
+  "search_enabled": false,
+  "event_counts": {
+    "BackendMessageId": 2,
+    "ReasoningDelta": 34,
+    "TextDelta": 1,
+    "MessageFinished": 1
+  },
+  "finish_reason": "stop",
+  "raw_line_count": 83,
+  "message_id_count": 1,
+  "unknown_delta_types": [],
+  "time_to_first_text_ms": 1394,
+  "total_ms": 1652,
+  "session_create_ms": 550,
+  "python": "3.14.6"
+}

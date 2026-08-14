@@ -1,0 +1,13 @@
+event: ready
+data: {"request_message_id": "SANITIZED-ID-1", "response_message_id": "SANITIZED-ID-2", "model_type": "default"}
+
+event: update_session
+data: {"updated_at": 1786711288.851558}
+
+data: {"v": {"response": {"message_id": "SANITIZED-ID-2", "parent_id": "SANITIZED-ID-1", "model": "", "role": "ASSISTANT", "thinking_enabled": false, "ban_edit": false, "ban_regenerate": false, "status": "WIP", "incomplete_message": null, "accumulated_token_usage": 0, "files": [], "feedback": null, "inserted_at": 1786711288.838872, "search_enabled": false, "content": "", "thinking_content": null, "thinking_elapsed_secs": null, "search_status": null, "search_results": null, "tips": []}}}
+
+data: {"p": "response/content", "o": "APPEND", "v": "OK"}
+
+data: {"p": "response/accumulated_token_usage", "o": "SET", "v": 39}
+
+data: {"p": "response/status", "v": "FINISHED"}

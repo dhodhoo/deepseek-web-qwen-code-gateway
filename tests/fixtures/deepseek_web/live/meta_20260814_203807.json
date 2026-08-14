@@ -1,0 +1,16 @@
+{
+  "captured_at": "2026-08-14T20:38:07",
+  "sanitized": true,
+  "prompt": "Reply with exactly one word: OK",
+  "thinking_enabled": false,
+  "search_enabled": false,
+  "event_counts": {},
+  "finish_reason": null,
+  "raw_line_count": 26,
+  "message_id_count": 0,
+  "unknown_delta_types": [],
+  "time_to_first_text_ms": null,
+  "total_ms": 2089,
+  "session_create_ms": 864,
+  "python": "3.14.6"
+}

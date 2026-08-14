@@ -2,27 +2,33 @@
 
 ## Provenance
 
-- `synthetic/` — hand-built SSE payloads matching the wire contract observed
-  in the vendored upstream parser (`dsk/api.py::_parse_chunk`) at commit
-  `4ae47bbb` and the DeepSeek Chat Completions-style framing it expects.
-  **Synthetic fixtures are provisional:** they exist so parser tests run
-  offline before live capture. The M0 live probe (`scripts/probe_deepseek.py`)
-  validates or corrects them.
-- `live/` — sanitized captures written by the live probe. Identifiers are
-  replaced with `SANITIZED-ID-<n>` placeholders; personal/credential keys are
-  removed (see `app/backends/deepseek_web/sanitize.py`).
+- `live/` — **ground truth.** Sanitized captures written by the live probe
+  (`scripts/probe_deepseek.py`), verified against the real DeepSeek Web API
+  on 2026-08-14. Identifiers are replaced with `SANITIZED-ID-<n>`
+  placeholders (stable within a capture); personal/credential keys are
+  removed (see `app/backends/deepseek_web/sanitize.py`). Current wire
+  protocol: event + JSON-patch with sticky paths — documented in
+  `docs/UPSTREAM_NOTES.md` ("Streaming event examples").
+- `synthetic/` — hand-built payloads in the **legacy (pre-2026)**
+  OpenAI-style `choices[].delta` shape. DeepSeek no longer serves this
+  format; these fixtures remain as regression tests for the generic
+  SSE/payload parser (`parse_sse_line`, `payload_to_events`) only.
 
 ## Fixture format
 
-One raw SSE line per text line, as delivered by `response.iter_lines()`
-(no trailing newlines inside a line):
+One raw SSE line per text line, as delivered by `response.iter_lines()`:
 
 ```text
-data: {"id": "...", "choices": [{"delta": {"content": "...", "type": "text"}, "finish_reason": null}]}
+data: {"p": "response/content", "o": "APPEND", "v": "OK"}
 ```
 
-Only `data: ` lines carry JSON payloads. Blank lines, `event:`/`id:` lines,
-and comments may appear in real streams and must be tolerated.
+`event:` marker lines and blank keepalives may appear and must be tolerated.
+
+## Tests
+
+`tests/test_wire.py` runs every `live/stream_*.sse.txt` capture through the
+protocol adapter (parametrized), so each new probe capture automatically
+extends offline coverage.
 
 ## Rule
 

@@ -13,7 +13,7 @@ from dsk.api import AuthenticationError, RateLimitError
 
 from app.backends.deepseek_web import DeepSeekWebBackend
 from app.backends.errors import BackendErrorCategory, BackendFailure
-from app.backends.events import MessageFinished, TextDelta
+from app.backends.events import BackendMessageId, MessageFinished, TextDelta
 
 
 @pytest.fixture()
@@ -71,26 +71,32 @@ class TestBackendOffline:
         assert backend._api._parse_chunk.__func__.__name__ == "_parse_chunk"
 
     def test_raw_sink_captures_when_parser_runs(self, backend: DeepSeekWebBackend) -> None:
-        # Exercise the capture wrapper around the REAL parser by feeding it
-        # bytes directly through stream_turn's wrapping: simulate by invoking
-        # the wrapped parser manually.
+        # Exercise the capture+adapt seam around the CURRENT protocol by
+        # feeding raw lines through stream_turn's wrapped parser.
         sink: list[bytes] = []
+        raw_lines = (
+            b"event: ready",
+            b'data: {"request_message_id": "r1", "response_message_id": "m1", "model_type": "default"}',
+            b'data: {"p": "response/content", "o": "APPEND", "v": "ok"}',
+            b'data: {"p": "response/status", "v": "FINISHED"}',
+        )
 
         def fake_chat_completion(*args, **kwargs):
-            # Emulate the vendored loop: parse raw lines through self parser.
-            for line in (
-                b'data: {"choices": [{"delta": {"content": "ok", "type": "text"}, "finish_reason": "stop"}]}',
-            ):
+            # Emulate the vendored loop: every iter_lines() row goes through
+            # the instance parser.
+            for line in raw_lines:
                 parsed = backend._api._parse_chunk(line)
                 if parsed:
                     yield parsed
 
         backend._api.chat_completion = fake_chat_completion  # type: ignore[method-assign]
         events = list(backend.stream_turn("sess-1", "hi", raw_sink=sink))
-        assert events == [TextDelta("ok"), MessageFinished("stop")]
-        assert sink == [
-            b'data: {"choices": [{"delta": {"content": "ok", "type": "text"}, "finish_reason": "stop"}]}'
+        assert events == [
+            BackendMessageId("m1"),
+            TextDelta("ok"),
+            MessageFinished("stop"),
         ]
+        assert sink == list(raw_lines)
         assert "_parse_chunk" not in backend._api.__dict__
 
     def test_upstream_rate_limit_mapped(self, backend: DeepSeekWebBackend) -> None:

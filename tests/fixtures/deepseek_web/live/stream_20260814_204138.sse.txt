@@ -1,0 +1,65 @@
+event: ready
+data: {"request_message_id": "SANITIZED-ID-1", "response_message_id": "SANITIZED-ID-2", "model_type": "default"}
+
+event: update_session
+data: {"updated_at": 1786711302.666476}
+
+data: {"v": {"response": {"message_id": "SANITIZED-ID-2", "parent_id": "SANITIZED-ID-1", "model": "", "role": "ASSISTANT", "thinking_enabled": true, "ban_edit": false, "ban_regenerate": false, "status": "WIP", "incomplete_message": null, "accumulated_token_usage": 0, "files": [], "feedback": null, "inserted_at": 1786711302.653064, "search_enabled": false, "content": "", "thinking_content": null, "thinking_elapsed_secs": null, "search_status": null, "search_results": null, "tips": []}}}
+
+data: {"p": "response/thinking_content", "v": "1"}
+
+data: {"o": "APPEND", "v": "."}
+
+data: {"v": " "}
+
+data: {"v": " The"}
+
+data: {"v": " user"}
+
+data: {"v": " asks"}
+
+data: {"v": " a"}
+
+data: {"v": " simple"}
+
+data: {"v": " arithmetic"}
+
+data: {"v": " question"}
+
+data: {"v": " and"}
+
+data: {"v": " requests"}
+
+data: {"v": " a"}
+
+data: {"v": " brief"}
+
+data: {"v": " answer"}
+
+data: {"v": ".\n"}
+
+data: {"v": "2"}
+
+data: {"v": "."}
+
+data: {"v": " "}
+
+data: {"v": " The"}
+
+data: {"v": " answer"}
+
+data: {"v": " is"}
+
+data: {"v": " "}
+
+data: {"v": "4"}
+
+data: {"v": "."}
+
+data: {"p": "response/thinking_elapsed_secs", "o": "SET", "v": 0.595816648}
+
+data: {"p": "response/content", "o": "APPEND", "v": "4"}
+
+data: {"p": "response/accumulated_token_usage", "o": "SET", "v": 42}
+
+data: {"p": "response/status", "v": "FINISHED"}

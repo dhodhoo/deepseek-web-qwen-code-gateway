@@ -137,13 +137,19 @@ def payload_to_events(payload: dict[str, Any]) -> list[BackendEvent]:
 
 
 def chunk_dict_to_events(chunk: dict[str, Any]) -> list[BackendEvent]:
-    """Convert one *reduced* vendored-client chunk dict into events.
+    """Convert one backend chunk dict into events.
 
-    The vendored ``DeepSeekAPI._parse_chunk`` yields dicts shaped like
-    ``{'content': str, 'type': str, 'finish_reason': str | None}`` and drops
-    every other field. Missing keys are tolerated.
+    Consumes the chunk contract produced by the backend adapters: the legacy
+    vendored shape ``{'content', 'type', 'finish_reason'}`` plus optional
+    extensions from the current wire adapter (``response_message_id`` /
+    ``request_message_id``, see :mod:`app.backends.deepseek_web.wire`).
+    Missing keys are tolerated.
     """
-    events = _delta_events(chunk.get("content"), chunk.get("type"))
+    events: list[BackendEvent] = []
+    response_message_id = chunk.get("response_message_id")
+    if response_message_id:
+        events.append(BackendMessageId(id=str(response_message_id)))
+    events.extend(_delta_events(chunk.get("content"), chunk.get("type")))
     finish_reason = chunk.get("finish_reason")
     if finish_reason is not None:
         events.append(MessageFinished(finish_reason=str(finish_reason)))
