@@ -1,0 +1,2 @@
+data: {"id": "SYN-RAW-ID-9", "choices": [{"index": 0, "delta": {"content": "hello", "type": "text"}, "finish_reason": null}], "message_id": "SYN-MSG-ID-77", "chat_session_id": "SYN-SESS-ID-5", "user_id": "SYN-USER-ID-3", "user": {"nickname": "someone", "avatar": "https://example.invalid/a.png"}, "created": 1755000000, "model": "deepseek-chat"}
+data: {"id": "SYN-RAW-ID-9", "choices": [{"index": 0, "delta": {"content": "", "type": "text"}, "finish_reason": "stop"}], "message_id": "SYN-MSG-ID-77", "created": 1755000001, "model": "deepseek-chat"}

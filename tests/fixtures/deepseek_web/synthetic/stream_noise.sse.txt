@@ -1,0 +1,10 @@
+: keepalive comment line
+event: message
+id: sse-event-id-1
+
+data: {"id": "SYN-4", "choices": []}
+data: {"id": "SYN-4", "heartbeat": true}
+data: {"id": "SYN-4", "choices": [{"index": 0, "delta": {"content": "search result ref", "type": "search_result"}, "finish_reason": null}]}
+data: {"id": "SYN-4", "choices": [{"index": 0, "delta": {"content": "visible text", "type": "text"}, "finish_reason": null}]}
+data: [1, 2, 3]
+data: {"id": "SYN-4", "choices": [{"index": 0, "delta": {"content": "", "type": "text"}, "finish_reason": "stop"}]}

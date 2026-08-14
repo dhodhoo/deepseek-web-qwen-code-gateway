@@ -1,0 +1,6 @@
+data: {"id": "SYN-2", "choices": [{"index": 0, "delta": {"content": "Let me consider", "type": "thinking"}, "finish_reason": null}], "created": 1755000000, "model": "deepseek-chat", "object": "chat.completion.chunk"}
+data: {"id": "SYN-2", "choices": [{"index": 0, "delta": {"content": " the arithmetic.", "type": "thinking"}, "finish_reason": null}], "created": 1755000000, "model": "deepseek-chat", "object": "chat.completion.chunk"}
+
+data: {"id": "SYN-2", "choices": [{"index": 0, "delta": {"content": "2+2", "type": "text"}, "finish_reason": null}], "created": 1755000001, "model": "deepseek-chat", "object": "chat.completion.chunk"}
+data: {"id": "SYN-2", "choices": [{"index": 0, "delta": {"content": " equals 4.", "type": "text"}, "finish_reason": null}], "created": 1755000001, "model": "deepseek-chat", "object": "chat.completion.chunk"}
+data: {"id": "SYN-2", "choices": [{"index": 0, "delta": {"content": "", "type": "text"}, "finish_reason": "stop"}], "created": 1755000002, "model": "deepseek-chat", "object": "chat.completion.chunk", "usage": {"prompt_tokens": 12, "completion_tokens": 30, "total_tokens": 42}}

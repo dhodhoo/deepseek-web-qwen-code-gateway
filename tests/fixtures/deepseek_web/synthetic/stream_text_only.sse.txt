@@ -1,0 +1,2 @@
+data: {"id": "SYN-1", "choices": [{"index": 0, "delta": {"content": "OK", "type": "text", "role": "assistant"}, "finish_reason": null}], "created": 1755000000, "model": "deepseek-chat", "object": "chat.completion.chunk"}
+data: {"id": "SYN-1", "choices": [{"index": 0, "delta": {"content": "", "type": "text"}, "finish_reason": "stop"}], "created": 1755000001, "model": "deepseek-chat", "object": "chat.completion.chunk", "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}}

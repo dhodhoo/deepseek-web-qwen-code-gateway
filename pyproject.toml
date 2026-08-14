@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepseek-qwen-gateway"
+version = "0.0.1"
+description = "Local-first OpenAI-compatible gateway that lets Qwen Code use DeepSeek Web (via the deepseek4free approach) as a model provider. M0: upstream compatibility spike."
+readme = "README_START_HERE.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+# Runtime dependencies for the M0 spike.
+# NOTE: upstream deepseek4free pins curl-cffi==0.8.1b9. That version has no
+# wheels for Python 3.12+/3.14 on Windows and its sdist build downloads a
+# libcurl-impersonate release that no longer exists (404). We therefore use a
+# modern curl-cffi; the vendored client only *warns* on version mismatch and
+# the APIs it uses (requests-style API + impersonate='chrome120') are stable
+# across these versions. Verified in M0; see docs/DECISIONS.md ADR-009.
+dependencies = [
+    "curl-cffi>=0.13",
+    "wasmtime>=3",
+    "numpy>=2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+# Browser-assisted Cloudflare cookie refresh (upstream dsk/bypass.py path).
+# Intentionally NOT installed by default in M0; see docs/UPSTREAM_NOTES.md.
+cloudbypass = [
+    "nodriver",
+    "drissionpage",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "live: tests that hit the real DeepSeek Web API (require DEEPSEEK_AUTH_TOKEN; never run by default)",
+]
+addopts = "-m 'not live'"

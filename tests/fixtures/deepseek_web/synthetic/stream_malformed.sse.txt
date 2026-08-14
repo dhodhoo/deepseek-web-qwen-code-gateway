@@ -1,0 +1,3 @@
+data: {"id": "SYN-3", "choices": [{"index": 0, "delta": {"content": "partial", "type": "text"}, "finish_reason": null}]}
+data: {"id": "SYN-3", "choices": [{"index": 0, "delta": {"content": BROKEN JSON HERE
+data: {"id": "SYN-3", "choices": [{"index": 0, "delta": {"content": "after", "type": "text"}, "finish_reason": null}]}

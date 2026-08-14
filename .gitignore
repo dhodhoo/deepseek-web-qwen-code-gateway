@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test/coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets & local credential material (NEVER commit)
+.env
+.env.*
+!.env.example
+*.cookies.json
+cookies.json
+dsk/cookies.json
+vendor/deepseek4free/dsk/cookies.json
+
+# Live probe captures are sanitized before commit; keep raw captures out.
+tests/fixtures/deepseek_web/raw_unsanitized/
+probe_output/
+
+# Local agent/session state
+.qwen/QWEN.local.md
