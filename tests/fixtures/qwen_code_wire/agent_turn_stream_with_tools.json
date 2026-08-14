@@ -1,0 +1,62 @@
+{
+  "model": "deepseek-web",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are Qwen Code, an interactive CLI agent developed by Alibaba Group, specializing in software engineering tasks. Your primary goal is to help users safely and efficiently, adhering strictly to the following instructions and utilizing your available tools."
+    },
+    {
+      "role": "user",
+      "content": "What files are in the current directory?"
+    }
+  ],
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "max_tokens": 32768,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Reads and returns the content of a specified file. If the file is large, the content will be truncated.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string",
+              "description": "The absolute path to the file to read."
+            },
+            "offset": {
+              "type": "number",
+              "description": "The line number to start reading from (0-based)."
+            },
+            "limit": {
+              "type": "number",
+              "description": "The maximum number of lines to read."
+            }
+          },
+          "required": ["file_path"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "run_shell_command",
+        "description": "Executes a given shell command in a subprocess.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "description": "Exact command to execute."
+            }
+          },
+          "required": ["command"]
+        }
+      }
+    }
+  ]
+}

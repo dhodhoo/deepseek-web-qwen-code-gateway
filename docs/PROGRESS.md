@@ -4,9 +4,9 @@ The coding agent must update this file after every milestone.
 
 ## Current status
 
-**Current milestone:** M4 — Canonical conversation/session state
+**Current milestone:** M5 — Real Qwen Code wire compatibility
 
-**State:** COMPLETE (offline-verified + live HTTP smoke 2026-08-14). Awaiting user review; M5 not started.
+**State:** COMPLETE (offline-verified 2026-08-14: fixture-driven wire tests + real openai SDK against real uvicorn + end-to-end smoke; live Qwen Code connection prepared turnkey). Awaiting user review; M6 not started.
 
 ## Completed
 
@@ -16,33 +16,85 @@ The coding agent must update this file after every milestone.
 - M2 (2026-08-14): FastAPI gateway surface — /health, /v1/models, non-streaming /v1/chat/completions with bearer auth, deterministic message compiler, OpenAI error mapping.
 - M3 (2026-08-14): OpenAI SSE streaming — event→chunk translator, primed pre-stream error handling, in-stream mid-failure envelope, [DONE], disconnect-safe generator.
 - M4 (2026-08-14): canonical conversation state — bounded in-memory store, history-prefix resolution, backend session reuse, parent-message threading, commit-on-finish + rebuild-on-failure, reconstruction tests.
+- M5 (2026-08-14): real Qwen Code wire compatibility — tools[]/tool_choice accepted and ignored (plain chat usable), opt-in sanitized diagnostic capture layer, source-verified wire fixtures + fixture tests, SDK-driven wire-compat tests, Qwen Code integration/wiring doc.
 
 ## Tests run
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-265 passed, 3 deselected (live tests excluded by default marker)
+285 passed, 3 deselected (live tests excluded by default marker)
 
-Live HTTP smoke (scripted FakeBackend behind real uvicorn, port 8144):
-turn1 -> 200; turn2 -> 200; ONE backend session reused; parent
-threading None -> 'resp-1'; delta prompts ('[user]\none' then
-'[user]\ntwo'); store: 1 conversation, 4 canonical messages,
-JSON snapshot round-trip.
+M5 smoke (in-process uvicorn + real openai Python SDK 3.0.0 +
+GATEWAY_DIAGNOSTICS_DIR): env-parsed diagnostics_dir; health 200;
+SDK non-stream chat WITH tools[] -> plain text (no fabricated
+tool_calls); SDK streaming chat parsed to completion; 2 sanitized
+records captured, Authorization value absent from disk.
+
+M5 SDK wire-compat tests run a real uvicorn gateway per module and
+drive it through the real openai SDK: models.list, non-stream,
+streaming with stream_options.include_usage, tools tolerance,
+extra_body non-standard fields — all green offline (FakeBackend).
 ```
 
 ## Known limitations
 
+- Live Qwen Code acceptance is PREPARED but not executed: no real Qwen Code install has been connected yet (user test sessions have not happened). docs/QWEN_CODE_INTEGRATION.md contains the turnkey 2-minute live checklist; the offline proof is the real-SDK wire-compat suite. Wire fixtures are SOURCE-verified (Qwen Code v0.21.11), not traffic-captured — the diagnostic capture layer exists to convert them into traffic-verified ones on first live connection.
+- `tools[]`/`tool_choice` are accepted but IGNORED (ADR-021): answers are plain text until M6 implements prompt-emulated tool calling. Tool-shaped history (assistant tool_calls / role=tool) still answers 400 UNSUPPORTED_MESSAGE until M6 (unreachable in plain chat — the gateway emits no tool calls yet).
 - Live multi-turn acceptance against chat.deepseek.com is NOT yet proven: `tests/test_live_upstream.py::test_live_multi_turn_threads_parent_message_id` is written (marker `live`) but has not run — the delta+parent strategy is validated offline only. If upstream rejects parent threading, the rebuild path (fresh session + full-history prompt) remains correct and is the documented fallback.
 - Conversation state is in-memory only (bounded 256, least-recently-updated eviction) and dies with the process; continuity self-heals because every request carries its own history. SQLite persistence deferred (ADR-020).
 - Live error paths (429/5xx/Cloudflare) were not triggered during probing; classification is unit-tested offline only.
 - Upstream deepseek4free is dormant since 2025-02-09; its stream parser was fully obsolete (protocol changed). Further drift is possible at any time; probe captures are the early-warning mechanism.
-- Sampling parameters are accepted but ignored; no usage chunk in streams (no upstream token counts).
+- Sampling parameters are accepted but ignored; no usage chunk in streams (no upstream token counts; Qwen Code tolerates absence).
 - Reasoning/thinking content is intentionally NOT surfaced in streams.
-- Tool calling, Qwen Code provider wiring, multi-account, UI, Docker intentionally not started.
+- Embeddings are not implemented (`/v1/embeddings` 404s; Qwen Code's embedContent hardcodes `text-embedding-ada-002` — out of core milestones).
+- Tool calling (M6+), multi-account, UI, Docker intentionally not started.
 
 ## Next action
 
-User reviews the M4 report. If approved, start M5 (real Qwen Code wire compatibility, diagnostic fixtures).
+User reviews the M5 report. If approved, start M6 (one emulated tool call: normalize incoming tools, tool prompt compiler, control-envelope parser, structured tool_calls output, role=tool compilation).
+
+---
+
+## 2026-08-14 — M5: Real Qwen Code wire compatibility
+
+### Completed
+
+- Policy change (ADR-021, partially supersedes ADR-018): `tools[]`/`tool_choice` are now ACCEPTED AND IGNORED — responses are plain text, tools are never echoed, no `tool_calls` are fabricated. Source verification showed every Qwen Code agent turn carries non-empty tools[]; the old `400 TOOLS_NOT_YET_SUPPORTED` made the M5 exit ("real Qwen Code can use the gateway for plain chat") unreachable. Tool-shaped HISTORY messages stay `400 UNSUPPORTED_MESSAGE` until M6 — unreachable in M5 plain chat and now pinned by a fixture test.
+- Opt-in diagnostic capture layer (`app/diagnostics.py`, `GATEWAY_DIAGNOSTICS_DIR`): every authenticated `/v1/chat/completions` request is appended BEFORE validation to `<dir>/requests.jsonl` (rejected shapes are exactly what wire fixtures need). Sanitized: Authorization header value never written (presence only); only content-type/user-agent header values kept; request bodies written in full (the purpose of the layer — use a private directory). Best-effort: capture failures log and never break requests. Disabled by default; env + settings + `.env.example` wired.
+- Wire fixtures (`tests/fixtures/qwen_code_wire/`, provenance README): agent turn (stream + stream_options.include_usage + realistic tools[]), side query (explicit stream:false, no tools), tool-loop history (assistant tool_calls with content:null + arguments JSON string; role=tool with content as array of text parts), non-standard extras (reasoning_effort, enable_thinking, thinking:{type:"disabled"}, chat_template_kwargs, preserve_thinking, metadata, cache_control, vl_high_resolution_images). Synthesized from the source verification in docs/UPSTREAM_NOTES.md (no live capture existed); the diagnostics layer is the path to traffic-verify them on first real connection.
+- Fixture-driven tests (`tests/test_m5_wire_fixtures.py`): agent turn streams plain text + [DONE] with no tool_calls/usage chunks; backend receives only the compiled canonical prompt (tools never reach upstream); same body non-streamed; tool_choice 'required' tolerated; side query 200; tool-history 400 UNSUPPORTED_MESSAGE (deterministic M6 target); extras 200.
+- SDK-driven wire-compat tests (`tests/test_m5_sdk_compat.py`): a real uvicorn gateway (module fixture) driven through the real openai Python SDK 3.0.0 over actual HTTP — models.list (provider/model selection), non-stream chat, streaming with include_usage, tools tolerance, extra_body non-standard fields. The closest offline proxy for Qwen Code's pinned openai Node SDK 5.11.0 (same wire protocol, different implementation).
+- `docs/QWEN_CODE_INTEGRATION.md` rewritten as the turnkey wiring guide: source-verified settings.json provider entry (baseUrl ending /v1, envKey, generationConfig inside the entry — impermeable/atomic), env key setup, M5 capability table, diagnostics instructions, troubleshooting, live acceptance checklist (the 2-minute user-run step).
+- API_CONTRACT.md synchronized (M5, ADR-021 bullets: tools tolerance, wire-format references, diagnostic capture); existing tools-400 tests in test_api.py / test_api_streaming.py inverted to accepted-and-ignored.
+- End-to-end smoke (in-process uvicorn + real openai SDK + GATEWAY_DIAGNOSTICS_DIR): env parsing, health, non-stream chat with tools[], streaming chat, 2 sanitized capture records with no key value on disk — ALL PASS (script deleted after use, established pattern).
+
+### Files changed
+
+```text
+app/diagnostics.py (new), app/server.py (tools tolerance + capture hook),
+app/config.py (diagnostics_dir), .env.example (GATEWAY_DIAGNOSTICS_DIR),
+pyproject.toml (dev extra: openai)
+tests/fixtures/qwen_code_wire/{README.md, agent_turn_stream_with_tools.json,
+  plain_chat_non_stream.json, tool_history_turn.json,
+  non_standard_extras.json} (new)
+tests/test_m5_wire_fixtures.py, tests/test_m5_diagnostics.py,
+  tests/test_m5_sdk_compat.py (new)
+tests/test_api.py, tests/test_api_streaming.py (tools tests inverted)
+docs/DECISIONS.md (ADR-021), docs/QWEN_CODE_INTEGRATION.md (rewritten),
+docs/API_CONTRACT.md (M5 sync), docs/PROGRESS.md
+```
+
+### Tests executed
+
+```text
+.venv\Scripts\python.exe -m pytest -q
+285 passed, 3 deselected (live tests excluded by default marker)
+```
+
+### Honest gaps
+
+- No real Qwen Code install was connected (no user test session this milestone); offline proof = fixtures + real-SDK suite, live step prepared turnkey in docs/QWEN_CODE_INTEGRATION.md.
+- Fixtures are source-verified, not traffic-captured (drift check = diagnostics capture on first live connection).
 
 ---
 

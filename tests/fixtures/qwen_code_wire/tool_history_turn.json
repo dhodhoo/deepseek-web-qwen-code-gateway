@@ -1,0 +1,61 @@
+{
+  "model": "deepseek-web",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are Qwen Code, an interactive CLI agent developed by Alibaba Group."
+    },
+    {
+      "role": "user",
+      "content": "Read the file src/main.py and explain it."
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_9f1d2c3b4a5e6f70",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"file_path\":\"src/main.py\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_9f1d2c3b4a5e6f70",
+      "content": [
+        {
+          "type": "text",
+          "text": "def main():\n    print(\"hello\")\n\nif __name__ == \"__main__\":\n    main()"
+        }
+      ]
+    }
+  ],
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "max_tokens": 32768,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Reads and returns the content of a specified file.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string",
+              "description": "The absolute path to the file to read."
+            }
+          },
+          "required": ["file_path"]
+        }
+      }
+    }
+  ]
+}

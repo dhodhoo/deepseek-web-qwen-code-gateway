@@ -32,6 +32,8 @@ dev = [
     "pytest>=8",
     # FastAPI TestClient transport.
     "httpx>=0.27",
+    # M5: real-client wire-compatibility tests (offline, FakeBackend).
+    "openai>=1",
 ]
 # Browser-assisted Cloudflare cookie refresh (upstream dsk/bypass.py path).
 # Intentionally NOT installed by default in M0; see docs/UPSTREAM_NOTES.md.

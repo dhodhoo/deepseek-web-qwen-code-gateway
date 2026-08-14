@@ -231,8 +231,11 @@ class TestStreamingErrors:
 
 
 class TestStreamingValidationAndAuth:
-    def test_stream_with_tools_is_still_400_until_m6(self) -> None:
-        client = _client(_settings(), FakeBackend())
+    def test_stream_with_tools_is_accepted_and_ignored_until_m6(self) -> None:
+        # M5 (ADR-021): Qwen Code agent turns always carry tools[]; the
+        # gateway streams a plain-text answer instead of rejecting.
+        backend = FakeBackend(turns=[SSE_TURN])
+        client = _client(_settings(), backend)
         payload = _chat_body(
             tools=[
                 {
@@ -243,11 +246,21 @@ class TestStreamingValidationAndAuth:
                         "parameters": {"type": "object", "properties": {}},
                     },
                 }
-            ]
+            ],
+            stream_options={"include_usage": True},
         )
-        response = client.post("/v1/chat/completions", json=payload, headers=AUTH)
-        assert response.status_code == 400
-        assert response.json()["error"]["code"] == "TOOLS_NOT_YET_SUPPORTED"
+        lines = _stream_lines(client, payload)
+        assert lines[-1] == "data: [DONE]"
+        chunks = [_parse(line) for line in lines[:-1]]
+        full_text = "".join(
+            chunk["choices"][0]["delta"].get("content", "") for chunk in chunks
+        )
+        assert full_text == "Hello!"
+        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+        # tools are ignored, never echoed; no usage chunk is emitted and the
+        # Qwen Code client tolerates its absence (UPSTREAM_NOTES, M5).
+        assert all("tool_calls" not in chunk["choices"][0]["delta"] for chunk in chunks)
+        assert all("usage" not in chunk for chunk in chunks)
 
     def test_stream_with_unknown_model_is_404(self) -> None:
         client = _client(_settings(), FakeBackend())

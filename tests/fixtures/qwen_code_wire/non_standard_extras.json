@@ -1,0 +1,27 @@
+{
+  "model": "deepseek-web",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hi there",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "stream": false,
+  "max_tokens": 16384,
+  "reasoning_effort": "low",
+  "enable_thinking": false,
+  "thinking": {
+    "type": "disabled"
+  },
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
+  "preserve_thinking": false,
+  "metadata": {
+    "qwen_code_side_query": true
+  },
+  "vl_high_resolution_images": false
+}

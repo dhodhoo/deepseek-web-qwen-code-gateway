@@ -1,0 +1,11 @@
+{
+  "model": "deepseek-web",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Summarize this error message in one sentence: TypeError: Cannot read properties of undefined (reading 'map')"
+    }
+  ],
+  "stream": false,
+  "max_tokens": 8192
+}

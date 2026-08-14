@@ -184,8 +184,12 @@ class TestChatCompletionsRejections:
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/event-stream")
 
-    def test_tools_are_400_until_m6(self) -> None:
-        client = _client(_settings(), FakeBackend())
+    def test_tools_are_accepted_and_ignored_until_m6(self) -> None:
+        # M5 (ADR-021): Qwen Code sends a non-empty tools[] on every agent
+        # turn, so the gateway accepts and IGNORES tools — the answer is
+        # plain text; structured tool_calls arrive in M6.
+        backend = FakeBackend(turns=[fake_text_turn("plain answer")])
+        client = _client(_settings(), backend)
         payload = _chat_body(
             tools=[
                 {
@@ -199,16 +203,23 @@ class TestChatCompletionsRejections:
             ]
         )
         response = client.post("/v1/chat/completions", json=payload, headers=AUTH)
-        assert response.status_code == 400
-        assert response.json()["error"]["code"] == "TOOLS_NOT_YET_SUPPORTED"
+        assert response.status_code == 200
+        message = response.json()["choices"][0]["message"]
+        assert message == {"role": "assistant", "content": "plain answer"}
+        assert len(backend.turn_calls) == 1
 
-    def test_tool_choice_alone_is_400_until_m6(self) -> None:
-        client = _client(_settings(), FakeBackend())
+    def test_tool_choice_is_accepted_and_ignored_until_m6(self) -> None:
+        # M5 (ADR-021): tool_choice only ever arrives as 'required'/'none'
+        # from Qwen Code (never 'auto'); both are tolerated and ignored.
+        backend = FakeBackend(turns=[fake_text_turn("plain answer")])
+        client = _client(_settings(), backend)
         response = client.post(
-            "/v1/chat/completions", json=_chat_body(tool_choice="required"), headers=AUTH
+            "/v1/chat/completions",
+            json=_chat_body(tool_choice="required"),
+            headers=AUTH,
         )
-        assert response.status_code == 400
-        assert response.json()["error"]["code"] == "TOOLS_NOT_YET_SUPPORTED"
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == "plain answer"
 
     def test_tool_message_is_400_unsupported_message(self) -> None:
         client = _client(_settings(), FakeBackend())

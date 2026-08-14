@@ -27,6 +27,8 @@ Environment variables (see .env.example):
   key when no key is configured (development opt-in; secure default is deny)
 * ``GATEWAY_MODEL_ID``         — advertised model alias (default ``deepseek-web``)
 * ``GATEWAY_HOST``/``GATEWAY_PORT`` — bind address for ``python -m app.main``
+* ``GATEWAY_DIAGNOSTICS_DIR``  — optional directory for the opt-in M5
+  diagnostic request capture (sanitized JSONL; see app/diagnostics.py)
 """
 
 from __future__ import annotations
@@ -110,6 +112,8 @@ class GatewaySettings(BaseModel):
     model_id: str = DEFAULT_MODEL_ID
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
+    # --- M5: opt-in diagnostic request capture (app/diagnostics.py) ------
+    diagnostics_dir: Path | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "GatewaySettings":
@@ -137,6 +141,10 @@ class GatewaySettings(BaseModel):
             or DEFAULT_HOST,
             "port": _parse_port(source.get("GATEWAY_PORT")),
         }
+        diagnostics_raw = (source.get("GATEWAY_DIAGNOSTICS_DIR") or "").strip()
+        common["diagnostics_dir"] = (
+            Path(diagnostics_raw) if diagnostics_raw else None
+        )
 
         if backend_type == FAKE_BACKEND_TYPE:
             return cls(backend_type=FAKE_BACKEND_TYPE, **common)  # type: ignore[arg-type]

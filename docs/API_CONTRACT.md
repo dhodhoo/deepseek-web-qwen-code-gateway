@@ -12,21 +12,23 @@ Primary prefix:
 
 ## Implementation status
 
-Last synchronized: M4 (2026-08-14). See also docs/PROGRESS.md and docs/DECISIONS.md (ADR-017..020).
+Last synchronized: M5 (2026-08-14). See also docs/PROGRESS.md and docs/DECISIONS.md (ADR-017..021).
 
 - `GET /health` — implemented (M2). Unauthenticated by design; exposes no secrets.
 - `GET /v1/models` — implemented (M2). One gateway alias (`GATEWAY_MODEL_ID`, default `deepseek-web`).
 - `POST /v1/chat/completions` — implemented (M2 non-streaming; M3 OpenAI SSE streaming) for plain chat with `system` / `user` / `assistant` text messages:
   - `stream: true` → implemented (M3): `chat.completion.chunk` SSE lines, role on the first chunk, incremental `content`, terminal chunk with mapped `finish_reason` (`length` passes through, else `stop`), terminated by `data: [DONE]`. No usage chunk is emitted (no upstream token counts; clients must tolerate absence).
   - Streaming errors: failures BEFORE the first byte answer real HTTP statuses (4xx/5xx, OpenAI error body); failures MID-stream emit `data: {"error": {...}}` and close WITHOUT `[DONE]`.
-  - `tools` / `tool_choice` → `400`, `code: TOOLS_NOT_YET_SUPPORTED` (until M6; applies to both modes).
-  - `role=tool`, assistant `tool_calls`, null-content assistant messages → `400`, `code: UNSUPPORTED_MESSAGE` (until M6).
+  - `tools` / `tool_choice` → ACCEPTED AND IGNORED (M5, ADR-021, partially supersedes the M2-era `TOOLS_NOT_YET_SUPPORTED` 400): responses are plain text, tools are never echoed and no `tool_calls` are fabricated. Qwen Code sends a non-empty `tools[]` on every agent turn, so tolerating it is what makes plain chat usable at all. Structured tool-call output arrives in M6.
+  - `role=tool`, assistant `tool_calls`, null-content assistant messages → `400`, `code: UNSUPPORTED_MESSAGE` (until M6; the exact shapes are fixtured in `tests/fixtures/qwen_code_wire/tool_history_turn.json`).
   - Unknown request fields (sampling knobs, `stream_options`, vendor extras) are accepted and ignored (lenient parsing, `extra="allow"`).
   - Unknown `model` → `404 model_not_found`; empty/missing `messages` or `model` → `422`.
 - Authentication (M2): `Authorization: Bearer <DEEPSEEK_GATEWAY_API_KEY>` on `/v1/*`. Secure-by-default: unconfigured key → `503 GATEWAY_API_KEY_NOT_CONFIGURED` unless `GATEWAY_ALLOW_NO_AUTH=1` (ADR-017).
 - Error envelope (M2): `{"error": {"message", "type", "code"}}`; `BackendFailure` categories map per the suggested HTTP table with `code` = category value (`app/error_mapping.py`).
 - Conversation continuity (M4, ADR-020): resolved from the request's own message history — no conversation header exists or is required. A request whose history STRICTLY extends a stored canonical history continues that conversation: the gateway reuses the backend session, sends only the new trailing messages upstream, and threads `parent_message_id`. New, divergent, or duplicate (equal-history) requests start a fresh conversation compiled from the request's full history. Canonical history advances only when a turn completes; failures invalidate the backend link and the next request rebuilds from canonical state. State is in-memory only (bounded; lost on restart — continuity self-heals because requests carry their own history).
 - Streaming tool-call chunks: NOT yet implemented (M6).
+- Qwen Code wire format (M5, ADR-021): the exact current agent request/history format is documented in docs/UPSTREAM_NOTES.md (source verification, Qwen Code v0.21.11) and covered by fixtures in `tests/fixtures/qwen_code_wire/` plus tests (`test_m5_wire_fixtures.py`, SDK-driven `test_m5_sdk_compat.py`). Wiring steps: docs/QWEN_CODE_INTEGRATION.md.
+- Diagnostic capture (M5, ADR-021): opt-in via `GATEWAY_DIAGNOSTICS_DIR`; appends one sanitized record per authenticated `/v1/chat/completions` request (before validation) to `<dir>/requests.jsonl`. The Authorization header VALUE is never written; request bodies are (that is the purpose of the layer). Disabled by default (app/diagnostics.py).
 
 ## Authentication
 

@@ -7,8 +7,17 @@ Endpoints (docs/API_CONTRACT.md):
 * ``GET  /v1/models``           — gateway model alias list (auth required)
 * ``POST /v1/chat/completions`` — plain chat, non-streaming (M2) and OpenAI
   SSE streaming (M3) with multi-turn conversation continuity resolved from
-  the request's own message history (M4); ``tools``/``tool_choice`` answer
-  400 until M6
+  the request's own message history (M4); ``tools``/``tool_choice`` are
+  ACCEPTED AND IGNORED until M6 (ADR-021) so a real Qwen Code — which
+  always sends ``tools[]`` on agent turns — can use the gateway for plain
+  chat today; tool-shaped HISTORY messages (assistant ``tool_calls``,
+  ``role=tool``) still answer 400 ``UNSUPPORTED_MESSAGE`` until M6
+
+M5 diagnostic capture: when ``GATEWAY_DIAGNOSTICS_DIR`` is configured,
+every authenticated chat-completions request is appended (sanitized —
+never the Authorization value) to ``<dir>/requests.jsonl`` so the exact
+wire format of a real Qwen Code install can be fixtured (ADR-021,
+app/diagnostics.py).
 
 Threading note: the DeepSeek backend is synchronous/blocking (vendored
 curl-cffi). All route handlers are therefore plain ``def`` — Starlette runs
@@ -48,6 +57,7 @@ from .backends.events import (
 )
 from .config import GatewaySettings, build_backend
 from .conversation import CanonicalMessage, Conversation, ConversationStore
+from .diagnostics import RequestRecorder
 from .error_mapping import backend_failure_to_response, openai_error_body
 from .openai_types import (
     AssistantMessageOut,
@@ -318,6 +328,12 @@ def create_app(
     app.state.settings = settings
     app.state.backend = backend
     app.state.store = store if store is not None else ConversationStore()
+    # M5 (ADR-021): opt-in diagnostic request capture; None when disabled.
+    app.state.recorder = (
+        RequestRecorder(settings.diagnostics_dir)
+        if settings.diagnostics_dir is not None
+        else None
+    )
 
     # ------------------------------------------------------------- errors
 
@@ -415,6 +431,20 @@ def create_app(
         cfg: GatewaySettings = request.app.state.settings
         backend_: LLMBackend = request.app.state.backend
 
+        # M5 (ADR-021): capture the request BEFORE any validation so the
+        # diagnostic layer also records shapes the gateway rejects — that
+        # is exactly what the wire-compatibility fixtures need.
+        recorder: RequestRecorder | None = request.app.state.recorder
+        if recorder is not None:
+            recorder.record(
+                "POST",
+                "/v1/chat/completions",
+                headers=request.headers,
+                # exclude_none keeps the record close to the raw wire shape
+                # (fields the client omitted stay omitted).
+                body=body.model_dump(mode="json", exclude_none=True),
+            )
+
         if body.model != cfg.model_id:
             raise GatewayHttpError(
                 404,
@@ -424,15 +454,11 @@ def create_app(
                     "model_not_found",
                 ),
             )
-        if body.tools or body.tool_choice is not None:
-            raise GatewayHttpError(
-                400,
-                openai_error_body(
-                    "tools/tool_choice are not supported yet (milestone M6).",
-                    "invalid_request_error",
-                    "TOOLS_NOT_YET_SUPPORTED",
-                ),
-            )
+        # M5 (ADR-021, supersedes ADR-018 in part): ``tools``/``tool_choice``
+        # are accepted and IGNORED — responses are plain text. Qwen Code
+        # sends a non-empty tools[] on every agent turn; rejecting it would
+        # make even plain chat impossible. Structured tool_calls output and
+        # tool-history compilation arrive in M6.
 
         try:
             canonical = messages_to_canonical(body.messages)
