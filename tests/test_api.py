@@ -184,10 +184,10 @@ class TestChatCompletionsRejections:
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/event-stream")
 
-    def test_tools_are_accepted_and_ignored_until_m6(self) -> None:
-        # M5 (ADR-021): Qwen Code sends a non-empty tools[] on every agent
-        # turn, so the gateway accepts and IGNORES tools — the answer is
-        # plain text; structured tool_calls arrive in M6.
+    def test_tools_with_a_plain_answer_stay_plain_text_in_m6(self) -> None:
+        # M6 (ADR-023): tools[] are compiled into prompt instructions, but
+        # a model answer without a control envelope is still plain text —
+        # no tool_calls key leaks into the response.
         backend = FakeBackend(turns=[fake_text_turn("plain answer")])
         client = _client(_settings(), backend)
         payload = _chat_body(
@@ -207,10 +207,14 @@ class TestChatCompletionsRejections:
         message = response.json()["choices"][0]["message"]
         assert message == {"role": "assistant", "content": "plain answer"}
         assert len(backend.turn_calls) == 1
+        # The tools reached the backend ONLY as the instruction block.
+        assert "[available tools]" in backend.turn_calls[0].prompt
+        assert "- run_shell: run" in backend.turn_calls[0].prompt
 
-    def test_tool_choice_is_accepted_and_ignored_until_m6(self) -> None:
-        # M5 (ADR-021): tool_choice only ever arrives as 'required'/'none'
-        # from Qwen Code (never 'auto'); both are tolerated and ignored.
+    def test_tool_choice_without_tools_stays_plain(self) -> None:
+        # M6: tool_choice only ever arrives as 'required'/'none' from Qwen
+        # Code (never 'auto'). With NO tools supplied there is nothing to
+        # enable — the request behaves like plain chat.
         backend = FakeBackend(turns=[fake_text_turn("plain answer")])
         client = _client(_settings(), backend)
         response = client.post(
@@ -220,9 +224,13 @@ class TestChatCompletionsRejections:
         )
         assert response.status_code == 200
         assert response.json()["choices"][0]["message"]["content"] == "plain answer"
+        assert "[available tools]" not in backend.turn_calls[0].prompt
 
-    def test_tool_message_is_400_unsupported_message(self) -> None:
-        client = _client(_settings(), FakeBackend())
+    def test_tool_message_is_compiled_since_m6(self) -> None:
+        # M6: role=tool history compiles into a [tool result] block
+        # instead of the M5-era 400.
+        backend = FakeBackend(turns=[fake_text_turn("ok")])
+        client = _client(_settings(), backend)
         payload = _chat_body(
             messages=[
                 {"role": "user", "content": "hi"},
@@ -230,10 +238,11 @@ class TestChatCompletionsRejections:
             ]
         )
         response = client.post("/v1/chat/completions", json=payload, headers=AUTH)
-        assert response.status_code == 400
-        error = response.json()["error"]
-        assert error["code"] == "UNSUPPORTED_MESSAGE"
-        assert "M6" in error["message"]
+        assert response.status_code == 200
+        assert (
+            "[tool result]\nid: call_1\ntool: unknown\nresult:\nresult\n"
+            "[end tool result]" in backend.turn_calls[0].prompt
+        )
 
     def test_unknown_model_is_404(self) -> None:
         client = _client(_settings(), FakeBackend())

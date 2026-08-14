@@ -4,9 +4,9 @@ The coding agent must update this file after every milestone.
 
 ## Current status
 
-**Current milestone:** M5 — Real Qwen Code wire compatibility
+**Current milestone:** M6 — One emulated tool call
 
-**State:** COMPLETE (offline-verified AND live-accepted 2026-08-14: a real Qwen Code v0.21.11 install answered through the gateway; the 9 captured requests were diffed against the fixtures and every source-verified wire fact confirmed). Awaiting user decision on M6; M6 not started.
+**State:** COMPLETE (offline-verified AND gateway-side live-verified: the M6 live smoke against the real DeepSeek backend produced a valid structured tool call on the first try, and the tool-history round trip answered correctly). Final acceptance step is user-run: connect real Qwen Code and let it execute one structured tool call. M7 (multi-turn tool loop) not started — awaits explicit instruction.
 
 ## Completed
 
@@ -17,6 +17,7 @@ The coding agent must update this file after every milestone.
 - M3 (2026-08-14): OpenAI SSE streaming — event→chunk translator, primed pre-stream error handling, in-stream mid-failure envelope, [DONE], disconnect-safe generator.
 - M4 (2026-08-14): canonical conversation state — bounded in-memory store, history-prefix resolution, backend session reuse, parent-message threading, commit-on-finish + rebuild-on-failure, reconstruction tests.
 - M5 (2026-08-14): real Qwen Code wire compatibility — tools[]/tool_choice accepted and ignored (plain chat usable), opt-in sanitized diagnostic capture layer, source-verified wire fixtures + fixture tests, SDK-driven wire-compat tests, Qwen Code integration/wiring doc.
+- M6 (2026-08-14): one emulated tool call — lenient tools normalization, deterministic [available tools] prompt compiler, strict control-envelope parser (honest plain text on any malformed envelope), tool-shaped history compilation (assistant tool_calls + role=tool), structured OpenAI tool_calls output in both response modes, gateway-minted call_dsqg ids, canonical compact-arguments round trip.
 
 ## Tests run
 
@@ -47,12 +48,29 @@ connected via .env-configured gateway; plain questions answered with
 normal streamed text; 9 requests captured sanitized and structurally
 diffed against tests/fixtures/qwen_code_wire/ (details in
 docs/UPSTREAM_NOTES.md, "Live traffic verification").
+
+M6 suite (same day):
+.venv\Scripts\python.exe -m pytest -q
+370 passed, 3 deselected (live tests excluded by default marker)
+290 -> 370: new M6 suites (test_m6_tools.py, test_m6_envelope.py,
+test_m6_api.py, test_m6_sdk_compat.py) plus the flipped M5-era
+tool-shape tests (tool history now compiles and streams 200 instead
+of 400; tools-with-plain-answer stays plain text).
+
+M6 LIVE SMOKE (same day, real DeepSeek backend via .env): streaming
+turn 1 with two declared tools finished finish_reason=tool_calls on
+the FIRST TRY — id call_dsqg_57e118c6d48147efb02ad96d72b37f72, name
+list_project_files, arguments {"path":"."}, zero content chars; the
+non-stream round trip (re-sending that exact assistant tool_calls +
+role=tool history) finished stop with content "README.md". Proof the
+real model follows the control-envelope protocol and the canonical
+round trip works live. Script deleted after use (established pattern).
 ```
 
 ## Known limitations
 
-- Live Qwen Code acceptance PASSED 2026-08-14 (user-run): plain chat works through a real Qwen Code v0.21.11 install; captures traffic-verified the wire fixtures (docs/UPSTREAM_NOTES.md, "Live traffic verification"). Two captured observations remain unexplained and are flagged MONITOR there (a reduced-tool parallel request lineage; byte-identical re-submissions before success). Structured tool calls remain M6.
-- `tools[]`/`tool_choice` are accepted but IGNORED (ADR-021): answers are plain text until M6 implements prompt-emulated tool calling. Tool-shaped history (assistant tool_calls / role=tool) still answers 400 UNSUPPORTED_MESSAGE until M6 (unreachable in plain chat — the gateway emits no tool calls yet).
+- Live Qwen Code acceptance PASSED 2026-08-14 (user-run): plain chat works through a real Qwen Code v0.21.11 install; captures traffic-verified the wire fixtures (docs/UPSTREAM_NOTES.md, "Live traffic verification"). Two captured observations remain unexplained and are flagged MONITOR there (a reduced-tool parallel request lineage; byte-identical re-submissions before success). Structured tool calling arrived in M6 (live smoke passed first try); the final M6 acceptance step — real Qwen Code executing one structured tool call — is user-run and prepared turnkey.
+- M6 tool calling is intentionally single-shot (ADR-023): one tool call per model turn; text after a valid envelope is discarded; an invalid/truncated envelope flushes as honest plain text with NO bounded repair (re-prompting) — repair, repeated tool-result/model cycles, and persistent cross-request tool-call id mapping are all M7 scope. `tool_choice: "none"` fully disables tools; any other value with valid tools enables the envelope protocol.
 - Live multi-turn acceptance against chat.deepseek.com is NOT yet proven: `tests/test_live_upstream.py::test_live_multi_turn_threads_parent_message_id` is written (marker `live`) but has not run — the delta+parent strategy is validated offline only. If upstream rejects parent threading, the rebuild path (fresh session + full-history prompt) remains correct and is the documented fallback.
 - Conversation state is in-memory only (bounded 256, least-recently-updated eviction) and dies with the process; continuity self-heals because every request carries its own history. SQLite persistence deferred (ADR-020).
 - Live error paths (429/5xx/Cloudflare) were not triggered during probing; classification is unit-tested offline only.
@@ -60,11 +78,63 @@ docs/UPSTREAM_NOTES.md, "Live traffic verification").
 - Sampling parameters are accepted but ignored; no usage chunk in streams (no upstream token counts; Qwen Code tolerates absence).
 - Reasoning/thinking content is intentionally NOT surfaced in streams.
 - Embeddings are not implemented (`/v1/embeddings` 404s; Qwen Code's embedContent hardcodes `text-embedding-ada-002` — out of core milestones).
-- Tool calling (M6+), multi-account, UI, Docker intentionally not started.
+- Multi-turn tool loop (M7), multi-account, UI, Docker intentionally not started.
 
 ## Next action
 
-M5 is fully accepted (offline suite + live traffic). If the user approves, start M6 (one emulated tool call: normalize incoming tools, tool prompt compiler, control-envelope parser, structured tool_calls output, role=tool compilation). Do not start M6 without explicit instruction.
+M6 is complete and live-verified on the gateway side. Remaining M6 acceptance is user-run: start the gateway (`python -m app.main`, `.env` configured) and give real Qwen Code one task that needs a single tool — the gateway emits the structured call, Qwen Code executes it and sends the result back, the gateway compiles it and answers (docs/QWEN_CODE_INTEGRATION.md, "M6 acceptance"). After that, if the user approves, start M7 (multi-turn tool loop: persistent tool-call id mapping, repeated cycles, bounded repair, history validation). Do not start M7 without explicit instruction.
+
+---
+
+## 2026-08-14 — M6: One emulated tool call
+
+### Completed
+
+- Protocol + policy (docs/TOOL_CALLING_PROTOCOL.md, ADR-023 — supersedes the ADR-021 "tools never reach the backend prompt" invariant): the gateway teaches the model a control-envelope protocol (`<<<DSQG_TOOL_CALL>>>` / `<<<DSQG_END_TOOL_CALL>>>`) via a deterministic prompt block, parses ONLY the current inference output for it, and re-emits valid envelopes as OpenAI structured `tool_calls`. Never fabricate; any malformed/truncated envelope flushes as honest plain text; tool results and user quotes are DATA, never scanned.
+- Tool normalization (`app/tools.py`, new): `normalize_tools` lenient on the way in (skips non-function/malformed entries, invalid names against `^[A-Za-z0-9_-]{1,64}$`, duplicates first-wins; empty result = tools disabled); `normalize_arguments_json` renders compact canonical JSON (`ensure_ascii=False`) in BOTH directions so re-sent history compares structurally equal; `arguments_compatible` shallow schema check (required keys, JSON types, bool never satisfies integer/number); `build_tool_instructions` deterministic `[available tools]` block with a `tool_choice: "required"` MUST variant.
+- Control-envelope parser (`app/tool_envelope.py`, new): `EnvelopeParser.feed` holds back candidate sentinel prefixes across arbitrary chunk boundaries and emits `str` content or a `ToolCallEmitted`; strict validation (JSON object, known tool name, schema-compatible arguments); invalid envelopes flushed raw, truncated envelopes flushed at finalization, one call per turn, text after a valid call discarded. `parser=None` is an exact passthrough — every M2–M5 path stays byte-identical when tools are disabled or absent.
+- Prompt compiler (`app/prompt_compiler.py`): tool-shaped history is now VALID — assistant `tool_calls` compile to `[assistant tool call]` blocks, `role=tool` (non-empty `tool_call_id` required) to `[tool result]` blocks, with tool names resolved from earlier calls in the sequence, then a `known_tool_names` seed built from the request's FULL canonical history (delta prompts exclude the assistant call but must still name its result), then `message.name`, else `"unknown"`. Null assistant content is valid only with tool_calls; malformed tool calls and null-content-without-calls still 400 with locations.
+- Wire output (`app/openai_types.py`, `app/streaming.py`, `app/server.py`): `FunctionCallOut`/`ToolCallOut` types; non-stream responses carry `choices[0].message.tool_calls` with gateway-minted `call_dsqg_<uuid4.hex>` ids; streaming emits an opener chunk (index 0, id, name, empty arguments) plus an arguments chunk, and `finish_reason: "tool_calls"` overrides the backend reason when a call was emitted. Responses serialize via `exclude_none` inside a `JSONResponse`, so plain responses keep the exact M2 shape (no `tool_calls: null`) and tool turns omit null `content`. The parser wraps the backend stream BEFORE the recorder tap, so canonical history stores the emitted tool call (content None) for the M4 commit path.
+- `tool_choice` semantics: `"none"` fully disables tools (no instructions, no parser — envelope text streams as plain content); `"required"` adds the MUST wording; `tools_enabled = bool(normalized_tools) and tool_choice != "none"`.
+- New test suites (all offline): `test_m6_tools.py` (normalization leniency, canonical arguments, schema compatibility, instruction determinism), `test_m6_envelope.py` (valid/invalid/truncated envelopes, chunked feeds at sizes 1–13 with no sentinel leakage, honest raw flush, one-call-per-turn), `test_m6_api.py` (non-stream + streaming tool_calls shapes, id regex, finish reasons, tool_history round trip with session reuse + delta prompt, tool_choice none, malformed tools, 400 cases), `test_m6_sdk_compat.py` (real uvicorn + real openai SDK: scripted envelope turns parsed non-streamed and streamed, full round trip reusing the gateway-issued call id).
+- Flipped M5-era tests: the fixtured tool-history turn now compiles and streams 200 with correct `[assistant tool call]`/`[tool result]` blocks and `[available tools]` instructions appended (was pinned 400 as the M6 target); tools-with-plain-answer stays plain text; diagnostics capture test updated for exclude_none null-content omission.
+- Docs synchronized: ADR-023, API_CONTRACT.md (tools/tool_choice, tool-history acceptance, streaming tool-call chunks, tool-call response example), QWEN_CODE_INTEGRATION.md capability table + M6 acceptance checklist, fixture README status line, this file.
+- LIVE SMOKE PASSED (real DeepSeek backend via `.env`, same day): streaming turn 1 with two declared tools followed the envelope FIRST TRY — `finish_reason: tool_calls`, `call_dsqg_57e118c6d48147efb02ad96d72b37f72`, `list_project_files`, `{"path":"."}`, zero content chars; the non-stream round trip with that exact tool history answered `README.md` with `finish_reason: stop`. Script deleted after use (established pattern). Remaining M6 acceptance is user-run: real Qwen Code executes one structured tool call.
+
+### Files changed
+
+```text
+app/tools.py, app/tool_envelope.py (new),
+app/prompt_compiler.py (tool-shaped history + known_tool_names),
+app/openai_types.py (FunctionCallOut/ToolCallOut/tool_calls),
+app/streaming.py (tool-call chunks + finish_reason tool_calls),
+app/server.py (parser wiring, recorder tool_calls, instructions,
+  JSONResponse exclude_none)
+tests/test_m6_tools.py, tests/test_m6_envelope.py, tests/test_m6_api.py,
+  tests/test_m6_sdk_compat.py (new)
+tests/test_api.py, tests/test_prompt_compiler.py,
+  tests/test_api_streaming.py, tests/test_m5_wire_fixtures.py,
+  tests/test_m5_diagnostics.py, tests/test_m5_sdk_compat.py (flipped/updated)
+docs/DECISIONS.md (ADR-023), docs/API_CONTRACT.md (M6 sync),
+docs/TOOL_CALLING_PROTOCOL.md (new protocol doc),
+docs/QWEN_CODE_INTEGRATION.md (M6 capability + acceptance),
+tests/fixtures/qwen_code_wire/README.md (status), docs/PROGRESS.md
+```
+
+### Tests executed
+
+```text
+.venv\Scripts\python.exe -m pytest -q
+370 passed, 3 deselected (live tests excluded by default marker)
+M6 live smoke against the real DeepSeek backend: PASSED first try
+(streaming tool call + non-stream tool-history round trip).
+```
+
+### Honest gaps
+
+- The final M6 acceptance — a real Qwen Code executing the structured tool call — is user-run and has not happened yet (gateway side is live-proven; the client side is turnkey-prepared).
+- One tool call per turn only; malformed envelopes are flushed honestly but NOT repaired (bounded repair, repeated cycles, persistent ids = M7 by design).
+- Live multi-turn probe (`pytest -m live`) still has never run (unchanged from M5).
 
 ---
 

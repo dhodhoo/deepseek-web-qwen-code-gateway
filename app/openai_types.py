@@ -18,6 +18,8 @@ from pydantic import BaseModel, ConfigDict, Field
 __all__ = [
     "ChatMessage",
     "ChatCompletionRequest",
+    "FunctionCallOut",
+    "ToolCallOut",
     "AssistantMessageOut",
     "Choice",
     "ChatCompletionResponse",
@@ -31,7 +33,8 @@ class ChatMessage(BaseModel):
 
     ``content`` may be a plain string, an array of content parts (only
     ``{"type": "text", "text": ...}`` parts are compiled today), or null.
-    ``tool_calls``/``tool_call_id`` are accepted but not supported until M6.
+    ``tool_calls``/``tool_call_id`` are validated and compiled since M6
+    (docs/TOOL_CALLING_PROTOCOL.md).
     """
 
     model_config = ConfigDict(extra="allow")
@@ -60,9 +63,30 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Any | None = None
 
 
+class FunctionCallOut(BaseModel):
+    """The ``function`` member of an outgoing assistant tool call (M6).
+
+    ``arguments`` is a JSON STRING on the OpenAI wire (both directions);
+    the gateway always emits the canonical compact form produced by
+    :func:`app.tools.normalize_arguments_json` (ADR-023).
+    """
+
+    name: str
+    arguments: str
+
+
+class ToolCallOut(BaseModel):
+    """One outgoing assistant tool call (M6, standard OpenAI shape)."""
+
+    id: str
+    type: str = "function"
+    function: FunctionCallOut
+
+
 class AssistantMessageOut(BaseModel):
     role: str = "assistant"
     content: str | None = None
+    tool_calls: list[ToolCallOut] | None = None
 
 
 class Choice(BaseModel):

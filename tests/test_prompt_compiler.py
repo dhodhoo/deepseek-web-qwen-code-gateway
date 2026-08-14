@@ -5,6 +5,14 @@ Extended in M4: the compiler now splits into ``messages_to_canonical``
 ``compile_canonical_to_prompt`` (render canonical messages), so the
 conversation manager can compile per-turn deltas through the exact same
 code path (ADR-020). ``compile_messages_to_prompt`` keeps its M2 behavior.
+
+Extended in M6 (ADR-023): tool-shaped messages compile instead of being
+rejected — assistant ``tool_calls`` render as ``[assistant tool call]``
+blocks and ``role=tool`` messages as ``[tool result]`` blocks
+(docs/TOOL_CALLING_PROTOCOL.md). Arguments are normalized to canonical
+compact JSON on the way in, so the client's re-sent history round-trips
+through structural equality. Null-content assistant messages remain
+rejected UNLESS they carry tool_calls.
 """
 
 from __future__ import annotations
@@ -90,37 +98,78 @@ class TestCompileMessages:
         with pytest.raises(UnsupportedMessageError, match="must not be empty"):
             compile_messages_to_prompt([])
 
-    def test_tool_role_is_rejected_with_m6_pointer(self) -> None:
-        with pytest.raises(UnsupportedMessageError, match="M6"):
-            compile_messages_to_prompt(
-                [_msg("user", "hi"), _msg("tool", "result", tool_call_id="call_1")]
-            )
+    def test_tool_role_compiles_to_a_tool_result_block(self) -> None:
+        # M6: role=tool is data, rendered under [tool result]. With no
+        # earlier assistant tool call to resolve the id against and no
+        # name field, the tool name renders as "unknown".
+        assert compile_messages_to_prompt(
+            [_msg("user", "hi"), _msg("tool", "result", tool_call_id="call_1")]
+        ) == (
+            "[user]\nhi\n\n"
+            "[tool result]\nid: call_1\ntool: unknown\n"
+            "result:\nresult\n[end tool result]"
+        )
+
+    def test_tool_role_without_tool_call_id_is_rejected(self) -> None:
+        with pytest.raises(UnsupportedMessageError, match="tool_call_id"):
+            compile_messages_to_prompt([_msg("user", "hi"), _msg("tool", "x")])
 
     def test_unknown_role_is_rejected(self) -> None:
         with pytest.raises(UnsupportedMessageError, match="unsupported role"):
             compile_messages_to_prompt([_msg("developer", "hi")])
 
-    def test_assistant_tool_calls_are_rejected_with_m6_pointer(self) -> None:
-        with pytest.raises(UnsupportedMessageError, match="M6"):
-            compile_messages_to_prompt(
-                [
-                    _msg("user", "hi"),
-                    _msg(
-                        "assistant",
-                        "thinking",
-                        tool_calls=[
-                            {
-                                "id": "call_1",
-                                "type": "function",
-                                "function": {"name": "run", "arguments": "{}"},
-                            }
-                        ],
-                    ),
-                ]
-            )
+    def test_assistant_tool_calls_compile_to_tool_call_blocks(self) -> None:
+        assert compile_messages_to_prompt(
+            [
+                _msg("user", "hi"),
+                _msg(
+                    "assistant",
+                    "thinking",
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "run",
+                                "arguments": '{"cmd": "ls"}',
+                            },
+                        }
+                    ],
+                ),
+            ]
+        ) == (
+            "[user]\nhi\n\n"
+            "[assistant]\nthinking\n\n"
+            "[assistant tool call]\nid: call_1\ntool: run\n"
+            'arguments: {"cmd":"ls"}'
+        )
 
-    def test_assistant_null_content_is_rejected_with_m6_pointer(self) -> None:
-        with pytest.raises(UnsupportedMessageError, match="M6"):
+    def test_tool_result_resolves_its_name_from_the_assistant_call(self) -> None:
+        assert compile_messages_to_prompt(
+            [
+                _msg(
+                    "assistant",
+                    None,
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "run", "arguments": "{}"},
+                        }
+                    ],
+                ),
+                _msg("tool", "done", tool_call_id="call_1"),
+            ]
+        ) == (
+            "[assistant tool call]\nid: call_1\ntool: run\narguments: {}\n\n"
+            "[tool result]\nid: call_1\ntool: run\n"
+            "result:\ndone\n[end tool result]"
+        )
+
+    def test_assistant_null_content_without_tool_calls_is_rejected(self) -> None:
+        with pytest.raises(
+            UnsupportedMessageError, match="requires tool_calls"
+        ):
             compile_messages_to_prompt([_msg("user", "hi"), _msg("assistant", None)])
 
     def test_error_message_identifies_the_offending_index(self) -> None:
@@ -155,16 +204,97 @@ class TestMessagesToCanonical:
         )
         assert canonical == [CanonicalMessage(role="user", content="a\nb")]
 
-    def test_rejections_match_the_m2_compiler_exactly(self) -> None:
+    def test_remaining_rejections_match_the_m2_compiler_exactly(self) -> None:
         # Same gate, same messages — canonicalization is the validation path
-        # now taken by the API layer before conversation resolution.
+        # taken by the API layer before conversation resolution. The shapes
+        # that remain unsupported after M6 reject identically in both entry
+        # points.
         with pytest.raises(UnsupportedMessageError, match="must not be empty"):
             messages_to_canonical([])
-        with pytest.raises(UnsupportedMessageError, match="M6"):
-            messages_to_canonical([_msg("tool", "r", tool_call_id="c")])
         with pytest.raises(UnsupportedMessageError, match="unsupported role"):
             messages_to_canonical([_msg("developer", "hi")])
-        with pytest.raises(UnsupportedMessageError, match="M6"):
+        with pytest.raises(
+            UnsupportedMessageError, match="requires tool_calls"
+        ):
+            messages_to_canonical([_msg("assistant", None)])
+        with pytest.raises(
+            UnsupportedMessageError, match="only valid on assistant"
+        ):
+            messages_to_canonical(
+                [
+                    _msg(
+                        "user",
+                        "hi",
+                        tool_calls=[
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {
+                                    "name": "run",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    )
+                ]
+            )
+        with pytest.raises(UnsupportedMessageError, match=r"messages\[1\]"):
+            messages_to_canonical([_msg("user", "hi"), _msg("tool", "x")])
+        with pytest.raises(UnsupportedMessageError, match="must not be empty"):
+            compile_messages_to_prompt([])
+        with pytest.raises(UnsupportedMessageError, match="unsupported role"):
+            compile_messages_to_prompt([_msg("developer", "hi")])
+
+    def test_tool_history_normalizes_to_canonical_tool_shapes(self) -> None:
+        canonical = messages_to_canonical(
+            [
+                _msg("user", "hi"),
+                _msg(
+                    "assistant",
+                    None,
+                    tool_calls=[
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "run",
+                                "arguments": '{ "cmd":  "ls" }',
+                            },
+                        }
+                    ],
+                ),
+                _msg("tool", "done", tool_call_id="c1", name="run"),
+            ]
+        )
+        assert canonical == [
+            CanonicalMessage(role="user", content="hi"),
+            CanonicalMessage(
+                role="assistant",
+                content=None,
+                tool_calls=(
+                    CanonicalToolCall(
+                        id="c1",
+                        function_name="run",
+                        # Arguments normalize to canonical compact JSON so
+                        # the client's re-sent history matches structurally
+                        # (ADR-023).
+                        arguments_json='{"cmd":"ls"}',
+                    ),
+                ),
+            ),
+            CanonicalMessage(
+                role="tool", content="done", tool_call_id="c1", name="run"
+            ),
+        ]
+
+    def test_malformed_tool_calls_are_rejected_with_locations(self) -> None:
+        with pytest.raises(UnsupportedMessageError, match=r"tool_calls\[0\]"):
+            messages_to_canonical(
+                [_msg("assistant", "x", tool_calls=[{"type": "function"}])]
+            )
+        with pytest.raises(
+            UnsupportedMessageError, match="not valid JSON"
+        ):
             messages_to_canonical(
                 [
                     _msg(
@@ -174,16 +304,36 @@ class TestMessagesToCanonical:
                             {
                                 "id": "c1",
                                 "type": "function",
-                                "function": {"name": "run", "arguments": "{}"},
+                                "function": {
+                                    "name": "run",
+                                    "arguments": "{not json",
+                                },
                             }
                         ],
                     )
                 ]
             )
-        with pytest.raises(UnsupportedMessageError, match="M6"):
-            messages_to_canonical([_msg("assistant", None)])
-        with pytest.raises(UnsupportedMessageError, match=r"messages\[1\]"):
-            messages_to_canonical([_msg("user", "hi"), _msg("tool", "x")])
+        with pytest.raises(
+            UnsupportedMessageError, match="must be a JSON object"
+        ):
+            messages_to_canonical(
+                [
+                    _msg(
+                        "assistant",
+                        "x",
+                        tool_calls=[
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {
+                                    "name": "run",
+                                    "arguments": "[1,2]",
+                                },
+                            }
+                        ],
+                    )
+                ]
+            )
 
 
 class TestCompileCanonical:
@@ -213,19 +363,21 @@ class TestCompileCanonical:
         with pytest.raises(UnsupportedMessageError, match="must not be empty"):
             compile_canonical_to_prompt([])
 
-    def test_tool_shaped_canonical_is_rejected_until_m6(self) -> None:
+    def test_tool_shaped_canonical_compiles_since_m6(self) -> None:
         call = CanonicalToolCall(
             id="c1", function_name="run", arguments_json="{}"
         )
-        with pytest.raises(UnsupportedMessageError, match="M6"):
-            compile_canonical_to_prompt(
-                [CanonicalMessage(role="tool", content="r", tool_call_id="c1")]
-            )
-        with pytest.raises(UnsupportedMessageError, match="M6"):
-            compile_canonical_to_prompt(
-                [CanonicalMessage(role="assistant", content=None, tool_calls=(call,))]
-            )
-        with pytest.raises(UnsupportedMessageError, match="M6"):
+        assert compile_canonical_to_prompt(
+            [CanonicalMessage(role="tool", content="r", tool_call_id="c1")]
+        ) == "[tool result]\nid: c1\ntool: unknown\nresult:\nr\n[end tool result]"
+        assert compile_canonical_to_prompt(
+            [CanonicalMessage(role="assistant", content=None, tool_calls=(call,))]
+        ) == "[assistant tool call]\nid: c1\ntool: run\narguments: {}"
+
+    def test_null_content_assistant_without_tool_calls_still_rejected(self) -> None:
+        with pytest.raises(
+            UnsupportedMessageError, match="requires tool_calls"
+        ):
             compile_canonical_to_prompt(
                 [CanonicalMessage(role="assistant", content=None)]
             )

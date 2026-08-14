@@ -147,7 +147,10 @@ class TestToolsToleranceThroughRealSdk:
         )
         message = response.choices[0].message
         assert message.content == "ok"
-        assert message.tool_calls is None  # ignored until M6, never faked
+        # M6: the scripted answer holds no control envelope, so no
+        # tool_calls are emitted — they are only ever produced by a
+        # strictly parsed envelope, never faked.
+        assert message.tool_calls is None
         assert response.choices[0].finish_reason == "stop"
 
     def test_non_standard_extras_via_extra_body(self, sdk_client) -> None:

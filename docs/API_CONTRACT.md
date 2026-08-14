@@ -12,21 +12,21 @@ Primary prefix:
 
 ## Implementation status
 
-Last synchronized: M5 (2026-08-14). See also docs/PROGRESS.md and docs/DECISIONS.md (ADR-017..021).
+Last synchronized: M6. See also docs/PROGRESS.md and docs/DECISIONS.md (ADR-017..023).
 
 - `GET /health` — implemented (M2). Unauthenticated by design; exposes no secrets.
 - `GET /v1/models` — implemented (M2). One gateway alias (`GATEWAY_MODEL_ID`, default `deepseek-web`).
-- `POST /v1/chat/completions` — implemented (M2 non-streaming; M3 OpenAI SSE streaming) for plain chat with `system` / `user` / `assistant` text messages:
-  - `stream: true` → implemented (M3): `chat.completion.chunk` SSE lines, role on the first chunk, incremental `content`, terminal chunk with mapped `finish_reason` (`length` passes through, else `stop`), terminated by `data: [DONE]`. No usage chunk is emitted (no upstream token counts; clients must tolerate absence).
+- `POST /v1/chat/completions` — implemented (M2 non-streaming; M3 OpenAI SSE streaming; M6 prompt-emulated tool calling) for plain chat with `system` / `user` / `assistant` text messages:
+  - `stream: true` → implemented (M3): `chat.completion.chunk` SSE lines, role on the first chunk, incremental `content`, terminal chunk with mapped `finish_reason` (`length` passes through, else `stop`; `tool_calls` when a tool call was emitted, M6), terminated by `data: [DONE]`. No usage chunk is emitted (no upstream token counts; clients must tolerate absence).
   - Streaming errors: failures BEFORE the first byte answer real HTTP statuses (4xx/5xx, OpenAI error body); failures MID-stream emit `data: {"error": {...}}` and close WITHOUT `[DONE]`.
-  - `tools` / `tool_choice` → ACCEPTED AND IGNORED (M5, ADR-021, partially supersedes the M2-era `TOOLS_NOT_YET_SUPPORTED` 400): responses are plain text, tools are never echoed and no `tool_calls` are fabricated. Qwen Code sends a non-empty `tools[]` on every agent turn, so tolerating it is what makes plain chat usable at all. Structured tool-call output arrives in M6.
-  - `role=tool`, assistant `tool_calls`, null-content assistant messages → `400`, `code: UNSUPPORTED_MESSAGE` (until M6; the exact shapes are fixtured in `tests/fixtures/qwen_code_wire/tool_history_turn.json`).
+  - `tools` / `tool_choice` → implemented as prompt-emulated tool calling (M6, ADR-023, supersedes the M5 "accepted and ignored" behavior). Incoming `tools[]` are normalized leniently (malformed entries silently skipped; duplicates first-wins). When at least one valid tool remains and `tool_choice != "none"`, a deterministic `[available tools]` instruction block is appended to the compiled prompt and the model's output is parsed for the control envelope (`docs/TOOL_CALLING_PROTOCOL.md`). A valid envelope becomes a structured OpenAI `tool_calls` output with a gateway-minted `call_dsqg_<hex>` id; an invalid or truncated envelope is flushed as honest plain text — no `tool_calls` are ever fabricated. `tool_choice: "required"` strengthens the instruction ("You MUST request exactly one tool call now"); `"none"` fully disables tools. One tool call per turn (parallel calls deferred; repeated cycles and bounded repair are M7). When tools are disabled or none remain valid, the M5 behavior stands: plain text, nothing echoed.
+  - `role=tool` and assistant `tool_calls` history → ACCEPTED AND COMPILED (M6, ADR-023): `role=tool` requires a non-empty `tool_call_id` and compiles to a `[tool result]` block; assistant `tool_calls` compile to `[assistant tool call]` blocks with arguments normalized to compact JSON both directions (structural round-trip equality). Assistant null-content messages are valid only with `tool_calls`; null content without tool calls is still `400 UNSUPPORTED_MESSAGE`, as are malformed tool-call entries (missing/empty id or name, non-JSON arguments).
   - Unknown request fields (sampling knobs, `stream_options`, vendor extras) are accepted and ignored (lenient parsing, `extra="allow"`).
   - Unknown `model` → `404 model_not_found`; empty/missing `messages` or `model` → `422`.
 - Authentication (M2): `Authorization: Bearer <DEEPSEEK_GATEWAY_API_KEY>` on `/v1/*`. Secure-by-default: unconfigured key → `503 GATEWAY_API_KEY_NOT_CONFIGURED` unless `GATEWAY_ALLOW_NO_AUTH=1` (ADR-017).
 - Error envelope (M2): `{"error": {"message", "type", "code"}}`; `BackendFailure` categories map per the suggested HTTP table with `code` = category value (`app/error_mapping.py`).
 - Conversation continuity (M4, ADR-020): resolved from the request's own message history — no conversation header exists or is required. A request whose history STRICTLY extends a stored canonical history continues that conversation: the gateway reuses the backend session, sends only the new trailing messages upstream, and threads `parent_message_id`. New, divergent, or duplicate (equal-history) requests start a fresh conversation compiled from the request's full history. Canonical history advances only when a turn completes; failures invalidate the backend link and the next request rebuilds from canonical state. State is in-memory only (bounded; lost on restart — continuity self-heals because requests carry their own history).
-- Streaming tool-call chunks: NOT yet implemented (M6).
+- Streaming tool-call chunks: implemented (M6, ADR-023) — see "Tool calls in streaming mode" below. Responses serialize with null fields omitted (`exclude_none`), so plain responses keep the exact M2 shape and tool-call responses omit a null `content`.
 - Qwen Code wire format (M5, ADR-021): the exact current agent request/history format is documented in docs/UPSTREAM_NOTES.md (source verification, Qwen Code v0.21.11) and covered by fixtures in `tests/fixtures/qwen_code_wire/` plus tests (`test_m5_wire_fixtures.py`, SDK-driven `test_m5_sdk_compat.py`). Wiring steps: docs/QWEN_CODE_INTEGRATION.md.
 - Diagnostic capture (M5, ADR-021): opt-in via `GATEWAY_DIAGNOSTICS_DIR`; appends one sanitized record per authenticated `/v1/chat/completions` request (before validation) to `<dir>/requests.jsonl`. The Authorization header VALUE is never written; request bodies are (that is the purpose of the layer). Disabled by default (app/diagnostics.py).
 
@@ -174,7 +174,7 @@ Text example:
 }
 ```
 
-Tool-call example:
+Tool-call example (implemented M6, ADR-023):
 
 ```json
 {
@@ -187,10 +187,9 @@ Tool-call example:
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": null,
         "tool_calls": [
           {
-            "id": "call_local_x",
+            "id": "call_dsqg_57e118c6d48147efb02ad96d72b37f72",
             "type": "function",
             "function": {
               "name": "read",
@@ -205,7 +204,7 @@ Tool-call example:
 }
 ```
 
-`function.arguments` must be a JSON string in the public OpenAI-compatible response.
+`function.arguments` must be a JSON string in the public OpenAI-compatible response. Null fields are omitted (`exclude_none` serialization), so a tool-call message omits `content` entirely. When the model produced text before the tool envelope, `content` carries that text alongside `tool_calls`.
 
 ## Streaming response
 
@@ -238,6 +237,8 @@ For v1:
 - use `finish_reason: "tool_calls"`.
 
 Do not display internal control syntax to Qwen Code as normal assistant prose.
+
+Implemented behavior (M6, ADR-023): text before a valid envelope streams as normal `content` deltas; the sentinel itself is held back across chunk boundaries until the envelope is decided. A VALID envelope emits exactly two tool-call chunks — an opener (`index: 0`, id, `type: "function"`, name, empty arguments; plus `role` if not yet sent) and one arguments chunk with the full compact JSON — then the terminal chunk with `finish_reason: "tool_calls"` (overriding the backend reason). An INVALID or truncated envelope is flushed as honest content text — no partial envelope is ever streamed and no `tool_calls` are fabricated. Exactly one tool call per turn (M6); repeated cycles and bounded repair arrive in M7.
 
 ## Conversation identity
 

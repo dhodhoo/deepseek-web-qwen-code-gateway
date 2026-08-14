@@ -23,6 +23,15 @@ response"). Guarantees:
 * **No usage chunk.** DeepSeek Web exposes no token counts; the verified
   Qwen Code client tolerates a missing usage chunk even when it sends
   ``stream_options.include_usage`` (docs/UPSTREAM_NOTES.md).
+* **Tool calls (M6).** The route feeds the stream through the control
+  envelope parser first (app/server.py), so this module only ever sees
+  decided items: renderable ``TextDelta`` text and at most one
+  :class:`app.tool_envelope.ToolCallEmitted`. A tool call renders as the
+  standard OpenAI streaming shape — one chunk opening
+  ``delta.tool_calls[0]`` (index/id/type/function.name, empty arguments),
+  one chunk carrying the full arguments string — and the terminal chunk's
+  finish_reason becomes ``tool_calls``. Envelope fragments never reach
+  this module partially, so nothing sentinel-shaped can leak mid-stream.
 
 Threading: backend iterators are synchronous/blocking; they are consumed via
 :meth:`starlette.concurrency.iterate_in_threadpool` so the event loop is
@@ -47,6 +56,7 @@ from .backends.events import (
     TextDelta,
 )
 from .error_mapping import backend_failure_to_response
+from .tool_envelope import ToolCallEmitted
 
 __all__ = [
     "STREAM_EMPTY",
@@ -141,9 +151,10 @@ async def sse_stream(
     """
     meta = {"chunk_id": chunk_id, "created": created, "model": model}
     role_sent = False
+    tool_call_seen = False
 
-    def render(event: BackendEvent) -> list[str]:
-        nonlocal role_sent
+    def render(event: BackendEvent | ToolCallEmitted) -> list[str]:
+        nonlocal role_sent, tool_call_seen
         if isinstance(event, BackendError):
             # Defensive: current backends raise BackendFailure (ADR-011/014);
             # normalize the event surface into the same failure path.
@@ -153,10 +164,47 @@ async def sse_stream(
                 retryable=event.retryable,
                 status_code=event.status_code,
             )
+        if isinstance(event, ToolCallEmitted):
+            # M6: one validated tool call → standard OpenAI streaming
+            # shape (opener chunk with id/type/name, then the arguments).
+            tool_call_seen = True
+            call = event.call
+            opener: dict[str, Any] = {
+                "index": 0,
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": ""},
+            }
+            delta: dict[str, Any] = {"tool_calls": [opener]}
+            if not role_sent:
+                delta = {"role": "assistant", **delta}
+                role_sent = True
+            return [
+                sse_data_line(_render_chunk(**meta, delta=delta)),
+                sse_data_line(
+                    _render_chunk(
+                        **meta,
+                        delta={
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {
+                                        "arguments": call.arguments_json
+                                    },
+                                }
+                            ]
+                        },
+                    )
+                ),
+            ]
         parts = backend_event_to_chunk(event)
         if parts is None:
             return []
         delta, finish_reason = parts
+        if finish_reason is not None and tool_call_seen:
+            # A fully valid envelope ended this turn: the public finish
+            # reason is tool_calls regardless of the backend's own reason.
+            finish_reason = "tool_calls"
         if not role_sent:
             delta = {"role": "assistant", **delta}
             role_sent = True

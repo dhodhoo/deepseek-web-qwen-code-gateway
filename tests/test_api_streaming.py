@@ -231,9 +231,10 @@ class TestStreamingErrors:
 
 
 class TestStreamingValidationAndAuth:
-    def test_stream_with_tools_is_accepted_and_ignored_until_m6(self) -> None:
-        # M5 (ADR-021): Qwen Code agent turns always carry tools[]; the
-        # gateway streams a plain-text answer instead of rejecting.
+    def test_stream_with_tools_and_a_plain_answer_has_no_tool_calls(self) -> None:
+        # M6 (ADR-023): Qwen Code agent turns always carry tools[]; when
+        # the model answer holds no control envelope the stream stays
+        # plain text — no tool_calls deltas are fabricated.
         backend = FakeBackend(turns=[SSE_TURN])
         client = _client(_settings(), backend)
         payload = _chat_body(
@@ -257,8 +258,9 @@ class TestStreamingValidationAndAuth:
         )
         assert full_text == "Hello!"
         assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
-        # tools are ignored, never echoed; no usage chunk is emitted and the
-        # Qwen Code client tolerates its absence (UPSTREAM_NOTES, M5).
+        # No envelope in the answer → no tool_calls deltas; no usage chunk
+        # is emitted and the Qwen Code client tolerates its absence
+        # (UPSTREAM_NOTES, M5).
         assert all("tool_calls" not in chunk["choices"][0]["delta"] for chunk in chunks)
         assert all("usage" not in chunk for chunk in chunks)
 

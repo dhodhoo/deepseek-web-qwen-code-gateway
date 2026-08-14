@@ -137,21 +137,25 @@ class TestCaptureIntegration:
         assert "test-key" not in raw
 
     def test_rejected_requests_are_captured_too(self, tmp_path: Path) -> None:
-        # Capture happens BEFORE validation: rejected shapes (here: tool
-        # history, 400 until M6) are exactly what the wire fixtures need.
+        # Capture happens BEFORE validation: rejected shapes (here: a
+        # null-content assistant message WITHOUT tool_calls, still 400
+        # after M6) are exactly what the wire fixtures need.
         client = _client(_settings(diagnostics_dir=tmp_path), FakeBackend())
         payload = {
             "model": MODEL,
             "messages": [
                 {"role": "user", "content": "hi"},
-                {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+                {"role": "assistant", "content": None},
             ],
         }
         response = client.post("/v1/chat/completions", json=payload, headers=AUTH)
         assert response.status_code == 400
         records = _read_records(tmp_path / REQUESTS_FILE_NAME)
         assert len(records) == 1
-        assert records[0]["body"]["messages"][1]["role"] == "tool"
+        assert records[0]["body"]["messages"][1]["role"] == "assistant"
+        # The capture dump uses exclude_none (raw wire fidelity), so the
+        # null content is absent rather than JSON null.
+        assert "content" not in records[0]["body"]["messages"][1]
 
     def test_requests_append(self, tmp_path: Path) -> None:
         backend = FakeBackend(

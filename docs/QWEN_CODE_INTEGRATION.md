@@ -8,14 +8,17 @@ protocol it uses the official OpenAI Node.js SDK (pinned exactly at
 standards-correct OpenAI Chat Completions API rather than a Qwen-specific
 HTTP protocol.
 
-**Status (M5):** plain chat works end-to-end — offline (SDK-driven wire
-tests, fixture tests) AND live: a real Qwen Code v0.21.11 install answered
-through the gateway on 2026-08-14, and the captured traffic confirmed the
-source-verified wire facts. Structured tool calls arrive in M6 — until then
-the gateway accepts the `tools[]` Qwen Code always sends but answers plain
-text (ADR-021). The verified wire facts live in
-`docs/UPSTREAM_NOTES.md`; the fixtured request shapes live in
-`tests/fixtures/qwen_code_wire/`.
+**Status (M6):** plain chat works end-to-end (live-accepted 2026-08-14, a
+real Qwen Code v0.21.11 install answered through the gateway), and
+**prompt-emulated tool calling is now implemented** (ADR-023): the gateway
+teaches DeepSeek a control-envelope protocol, parses the answer, and emits
+real OpenAI structured `tool_calls`. The gateway side is live-verified —
+the M6 live smoke produced a valid tool call on the first try and answered
+the tool-history round trip correctly. The final M6 acceptance step is
+user-run: let real Qwen Code execute one structured tool call (checklist
+below). The verified wire facts live in `docs/UPSTREAM_NOTES.md`; the
+fixtured request shapes live in `tests/fixtures/qwen_code_wire/`; the tool
+protocol lives in `docs/TOOL_CALLING_PROTOCOL.md`.
 
 ## Recommended `~/.qwen/settings.json`
 
@@ -112,18 +115,19 @@ http://127.0.0.1:8000/v1/chat/completions
 
 The OpenAI SDK appends the resource path.
 
-## What to expect today (M5)
+## What to expect today (M6)
 
-| Behavior                                                                                                              | Status                                                                                                                    |
-| --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| Plain chat, streaming (agent turns)                                                                                   | Works — `stream:true` + `stream_options.include_usage` accepted; no usage chunk is emitted (the client tolerates absence) |
-| Plain chat, non-streaming (side queries)                                                                              | Works                                                                                                                     |
-| Multi-turn continuity                                                                                                 | Works — resolved from the request's own history (ADR-020); restart-safe                                                   |
-| `tools[]` / `tool_choice`                                                                                             | **Accepted and ignored** — answers are plain text; structured `tool_calls` arrive in M6 (ADR-021)                         |
-| Assistant `tool_calls` / `role=tool` history                                                                          | `400 UNSUPPORTED_MESSAGE` until M6 — unreachable in a plain-chat session because the gateway never emits tool calls yet   |
-| Non-standard extras (`reasoning_effort`, `enable_thinking`, `chat_template_kwargs`, `metadata`, `cache_control`, ...) | Accepted and ignored (lenient parsing)                                                                                    |
-| `max_tokens` (always sent, possibly huge)                                                                             | Accepted; DeepSeek applies its own upstream limits                                                                        |
-| Embeddings (`/v1/embeddings`, client hardcodes `text-embedding-ada-002`)                                              | Not implemented — out of core milestones; the endpoint 404s                                                               |
+| Behavior                                                                                                              | Status                                                                                                                                                                                        |
+| --------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Plain chat, streaming (agent turns)                                                                                   | Works — `stream:true` + `stream_options.include_usage` accepted; no usage chunk is emitted (the client tolerates absence)                                                                     |
+| Plain chat, non-streaming (side queries)                                                                              | Works                                                                                                                                                                                         |
+| Multi-turn continuity                                                                                                 | Works — resolved from the request's own history (ADR-020); restart-safe                                                                                                                       |
+| `tools[]` / `tool_choice`                                                                                             | **Prompt-emulated tool calling (M6, ADR-023)** — a valid model envelope becomes structured `tool_calls`; malformed envelopes flush as honest plain text; `tool_choice: "none"` disables tools |
+| Assistant `tool_calls` / `role=tool` history                                                                          | **Accepted and compiled (M6)** — `[assistant tool call]` / `[tool result]` prompt blocks; malformed entries 400 with locations                                                                |
+| Tool call frequency                                                                                                   | One tool call per model turn (M6); repeated cycles, bounded repair and persistent ids arrive in M7                                                                                            |
+| Non-standard extras (`reasoning_effort`, `enable_thinking`, `chat_template_kwargs`, `metadata`, `cache_control`, ...) | Accepted and ignored (lenient parsing)                                                                                                                                                        |
+| `max_tokens` (always sent, possibly huge)                                                                             | Accepted; DeepSeek applies its own upstream limits                                                                                                                                            |
+| Embeddings (`/v1/embeddings`, client hardcodes `text-embedding-ada-002`)                                              | Not implemented — out of core milestones; the endpoint 404s                                                                                                                                   |
 
 ## Wire verification status (M5 — traffic-verified)
 
@@ -159,8 +163,11 @@ assistant(tool_calls=[call_A])
 → next assistant/model turn
 ```
 
-Never emit orphan tool calls or lose their IDs. (M6 work; the canonical
-representation already exists in `app/conversation.py`.)
+Never emit orphan tool calls or lose their IDs. Implemented in M6
+(ADR-023): the gateway mints `call_dsqg_<hex>` ids, stores the emitted
+call in canonical history, and compiles re-sent tool history back to
+deterministic prompt blocks. Cross-request persistent id mapping (M7)
+will extend this; today ids round-trip through the client's own history.
 
 ## Plain-text pseudo tool calls
 
@@ -168,22 +175,27 @@ Qwen Code executes structured `tool_calls`; XML/JSON-looking prose in
 assistant `content` is not enough.
 
 Therefore, when DeepSeek produces an internal emulated tool envelope, the
-gateway must parse it and return a real OpenAI `tool_calls` object (M6,
-ADR-006).
+gateway must parse it and return a real OpenAI `tool_calls` object.
+Implemented in M6 (ADR-006 protocol, ADR-023 implementation): the
+`<<<DSQG_TOOL_CALL>>>` envelope is validated (known name + schema-compatible
+arguments) and emitted as a structured tool call; anything invalid is
+flushed as honest plain text instead — see docs/TOOL_CALLING_PROTOCOL.md.
 
 ## Streaming compatibility
 
 Test explicitly:
 
 - normal `finish_reason: "stop"`;
-- tool `finish_reason: "tool_calls"` (M6);
+- tool `finish_reason: "tool_calls"` — implemented M6;
 - no missing terminal finish on success;
 - no duplicated conflicting terminal chunks;
 - `[DONE]` termination.
 
 M3/M5 cover the text path (`tests/test_api_streaming.py`,
 `tests/test_m5_sdk_compat.py` parse every emitted chunk through a real
-OpenAI SDK).
+OpenAI SDK); M6 covers the tool path (`tests/test_m6_api.py`,
+`tests/test_m6_sdk_compat.py` — opener + arguments chunks, finish
+override, honest flush of malformed envelopes).
 
 ## Qwen project instructions
 
@@ -229,3 +241,36 @@ Code session, `/model` → DeepSeek Web Gateway, plain questions. Result:
 normal streamed answers; 9 sanitized captures recorded and diffed against
 the fixtures (see "Wire verification status" above). Rollback is `/model`
 back to the previous provider.
+
+## Live verification (M6 — gateway-side smoke PASSED 2026-08-14)
+
+The M6 live smoke ran the real DeepSeek backend through the full gateway
+pipeline: a streaming agent-shaped request with two declared tools
+finished `tool_calls` on the FIRST TRY (gateway-minted id, correct name,
+compact arguments, zero content chars), and the non-stream request that
+re-sent that exact tool history answered correctly with `finish_reason:
+stop`. The model follows the control-envelope protocol; the canonical
+round trip works live.
+
+## M6 acceptance (user-run checklist)
+
+The final M6 exit step — real Qwen Code receives and executes one
+structured tool call:
+
+1. `.env` configured as above; start `python -m app.main`; check `/health`.
+2. In Qwen Code: `/model` → DeepSeek Web Gateway (same setup as the M5
+   acceptance).
+3. Ask for ONE small thing that needs a single tool, e.g. "list the files
+   in the current directory" or "read QWEN.md and summarize it in one
+   sentence". Keep it single-step: repeated tool cycles are M7.
+4. Pass criteria: Qwen Code shows/executes one tool call and produces a
+   final answer incorporating the result; the gateway logs/captures show
+   the assistant `tool_calls` turn followed by the `role=tool` result
+   being compiled (enable `GATEWAY_DIAGNOSTICS_DIR` to inspect the
+   sanitized request trail).
+5. If the answer comes back as plain text containing a raw
+   `<<<DSQG_TOOL_CALL>>>` envelope, the model produced a malformed
+   envelope and the gateway flushed it honestly (ADR-023); retry once —
+   bounded repair is M7 scope.
+
+Rollback is unchanged: `/model` back to the previous provider.
