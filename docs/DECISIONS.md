@@ -587,6 +587,24 @@ Supporting change: `EnvelopeParser` gains the read-only `invalid_envelope_seen` 
 
 **Alternatives considered:** a JS-framework SPA with a build step (rejected — asset pipeline and node dependency for a local-first tool; M13's Docker image should stay plain); requiring the gateway API key on `/admin/*` (rejected for M12 — would re-pin the established unauthenticated admin contract of M9/M10 and the UI would need key plumbing; recorded as a future additive setting instead); runtime account add/remove with credentials POSTed to the admin API (rejected — moves a secret across the admin boundary and needs runtime backend construction/credential persistence; the lifecycle the milestone names is enable/disable/reset of CONFIGURED accounts); settings mutation at runtime (rejected — frozen env-derived settings; half-applied partial config is worse than a restart); a separate admin server process (rejected — state is in-process/in-memory: router, store, metrics all live in the gateway process, so an out-of-process UI could only ever show a stale mirror); embedding conversation CONTENT in the sessions view (rejected — raw prompts/tool output are deliberately kept off every admin surface; metadata satisfies the milestone's "Sessions" section).
 
+## ADR-040 — Docker deployment is a single non-root runtime image
+
+**Status:** Accepted
+
+**Context:** M13 needs a reproducible operator path without adding a second service, a frontend build pipeline, or secret material to the image. The gateway is an in-memory local-first process; diagnostics are the only current filesystem output, while conversation/account/metrics state is intentionally rebuilt on restart. The container must be reachable by Qwen Code on the host, while the application itself must bind `0.0.0.0` inside the container.
+
+**Decision:**
+
+1. Build one runtime image from `python:3.12-slim`; install the package and runtime dependencies from `pyproject.toml`, copy only the application, vendored upstream client, and packaging metadata, and run `python -m app.main` as a dedicated non-root user.
+2. Keep configuration and credentials outside the image: Compose reads a user-created `.env`, passes it as runtime environment, and `.env` remains ignored. `.env.example` documents container-safe defaults (`GATEWAY_HOST=0.0.0.0`, diagnostics under `/var/lib/deepseek-qwen-gateway/diagnostics`).
+3. Publish host port `8000` to container port `8000` by default. Add a Compose healthcheck against `http://127.0.0.1:8000/health`; `/health` remains unauthenticated and secret-free.
+4. Provide one named volume mounted at `/var/lib/deepseek-qwen-gateway` for opt-in diagnostics and future operator state. No raw conversation or credential persistence is introduced by M13.
+5. Keep Docker/operator instructions in `docs/OPERATIONS.md`: build/start, health, Qwen Code provider setup, logs, configuration changes/restart, diagnostics, backup/volume notes, and troubleshooting. `docker compose up -d` is the exit-path after credentials/configuration are supplied.
+
+**Consequences:** The deployment is reproducible and Docker Desktop-compatible with no host Python dependency. The image is usable without credentials for `GATEWAY_BACKEND=fake` smoke checks, while real DeepSeek credentials are injected only at startup. Runtime in-memory state is lost on container replacement/restart by design; the named volume currently protects only diagnostics and is not a conversation database. Binding `0.0.0.0` inside the container is required for port publishing, but host exposure remains operator-controlled through Compose port binding/firewall.
+
+**Alternatives considered:** host-network mode (rejected — less portable and weakens explicit port boundaries); a separate reverse proxy/admin container (rejected — unnecessary for the local-first gateway and adds operational surface); baking `.env` into the image (rejected — credential leak); root runtime (rejected — avoidable privilege); Python base image with an editable checkout (rejected — larger, less reproducible runtime); persistent SQLite conversation storage (deferred — outside M13 and conflicts with current in-memory state contract).
+
 # Template
 
 ## ADR-XXX — Title
