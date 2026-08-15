@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "deepseek-qwen-gateway"
 version = "0.0.1"
-description = "Local-first OpenAI-compatible gateway that lets Qwen Code use DeepSeek Web (via the deepseek4free approach) as a model provider. M0: upstream compatibility spike."
-readme = "README_START_HERE.md"
+description = "Experimental local-first OpenAI-compatible gateway that lets Qwen Code use DeepSeek Web through a private-web backend adapter."
+readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 # Runtime dependencies for the M0 spike.

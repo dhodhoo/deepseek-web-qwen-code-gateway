@@ -266,13 +266,31 @@ const esc = (value) => String(value === null || value === undefined ? "" : value
     {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]
   ));
 
+function adminHeaders() {
+  const key = sessionStorage.getItem("dsqg-admin-key");
+  return key ? {"Authorization": "Bearer " + key} : {};
+}
+async function adminFetch(url, options) {
+  options = options || {};
+  options.headers = Object.assign({}, adminHeaders(), options.headers || {});
+  let response = await fetch(url, options);
+  if (response.status === 401 && !sessionStorage.getItem("dsqg-admin-key")) {
+    const key = window.prompt("Gateway API key required for remote admin access:");
+    if (key) {
+      sessionStorage.setItem("dsqg-admin-key", key);
+      options.headers = Object.assign({}, adminHeaders(), options.headers || {});
+      response = await fetch(url, options);
+    }
+  }
+  return response;
+}
 async function jget(url) {
-  const response = await fetch(url);
+  const response = await adminFetch(url);
   if (!response.ok) throw new Error(url + " -> HTTP " + response.status);
   return response.json();
 }
 async function jpost(url) {
-  const response = await fetch(url, {method: "POST"});
+  const response = await adminFetch(url, {method: "POST"});
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error((body.error && body.error.message) ||

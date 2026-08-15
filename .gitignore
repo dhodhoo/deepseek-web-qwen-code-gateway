@@ -12,6 +12,8 @@ venv/
 .pytest_cache/
 .coverage
 htmlcov/
+*.log
+
 
 # Secrets & local credential material (NEVER commit)
 .env
@@ -20,10 +22,22 @@ htmlcov/
 *.token
 *.token.txt
 ds_token.txt
-*.cookies.json
-cookies.json
-dsk/cookies.json
-vendor/deepseek4free/dsk/cookies.json
+*cookie*
+*Cookie*
+*localstorage*
+localstorage.txt
+
+# Internal audit/session artifacts (keep out of public portfolio pushes)
+AUDIT_REPORT.md
+SESSION_HANDOFF.md
+.qwen/
+.vscode/
+
+# Internal agent/project foundation (not part of the public portfolio surface)
+00_MASTER_PROMPT.md
+AGENTS.md
+QWEN.md
+README_START_HERE.md
 
 # Live probe captures are sanitized before commit; keep raw captures out.
 tests/fixtures/deepseek_web/raw_unsanitized/

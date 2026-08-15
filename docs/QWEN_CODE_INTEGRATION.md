@@ -8,7 +8,7 @@ protocol it uses the official OpenAI Node.js SDK (pinned exactly at
 standards-correct OpenAI Chat Completions API rather than a Qwen-specific
 HTTP protocol.
 
-**Status (M8 ACCEPTANCE PASSED — user-run, 2026-08-15, fourth attempt):** plain chat works end-to-end (live-accepted 2026-08-14, a
+**Status (M8 manual acceptance reported PASS; diagnostics capture pending):** plain chat works end-to-end (live-accepted 2026-08-14, a
 real Qwen Code v0.21.11 install answered through the gateway),
 **prompt-emulated tool calling is implemented AND live-accepted** (ADR-023):
 the gateway teaches DeepSeek a control-envelope protocol, parses the
@@ -32,25 +32,21 @@ results (capture records 66–71). **M8 (real coding acceptance, ADR-030)
 was attempted three times; every attempt died on the model answering in
 prose instead of emitting the control envelope. The post-M8 hotfix round 1
 (ADR-031 → ADR-032 superseded → ADR-033) fixed marker-bearing simulation;
-round 2 (ADR-034 + ADR-035) is applied and live-re-verified after the
-third attempt falsified the remaining guard:** historical assistant tool
-calls now compile BYTE-IDENTICAL to the instructed envelope (imitation
-becomes a valid tool request, ADR-034), and EVERY tool-enabled turn that
-ends without a valid envelope gets ONE bounded repair retry — the mid-loop
-termination guard was removed after live falsification (ADR-035). Replays
-of BOTH killer records from the third attempt now return real `tool_calls`
-responses. **M8 acceptance PASSED on the fourth attempt (user-run,
-2026-08-15):** the full autonomous loop ran through the gateway —
-`read_file` ×2 → `edit` → `run_shell_command` ×2 → final explanation
-(capture records 93–106, `call_dsqg_` ids round-tripping verbatim,
-gateway executed nothing), fixture suite `Ran 9 tests ... OK`, and a
-correct explanation of the one-line `//` → `/` fix. A
-deterministic buggy fixture is
-committed at `acceptance/m8-buggy-repo/` (stdlib-only, one failing test,
-both states offline-verified), the coding-loop wire shapes are
-regression-pinned in `tests/test_m8_coding_shapes.py` (suite 424 passed
-after hotfix round 2) — the
-checklist is below. Four
+round 2 (ADR-034 + ADR-035) was applied and live-re-verified on an earlier
+revision. **Manual M8 result reported PASS — diagnostics capture pending:\*\* an
+earlier gateway revision completed the autonomous loop — `read_file` ×2 →
+`edit` → `run_shell_command` ×2 → final explanation — and the fixture tests
+passed. The old replay script is not present in the current repository and
+was not found in Git history, so that result is retained only as historical,
+non-reproducible evidence rather than as a current failure. Do not claim
+repository-grade M8 reproducibility until a fresh run records sanitized
+structured `tool_calls` and matching `role=tool` diagnostics on the exact
+current commit.
+
+A deterministic buggy fixture is committed at
+`acceptance/m8-buggy-repo/` (stdlib-only, one failing test, both states
+offline-verified), and the coding-loop wire shapes are regression-pinned
+in `tests/test_m8_coding_shapes.py` — the checklist is below. Four
 post-M6 live bugs were fixed and live-re-verified (ADR-024/025/026/027).
 The verified wire facts live in `docs/UPSTREAM_NOTES.md`; the fixtured
 request shapes live in `tests/fixtures/qwen_code_wire/`; the tool protocol

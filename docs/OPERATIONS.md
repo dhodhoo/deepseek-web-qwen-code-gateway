@@ -41,7 +41,15 @@ Verify the service:
 curl http://127.0.0.1:8000/health
 ```
 
-Open the local admin UI at `http://127.0.0.1:8000/admin`.
+Open the local admin UI at `http://127.0.0.1:8000/admin`. Admin routes are
+unauthenticated only when the application bind host is loopback. Docker sets
+its internal bind to `0.0.0.0`, so the Compose admin surface requires the
+configured `DEEPSEEK_GATEWAY_API_KEY` bearer key. Send it as
+`Authorization: Bearer <key>` when calling the admin API or place the same key
+in the browser client used for remote administration.
+
+Do not publish the admin surface to the LAN or internet without the gateway
+key and an appropriate TLS/reverse-proxy boundary.
 
 ## Fake-backend smoke test
 

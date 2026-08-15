@@ -140,6 +140,38 @@ def _account_row(client: TestClient, account_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+class TestAdminAuth:
+    def test_non_loopback_admin_requires_gateway_key(self) -> None:
+        client, _, _ = _multi_client(
+            [FakeBackend()], settings=_settings(host="0.0.0.0")
+        )
+        for method, path in (
+            ("get", "/admin"),
+            ("get", "/admin/summary"),
+            ("get", "/admin/accounts"),
+            ("get", "/admin/sessions"),
+            ("get", "/admin/settings"),
+            ("get", "/admin/metrics"),
+            ("post", "/admin/accounts/acct-1/disable"),
+        ):
+            response = getattr(client, method)(path)
+            assert response.status_code == 401, (method, path)
+            assert response.json()["error"]["code"] == "invalid_api_key"
+
+    def test_non_loopback_admin_accepts_gateway_key(self) -> None:
+        client, _, _ = _multi_client(
+            [FakeBackend()], settings=_settings(host="0.0.0.0")
+        )
+        headers = {**AUTH}
+        assert client.get("/admin", headers=headers).status_code == 200
+        assert (
+            client.post(
+                "/admin/accounts/acct-1/disable", headers=headers
+            ).status_code
+            == 200
+        )
+
+
 class TestAdminPage:
     def test_admin_page_is_self_contained_html(self) -> None:
         client, _, _ = _multi_client([FakeBackend()])

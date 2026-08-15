@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /opt/deepseek-qwen-gateway
 
-COPY pyproject.toml README_START_HERE.md ./
+COPY pyproject.toml README.md ./
 COPY app ./app
 COPY vendor ./vendor
 

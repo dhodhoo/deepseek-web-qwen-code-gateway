@@ -1405,6 +1405,23 @@ def create_app(
 
     # -------------------------------------------------------------- routes
 
+    def require_admin_auth(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> None:
+        """Protect admin routes whenever the process is not loopback-only.
+
+        Native local development keeps the M12 no-key behavior on loopback.
+        Container/LAN/public bindings must use the gateway bearer key so the
+        operator control plane cannot be mutated by any reachable client.
+        """
+        cfg: GatewaySettings = request.app.state.settings
+        host = cfg.host.strip().lower()
+        loopback_hosts = {"127.0.0.1", "localhost", "::1"}
+        if host in loopback_hosts:
+            return
+        require_gateway_auth(request, authorization)
+
     def _fleet_health_payload(router_: AccountRouter) -> dict:
         """The ``/health`` payload — fleet-aware since M10 (ADR-037).
 
@@ -1435,7 +1452,7 @@ def create_app(
         """Process/service health (never exposes secrets)."""
         return _fleet_health_payload(request.app.state.router)
 
-    @app.get("/admin/metrics")
+    @app.get("/admin/metrics", dependencies=[Depends(require_admin_auth)])
     def admin_metrics(request: Request) -> dict:
         """Operational counters (M9, ADR-036).
 
@@ -1445,7 +1462,7 @@ def create_app(
         """
         return request.app.state.metrics.snapshot()
 
-    @app.get("/admin/accounts")
+    @app.get("/admin/accounts", dependencies=[Depends(require_admin_auth)])
     def admin_accounts(request: Request) -> dict:
         """Masked account registry view (M10, ADR-037).
 
@@ -1463,7 +1480,11 @@ def create_app(
 
     # ---------------------------------------------- M12 (ADR-039) admin UI
 
-    @app.get("/admin", include_in_schema=False)
+    @app.get(
+        "/admin",
+        include_in_schema=False,
+        dependencies=[Depends(require_admin_auth)],
+    )
     def admin_ui() -> HTMLResponse:
         """Self-contained operator dashboard (M12, ADR-039).
 
@@ -1476,7 +1497,7 @@ def create_app(
         """
         return HTMLResponse(ADMIN_PAGE_HTML)
 
-    @app.get("/admin/summary")
+    @app.get("/admin/summary", dependencies=[Depends(require_admin_auth)])
     def admin_summary(request: Request) -> dict:
         """Dashboard aggregate (M12, ADR-039).
 
@@ -1492,7 +1513,7 @@ def create_app(
             router_, store_, metrics_, _fleet_health_payload(router_)
         )
 
-    @app.get("/admin/sessions")
+    @app.get("/admin/sessions", dependencies=[Depends(require_admin_auth)])
     def admin_sessions(request: Request) -> dict:
         """Sanitized session list (M12, ADR-039).
 
@@ -1504,7 +1525,7 @@ def create_app(
         store_: ConversationStore = request.app.state.store
         return {"sessions": build_sessions_view(store_)}
 
-    @app.get("/admin/settings")
+    @app.get("/admin/settings", dependencies=[Depends(require_admin_auth)])
     def admin_settings(request: Request) -> dict:
         """Read-only masked settings view (M12, ADR-039).
 
@@ -1550,18 +1571,27 @@ def create_app(
         )
         return {"account": row}
 
-    @app.post("/admin/accounts/{account_id}/disable")
+    @app.post(
+        "/admin/accounts/{account_id}/disable",
+        dependencies=[Depends(require_admin_auth)],
+    )
     def admin_account_disable(account_id: str, request: Request) -> dict:
         """Operator disable (M12): blocks routing + releases session links."""
         return _account_lifecycle(account_id, "disable", request)
 
-    @app.post("/admin/accounts/{account_id}/enable")
+    @app.post(
+        "/admin/accounts/{account_id}/enable",
+        dependencies=[Depends(require_admin_auth)],
+    )
     def admin_account_enable(account_id: str, request: Request) -> dict:
         """Operator enable (M12): flips the flag only — an ``invalid``
         account stays invalid until ``reset``."""
         return _account_lifecycle(account_id, "enable", request)
 
-    @app.post("/admin/accounts/{account_id}/reset")
+    @app.post(
+        "/admin/accounts/{account_id}/reset",
+        dependencies=[Depends(require_admin_auth)],
+    )
     def admin_account_reset(account_id: str, request: Request) -> dict:
         """Operator restoration (M12): enabled + healthy + cleared
         cooldown/counters — after credential rotation."""
