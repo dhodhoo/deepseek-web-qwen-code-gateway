@@ -4,11 +4,11 @@ The coding agent must update this file after every milestone.
 
 ## Current status
 
-**Current milestone:** M7 — Multi-turn tool loop — COMPLETE, **ACCEPTANCE PASSED (user-run, 2026-08-15, re-run after the ADR-029 hotfix)**
+**Current milestone:** M8 — Real coding acceptance
 
-**State:** COMPLETE — **ACCEPTANCE PASSED (user-run, 2026-08-15, re-run after the ADR-029 hotfix)**. Offline suite 384 → 410 → 413 passed (tests/test\*m7*loop.py: bounded repair policy, buffered streaming tool turns, the 3-cycle loop through the real app, persistent id index, lenient history validation — ADR-028; plus the ADR-029 pre-loop repair + anti-simulation tests). The first acceptance attempt stalled on turn 1 (prose-simulated tool loop, diagnostics record 61); ADR-029 fixed it (anti-simulation instructions + pre-loop plain-text repair) and the re-run passed FIRST TRY: three sequential tool interactions (`list_directory(docs)` → `read_file(docs/ROADMAP.md)` → `read_file(docs/TOOL_CALLING_PROTOCOL.md)`) plus a final answer quoting the M7 exit criterion and both sentinels from the files actually read — capture records 66–71, three `call_dsqg*` ids round-tripping verbatim, gateway executed none of the tools. The M7 EXIT per ROADMAP is met. Next milestone is M8 (deterministic bug-fix repository benchmark) — NOT started; awaits the user's explicit go-ahead per the milestone gate.
+**State:** IMPLEMENTED (offline side) — **awaiting user-run acceptance**. ADR-030 written design-first (docs/DECISIONS.md); deterministic buggy fixture committed at `acceptance/m8-buggy-repo/` (stdlib-only unittest suite, exactly one failing test — both states offline-verified: buggy = `Ran 9 tests ... FAILED (failures=1)` with a single `AssertionError: 1 != 1.5`, fixed = `Ran 9 tests ... OK`; restored to buggy for the run); offline coding-shape regression added (tests/test_m8_coding_shapes.py: five-cycle coding loop in the agent wire shape with edit/shell tool shapes + large string arguments, tool-result injection boundary in both response modes). Offline suite 413 → 416 passed, 3 deselected. Readiness check found ZERO required gateway code changes (M6/M7 machinery is tool-agnostic; `[tool result]` rendering is verbatim/uncapped, the injection boundary is structural). ROADMAP M8 exit: Qwen Code autonomously inspects/searches, reads, edits/patches, runs tests, iterates if needed, returns a final explanation; the gateway remains only the provider adapter — that final step is user-run like every milestone's acceptance (checklist in docs/QWEN_CODE_INTEGRATION.md). M9 not started — awaits explicit instruction.
 
-**Previous milestone:** M6 — One emulated tool call — COMPLETE, **ACCEPTANCE PASSED (user-run, 2026-08-15)**. Real Qwen Code v0.21.11 executed structured tool calls through the gateway: a multi-turn loop of `list_directory` / `read_file` calls (7 calls across successive turns, incl. adapting after a permission denial), tool results compiled back, final answers incorporating the results; Qwen Code's background memory agent ran its own tool loop through the same gateway concurrently without issue. The four live bugs from the first attempt are fixed and live-verified (post-M6 hotfix addendum below; ADR-024/025/026/027).
+**Previous milestone:** M7 — Multi-turn tool loop — COMPLETE, **ACCEPTANCE PASSED (user-run, 2026-08-15, re-run after the ADR-029 hotfix)**. Three sequential tool interactions (`list_directory` → two `read_file`) plus a final answer built from the results; gateway executed none of the tools (capture records 66–71). The first attempt's prose-simulated stall (record 61) was fixed by the ADR-029 hotfix and live-re-verified before the re-run.
 
 ## Completed
 
@@ -21,6 +21,7 @@ The coding agent must update this file after every milestone.
 - M5 (2026-08-14): real Qwen Code wire compatibility — tools[]/tool_choice accepted and ignored (plain chat usable), opt-in sanitized diagnostic capture layer, source-verified wire fixtures + fixture tests, SDK-driven wire-compat tests, Qwen Code integration/wiring doc.
 - M6 (2026-08-14): one emulated tool call — lenient tools normalization, deterministic [available tools] prompt compiler, strict control-envelope parser (honest plain text on any malformed envelope), tool-shaped history compilation (assistant tool_calls + role=tool), structured OpenAI tool_calls output in both response modes, gateway-minted call_dsqg ids, canonical compact-arguments round trip.
 - M7 (2026-08-15): multi-turn tool loop hardening — buffered tool turns (tool-enabled turns drained fully before any response byte in BOTH response modes; failures pre-response → HTTP status; re-emitted through the unchanged sse_stream so M6 chunk shapes are preserved), bounded repair (≤1 retry per turn with a static hint listing valid tool names — never echoed model output; re-branches on the ORIGINAL parent_message_id), backend-link invalidation after multi-attempt turns (next request rebuilds from canonical — ADR-020 self-heal), persistent tool-call ID index derived per request from canonical history, lenient tool-history validation (log-only, never rejects). ADR-028. **ACCEPTANCE PASSED (user-run, 2026-08-15, re-run after the ADR-029 hotfix):** three sequential tool interactions (`list_directory` → `read_file` ROADMAP.md → `read_file` TOOL_CALLING_PROTOCOL.md) plus a final answer built from the results, gateway executed none of the tools (capture records 66–71).
+- M8 (2026-08-15, offline side): real coding acceptance preparation — ADR-030 (design-first), deterministic buggy fixture `acceptance/m8-buggy-repo/` (stdlib-only `textstats` + unittest suite, exactly one failing test / one-line fix, both states offline-verified, fixture docs never leak the bug, committed in the buggy state), offline coding-loop regression `tests/test_m8_coding_shapes.py` (five-cycle loop in the agent wire shape without tool_choice — run_shell_command → grep_search → read_file → edit with large string arguments → run_shell_command → final answer; tool-result injection boundary in both response modes). Readiness check: ZERO gateway code changes required (M6/M7 machinery is tool-agnostic). Suite 413 → 416 passed. Live acceptance is user-run.
 
 ## Tests run
 
@@ -182,6 +183,21 @@ as-is, lenient), and fired one tools=0 non-stream side request after
 the final answer. First-try pass: no repair stall was visible in the
 UI (capture is request-only, so the per-turn call count is not
 recorded). M7 EXIT per ROADMAP: met.
+
+M8 OFFLINE (2026-08-15, same day): fixture both-states verification via
+stdlib unittest — buggy state: Ran 9 tests, FAILED (failures=1) with
+exactly one AssertionError (1 != 1.5, test_fractional_average); fixed
+state (floor division // -> true division /): Ran 9 tests, OK; fixture
+restored to the buggy state for the live run. New offline regression
+tests/test_m8_coding_shapes.py: five-cycle coding loop in the verified
+agent wire shape (tools present, tool_choice ABSENT — run_shell_command
+-> grep_search -> read_file -> edit with large string arguments ->
+run_shell_command -> final explanation; ids persist verbatim through the
+per-request index; six inferences, one session, no repair), plus the
+tool-result injection boundary in BOTH response modes (a role=tool result
+carrying a full control envelope compiles as data and never fabricates a
+tool call; mid-loop plain text stays repair-free). Full offline suite:
+416 passed, 3 deselected (was 413).
 ```
 
 ## Known limitations
@@ -202,7 +218,26 @@ recorded). M7 EXIT per ROADMAP: met.
 
 ## Next action
 
-**M7 is COMPLETE — ACCEPTANCE PASSED (user-run, 2026-08-15, re-run after the ADR-029 hotfix).** The multi-turn tool loop (buffered tool turns, bounded repair, persistent tool-call ids, lenient history validation — ADR-028) plus the ADR-029 hotfix (anti-simulation tool instructions + pre-loop plain-text repair) is offline-green (413 passed) and the user-run acceptance met the ROADMAP exit: three sequential tool interactions plus a final answer built from the results, gateway executed none of the tools (capture records 66–71; three `call_dsqg_` ids round-tripped verbatim through `role=tool.tool_call_id`). The first attempt's prose-simulated stall (record 61) was fixed and live-re-verified before the re-run. Next milestone is M8 (deterministic bug-fix repository benchmark) — per the milestone gate, do NOT start M8 without the user's explicit go-ahead.
+**M8 is IMPLEMENTED on the offline side — acceptance is user-run.** ADR-030 (design-first) defines the deterministic buggy fixture and the procedure: `acceptance/m8-buggy-repo/` is committed in its BUGGY state (stdlib-only `textstats` + unittest suite, 9 tests; buggy = exactly one failure `AssertionError: 1 != 1.5`; fixed (`//` → `/`) = all OK — both states offline-verified, then restored to buggy). Offline regression pins the coding-loop wire shapes (tests/test_m8_coding_shapes.py; suite 413 → 416 passed), and the readiness check found ZERO required gateway code changes — the M6/M7 machinery is tool-agnostic. The user-run step: start the gateway, launch Qwen Code from inside `acceptance/m8-buggy-repo/`, give the EXACT ROADMAP prompt "Find and fix the bug, then run the tests and explain what changed." Repro checklist: docs/QWEN_CODE_INTEGRATION.md ("M8 acceptance"). After it passes, the next milestone is M9 (reliability hardening) — per the milestone gate, do NOT start M9 without the user's explicit go-ahead.
+
+---
+
+## 2026-08-15 — M8: Real coding acceptance (offline side complete)
+
+### Context
+
+M7 acceptance PASSED earlier the same day (capture records 66–71). The user then gave the explicit go-ahead for M8 — ROADMAP's "key milestone": real coding through the gateway on a tiny deterministic buggy fixture repository, prompt "Find and fix the bug, then run the tests and explain what changed." Exit: autonomous inspect/search → read → edit/patch → run tests → iterate if needed → final explanation, with the gateway remaining only the provider adapter.
+
+### Completed
+
+- Readiness check (ZERO code changes needed): the M6/M7 machinery is tool-agnostic — lenient tools normalization + 150-char description compaction (ADR-024) absorb the client's full tool surface; prompt_compiler.py renders tool results verbatim as DATA with no size cap (shell/test output scale is trivial for upstream prompt limits); the injection boundary is structural (only the current inference is envelope-parsed). pytest's `testpaths = ["tests"]` keeps the fixture's own test file out of the gateway suite.
+- ADR-030 written DESIGN-FIRST (docs/DECISIONS.md): fixture committed in-repo at acceptance/m8-buggy-repo/ (versioned, resettable via `git checkout -- acceptance/m8-buggy-repo`); determinism contract (stdlib only, pure functions, fixed inputs, no clock/network/randomness); the bug = floor division in `average_word_length` (unambiguous failure signal, one-line fix, location must be LOCATED — the other three functions and remaining tests are correct); fixture docs never leak the bug; acceptance user-run with the exact ROADMAP prompt; alternatives recorded (fixture outside the repo, Node fixture, syntax-error bug, multi-bug fixture — all rejected).
+- Fixture built and BOTH states offline-verified: buggy = `Ran 9 tests ... FAILED (failures=1)` with exactly one `AssertionError: 1 != 1.5` (test_fractional_average); fixed (`//` → `/`) = `Ran 9 tests ... OK`; fixture restored to the buggy state for the live run. Files: QWEN.md (fixture project instructions), README.md (benchmark description + reset procedure), textstats.py (four helpers, one bug), test_textstats.py (nine tests).
+- tests/test_m8_coding_shapes.py (3 tests): five-cycle coding loop in the verified agent wire shape (tools present, tool_choice ABSENT: run_shell_command → grep_search → read_file → edit → run_shell_command → final explanation; the edit envelope carries large old/new string arguments and round-trips as compact JSON; ids persist verbatim through the per-request index; six inferences, one session, no repair); tool-result injection boundary in BOTH response modes (a role=tool result containing a full control envelope compiles as data under [tool result] and never fabricates a tool call; mid-loop plain text stays repair-free — ADR-029 termination guard).
+
+### Status
+
+Offline side complete: suite 416 passed, 3 deselected (was 413). Live acceptance is user-run — checklist in docs/QWEN_CODE_INTEGRATION.md ("M8 acceptance"). Expected gateway code change: ZERO; any live wrinkle becomes a hotfix ADR (post-M6/M7 pattern) with the capture + replay procedure as diagnostic.
 
 ---
 

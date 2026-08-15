@@ -8,7 +8,7 @@ protocol it uses the official OpenAI Node.js SDK (pinned exactly at
 standards-correct OpenAI Chat Completions API rather than a Qwen-specific
 HTTP protocol.
 
-**Status (M7):** plain chat works end-to-end (live-accepted 2026-08-14, a
+**Status (M8 preparation):** plain chat works end-to-end (live-accepted 2026-08-14, a
 real Qwen Code v0.21.11 install answered through the gateway),
 **prompt-emulated tool calling is implemented AND live-accepted** (ADR-023):
 the gateway teaches DeepSeek a control-envelope protocol, parses the
@@ -28,7 +28,13 @@ repair also fires on pre-loop envelope-less plain text — a replay of the
 exact failing request now returns a real `tool_calls` response. **M7
 acceptance PASSED (user-run, 2026-08-15, re-run after the hotfix):**
 three sequential tool interactions plus a final answer built from the
-results (capture records 66–71). Four
+results (capture records 66–71). **M8 (real coding acceptance, ADR-030)
+is READY — awaiting the user run:** a deterministic buggy fixture is
+committed at `acceptance/m8-buggy-repo/` (stdlib-only, one failing test,
+both states offline-verified), the coding-loop wire shapes are
+regression-pinned in `tests/test_m8_coding_shapes.py` (suite 416 passed),
+and the readiness check found ZERO required gateway code changes — the
+checklist is below. Four
 post-M6 live bugs were fixed and live-re-verified (ADR-024/025/026/027).
 The verified wire facts live in `docs/UPSTREAM_NOTES.md`; the fixtured
 request shapes live in `tests/fixtures/qwen_code_wire/`; the tool protocol
@@ -227,7 +233,76 @@ persistent Markdown project instructions/context.
 Do not rely on it as the only source of project requirements;
 `00_MASTER_PROMPT.md` remains the implementation entry prompt.
 
-## Acceptance setup (M8, future)
+## M8 acceptance (user-run checklist)
+
+**Status: READY — awaiting user run (offline side complete 2026-08-15).**
+The deterministic buggy fixture is committed at `acceptance/m8-buggy-repo/`
+(ADR-030): one library module + one stdlib-only unittest suite, exactly one
+failing test whose location and nature are NOT stated anywhere in the
+fixture docs. Both states offline-verified: buggy = `Ran 9 tests ...
+FAILED (failures=1)` (a single `AssertionError: 1 != 1.5`); fixed = `Ran 9
+tests ... OK`. Offline regression for the coding-loop wire shapes:
+`tests/test_m8_coding_shapes.py` (suite 413 → 416 passed). Expected gateway
+code change for the live run: ZERO — the M6/M7 machinery is tool-agnostic.
+
+Prompt (EXACT, from ROADMAP M8):
+
+```text
+Find and fix the bug, then run the tests and explain what changed.
+```
+
+1. Reset the fixture to its committed (buggy) state — always start here:
+
+   ```bash
+   git checkout -- acceptance/m8-buggy-repo
+   ```
+
+2. `.env` configured as above; start `python -m app.main`; check `/health`.
+   A FRESH Qwen Code session is recommended.
+3. Start Qwen Code from INSIDE the fixture directory so the fixture (not
+   the gateway) is the working tree and the fixture's own `QWEN.md` is the
+   project instruction:
+
+   ```bash
+   cd acceptance/m8-buggy-repo
+   qwen
+   ```
+
+4. In Qwen Code: `/model` → DeepSeek Web Gateway.
+5. Give the exact prompt above.
+
+6. Pass criteria (ROADMAP M8 exit — ALL must hold):
+   - Qwen Code autonomously inspects/searches the fixture (list/grep/read
+     tool calls), EDITS the buggy code, RUNS the tests via a shell tool,
+     and iterates if a run still fails;
+   - it returns a final explanation naming the actual change (floor
+     division `//` → true division `/` in `average_word_length`);
+   - the suite passes at the end (`Ran 9 tests ... OK`);
+   - the gateway executes NONE of the tools — verify in
+     `GATEWAY_DIAGNOSTICS_DIR/requests.jsonl`: the loop requests carry
+     `edit` / `run_shell_command` tool calls with gateway-minted
+     `call_dsqg_` ids round-tripping verbatim through
+     `role=tool.tool_call_id`;
+   - no raw sentinel text (`<<<DSQG_TOOL_CALL>>>`) reaches the UI as
+     assistant prose on a tool turn.
+
+7. Interpretation notes:
+   - the first turn may be slow (buffered tool turn, ADR-028); a pre-loop
+     plain-text first attempt costs the ADR-029 anti-simulation retry —
+     a slow first turn ending in a real tool call is the hotfix working;
+   - a turn whose tool result is the FAILING test output is expected and
+     correct — the agent must see the failure to fix it;
+   - if an answer ever simulates tool execution again (fabricated test
+     output, no tool shown in the UI): that is the ADR-029 failure mode
+     escaping both defenses — note the line count in `requests.jsonl` and
+     report it (capture is request-only; the response side needs replay).
+
+8. After a PASS: reset the fixture for future re-runs (step 1), record the
+   pass here + in `docs/PROGRESS.md`, and commit.
+
+Rollback is unchanged: `/model` back to the previous provider.
+
+## Legacy M8 sketch (superseded by the checklist above)
 
 Create a tiny deterministic buggy repository and run Qwen Code against the
 gateway.
