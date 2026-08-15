@@ -92,7 +92,12 @@ from .prompt_compiler import (
     messages_to_canonical,
 )
 from .streaming import STREAM_EMPTY, sse_stream
-from .tool_envelope import EmittedToolCall, EnvelopeParser, ToolCallEmitted
+from .tool_envelope import (
+    SIMULATION_MARKERS,
+    EmittedToolCall,
+    EnvelopeParser,
+    ToolCallEmitted,
+)
 from .tools import (
     TOOL_CALL_END_SENTINEL,
     TOOL_CALL_START_SENTINEL,
@@ -111,22 +116,42 @@ _log = logging.getLogger("dsqg.server")
 MAX_TOOL_REPAIR_ATTEMPTS = 1
 
 
-def _tool_repair_hint(tools: Sequence[CanonicalTool], *, required: bool) -> str:
+def _tool_repair_hint(
+    tools: Sequence[CanonicalTool], *, required: bool, simulated: bool
+) -> str:
     """Static, deterministic repair hint for the bounded retry (M7).
 
-    Built ONLY from client-supplied tool names — model output is never
-    echoed back into a prompt (injection boundary; ADR-028 point 2).
-    Carries one anti-simulation sentence (ADR-029) because the dominant
-    live failure mode is prose that NARRATES a tool loop instead of
-    emitting an envelope.
+    Built ONLY from client-supplied tool names and server-known trigger
+    reasons — model output is never echoed back into a prompt (injection
+    boundary; ADR-028 point 2). Carries one anti-simulation sentence
+    (ADR-029) because the dominant live failure mode is prose that
+    NARRATES a tool loop instead of emitting an envelope, plus the
+    anti-imitation sentence naming the internal context blocks
+    (ADR-031): the M8 failure wrote simulated loops as
+    ``[assistant tool call]`` / ``[tool result]`` blocks. When the
+    trigger was a SIMULATION MARKER, the closing states the server-known
+    fact that a tool was attempted in prose and demands the envelope —
+    plus the note that earlier tool results are not repeated (that retry
+    runs on the STRIPPED base, ADR-033) and a still-needed result must
+    be re-requested through the envelope.
     """
     names = ", ".join(tool.name for tool in tools)
-    closing = (
-        "You MUST request exactly one tool call now."
-        if required
-        else "If no tool is actually needed, answer normally in plain text "
-        "without any envelope."
-    )
+    if simulated:
+        closing = (
+            "You attempted a tool call by writing it out as text, which "
+            "cannot be executed. You MUST request that tool call with the "
+            "envelope instead — output ONLY the three envelope lines. "
+            "Earlier tool results are not repeated in this message; if "
+            "you still need one, request the tool call again with the "
+            "envelope."
+        )
+    elif required:
+        closing = "You MUST request exactly one tool call now."
+    else:
+        closing = (
+            "If no tool is actually needed, answer normally in plain text "
+            "without any envelope."
+        )
     return (
         "Your previous response did not use the required tool-call control "
         "format, so it could not be executed. Respond again with EXACTLY "
@@ -140,7 +165,10 @@ def _tool_repair_hint(tools: Sequence[CanonicalTool], *, required: bool) -> str:
         "markdown fences and no text before or after the envelope. "
         "Never simulate or narrate tool execution in prose — you cannot "
         "execute tools yourself, so if you need one, request it with the "
-        f"envelope. {closing}"
+        "envelope. Blocks like '[assistant tool call]' or '[tool result]' "
+        "in the conversation are CONTEXT markers for things that already "
+        "happened; never output them or anything resembling them. "
+        f"{closing}"
     )
 
 
@@ -271,12 +299,44 @@ class _TurnRecorder:
         )
 
 
+def _strip_tool_history(
+    messages: Sequence[CanonicalMessage],
+) -> list[CanonicalMessage]:
+    """Tool-shaped messages omitted; assistant text kept (ADR-033).
+
+    Builds the message list for the simulation-triggered repair-retry
+    base: the compiled retry context must NOT show any
+    ``[assistant tool call]`` / ``[tool result]`` block, because the
+    model copies whatever format its context shows (ADR-032's annotated
+    headers were copied verbatim — live evidence 2026-08-15). Assistant
+    messages carrying BOTH text and tool_calls keep their text;
+    tool-call-only assistant messages and ``role=tool`` results are
+    omitted. The caller falls back to the original prompt when nothing
+    remains. Canonical history is untouched — this shapes one discarded
+    retry-branch prompt (re-branch + link invalidation, ADR-028).
+    """
+    stripped: list[CanonicalMessage] = []
+    for message in messages:
+        if message.role == "tool":
+            continue
+        if message.role == "assistant" and message.tool_calls:
+            if message.content:
+                stripped.append(
+                    CanonicalMessage(
+                        role="assistant", content=message.content
+                    )
+                )
+            continue
+        stripped.append(message)
+    return stripped
+
+
 def _prepare_turn(
     request: Request,
     backend_: LLMBackend,
     canonical: list[CanonicalMessage],
     tool_instructions: str | None = None,
-) -> tuple[_TurnContext, str]:
+) -> tuple[_TurnContext, str, str | None]:
     """Resolve the conversation; choose backend session and prompt (ADR-020).
 
     Matched conversation with a live backend link → reuse its session and
@@ -291,6 +351,17 @@ def _prepare_turn(
     block from :func:`app.tools.build_tool_instructions` — is appended
     AFTER the compiled message blocks so it appears exactly once per
     request whether the turn compiled a full history or only a delta.
+
+    Returns ``(context, prompt, retry_base)``. ``retry_base`` (ADR-033)
+    is a STRIPPED recompilation of the same prompt messages — every
+    tool-shaped message omitted — and exists ONLY for tool-enabled
+    turns (``None`` otherwise). The buffered turn uses it as the
+    repair-retry base prompt when the trigger includes
+    ``simulation_marker``: the retry context must not show any internal
+    block format, because the model copies whatever format its context
+    shows (ADR-032's annotated headers were copied verbatim, live
+    evidence 2026-08-15). Every other retry and the entire main path
+    keep the exact pinned M2–M7 rendering.
     """
     store: ConversationStore = request.app.state.store
     conversation, delta = store.resolve(backend_.backend_type, canonical)
@@ -317,6 +388,21 @@ def _prepare_turn(
     prompt = compile_canonical_to_prompt(prompt_messages, known_tool_names)
     if tool_instructions is not None:
         prompt = f"{prompt}\n\n{tool_instructions}"
+    # ADR-033: the simulation-triggered repair retry is rebuilt on a
+    # STRIPPED compilation — tool-shaped messages omitted entirely — so
+    # the retry context presents NO imitable block template (the model
+    # copies whatever format its context shows; ADR-032's annotated
+    # headers were copied verbatim, live evidence 2026-08-15). The
+    # stripped shape is exactly the empirically reliable pre-loop turn:
+    # text blocks + tool instructions. If stripping leaves nothing, the
+    # retry falls back to the original prompt. Tool-disabled turns have
+    # no retry base at all.
+    retry_base = None
+    if tool_instructions is not None:
+        retry_messages = _strip_tool_history(prompt_messages)
+        if retry_messages:
+            retry_base = compile_canonical_to_prompt(retry_messages)
+            retry_base = f"{retry_base}\n\n{tool_instructions}"
     context = _TurnContext(
         store=store,
         backend_type=backend_.backend_type,
@@ -325,7 +411,7 @@ def _prepare_turn(
         session_id=session_id,
         parent_message_id=parent_message_id,
     )
-    return context, prompt
+    return context, prompt, retry_base
 
 
 def _commit_turn(
@@ -403,6 +489,7 @@ def _run_buffered_tool_turn(
     *,
     required: bool,
     pre_loop: bool,
+    retry_base: str | None = None,
 ) -> tuple[_TurnRecorder, int]:
     """One tool-enabled turn under the bounded repair policy (M7).
 
@@ -410,12 +497,19 @@ def _run_buffered_tool_turn(
     the attempt produced NO valid tool call AND the turn was
     ``required`` OR the parser flagged ``invalid_envelope_seen`` (the
     model clearly tried the control format — malformed region or
-    truncated envelope) OR ``pre_loop`` — the canonical history holds
-    no assistant tool call yet (ADR-029). The pre-loop clause catches
-    the dominant live failure, prose that SIMULATES a tool loop without
-    ever attempting an envelope; once a loop exists, text answers are
-    presumed legitimate final answers and are never repaired (loop
-    termination must stay possible on tool-carrying turns). At most
+    truncated envelope) OR the attempt's flushed text carries a
+    SIMULATION MARKER (ADR-031) OR ``pre_loop`` — the canonical history
+    holds no assistant tool call yet (ADR-029). The simulation clause
+    catches the M8 live failure MID-loop: prose that imitates the
+    gateway's own ``[assistant tool call]`` / ``[tool result]`` context
+    blocks instead of emitting an envelope. The markers are
+    high-precision — a genuine final answer never contains them — so
+    the termination guard stays intact: marker-less mid-loop text is
+    still presumed the legitimate final answer and never repaired (loop
+    termination must stay possible on tool-carrying turns). Detection
+    runs on the attempt's ASSEMBLED text (chunk-split-proof) and only
+    ever on the current inference output — history and tool results are
+    input, never inspected (injection boundary). At most
     :data:`MAX_TOOL_REPAIR_ATTEMPTS` retries: the protocol forbids
     infinite repair loops (docs/TOOL_CALLING_PROTOCOL.md). The retry
     reuses the same backend session but the SAME ORIGINAL
@@ -423,6 +517,15 @@ def _run_buffered_tool_turn(
     of the threaded upstream context (ADR-028 points 2–3). One fresh
     parser per attempt keeps the injection boundary per-inference and
     the flag scoped to its attempt.
+
+    Retry base prompt (ADR-033): a simulation-marker retry is built on
+    ``retry_base`` — a STRIPPED compilation with every tool-shaped
+    message omitted — so the retry context presents no imitable block
+    template (the model copies whatever format its context shows;
+    ADR-032's annotated headers were copied verbatim). Every other
+    trigger (and simulation retries where no base was prepared, e.g.
+    direct callers of this function) keeps the exact original
+    ``prompt``.
     """
     attempts_used = 0
     current_prompt = prompt
@@ -434,11 +537,42 @@ def _run_buffered_tool_turn(
         )
         if recorder.tool_calls:
             return recorder, attempts_used
-        needs_repair = required or parser.invalid_envelope_seen or pre_loop
-        if not needs_repair or attempts_used > MAX_TOOL_REPAIR_ATTEMPTS:
+        simulated = any(
+            marker in recorder.text for marker in SIMULATION_MARKERS
+        )
+        reasons = [
+            name
+            for name, active in (
+                ("required", required),
+                ("invalid_envelope_seen", parser.invalid_envelope_seen),
+                ("simulation_marker", simulated),
+                ("pre_loop", pre_loop),
+            )
+            if active
+        ]
+        if not reasons or attempts_used > MAX_TOOL_REPAIR_ATTEMPTS:
+            if reasons:
+                _log.info(
+                    "tool-enabled turn ends after %d attempt(s); repair "
+                    "budget exhausted (triggers: %s)",
+                    attempts_used,
+                    ", ".join(reasons),
+                )
             return recorder, attempts_used
+        _log.info(
+            "tool repair retry %d/%d (triggers: %s)",
+            attempts_used,
+            MAX_TOOL_REPAIR_ATTEMPTS,
+            ", ".join(reasons),
+        )
+        # ADR-033: simulation-marker retries rebuild on the STRIPPED
+        # base (no tool-shaped history) so the retry context presents
+        # no imitable block template; every other retry keeps the exact
+        # original prompt.
+        base = retry_base if (simulated and retry_base is not None) else prompt
         current_prompt = (
-            f"{prompt}\n\n{_tool_repair_hint(tools, required=required)}"
+            f"{base}\n\n"
+            f"{_tool_repair_hint(tools, required=required, simulated=simulated)}"
         )
 
 
@@ -491,6 +625,7 @@ def _start_buffered_tool_stream(
     *,
     required: bool,
     pre_loop: bool,
+    retry_base: str | None = None,
 ) -> StreamingResponse:
     """SSE response for a tool-enabled turn (M7 buffered path, ADR-028).
 
@@ -509,6 +644,7 @@ def _start_buffered_tool_stream(
             tools,
             required=required,
             pre_loop=pre_loop,
+            retry_base=retry_base,
         )
     except BackendFailure as failure:
         _invalidate_turn(context)
@@ -865,10 +1001,12 @@ def create_app(
         # holds no assistant tool call yet, so an envelope-less text
         # answer on this tool-enabled turn gets the bounded repair retry
         # (dominant live failure: prose-simulated tool use). Once a loop
-        # exists, text answers are presumed final and never repaired.
+        # exists, text answers are presumed final and never repaired —
+        # EXCEPT text carrying a simulation marker (ADR-031), which the
+        # buffered turn detects on its own assembled output.
         pre_loop = not tool_call_index(canonical)
 
-        context, prompt = _prepare_turn(
+        context, prompt, retry_base = _prepare_turn(
             request, backend_, canonical, tool_instructions
         )
 
@@ -884,6 +1022,7 @@ def create_app(
                     tools,
                     required=required,
                     pre_loop=pre_loop,
+                    retry_base=retry_base,
                 )
             # Tool-disabled streaming stays on the exact M3 path
             # (byte-identical; M3 fixtures pinned).
@@ -901,6 +1040,7 @@ def create_app(
                     tools,
                     required=required,
                     pre_loop=pre_loop,
+                    retry_base=retry_base,
                 )
             except BackendFailure as failure:
                 _invalidate_turn(context)

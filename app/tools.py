@@ -196,7 +196,10 @@ def build_tool_instructions(
     showed the model answering in prose by NARRATING a tool loop with
     fabricated results instead of emitting an envelope. The optional
     branch and the envelope rules therefore forbid simulated or narrated
-    tool execution explicitly.
+    tool execution explicitly. ADR-031 extends this: the M8 acceptance
+    showed the model imitating the gateway's OWN internal history blocks
+    (``[assistant tool call]`` / ``[tool result]``), so the wording also
+    marks those blocks as history-only data that must never be output.
     """
     lines: list[str] = ["[available tools]"]
     if required:
@@ -211,7 +214,8 @@ def build_tool_instructions(
             "below. If you need a tool to answer, you MUST request it with "
             "the control envelope — you cannot execute tools yourself; "
             "NEVER simulate or narrate tool execution in prose (no "
-            "fabricated listings or results)."
+            "fabricated listings or results, and never '[assistant tool "
+            "call]' or '[tool result]' blocks)."
         )
     lines.append("")
     lines.append("Available tools:")
@@ -255,6 +259,11 @@ def build_tool_instructions(
     lines.append(
         "- Never describe a tool call in prose; either output a real "
         "envelope or answer normally."
+    )
+    lines.append(
+        "- '[assistant tool call]' and '[tool result]' blocks in the "
+        "conversation are HISTORY data only; never output those markers — "
+        "the envelope above is the ONLY way to request a tool."
     )
     return "\n".join(lines)
 

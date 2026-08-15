@@ -8,7 +8,7 @@ protocol it uses the official OpenAI Node.js SDK (pinned exactly at
 standards-correct OpenAI Chat Completions API rather than a Qwen-specific
 HTTP protocol.
 
-**Status (M8 preparation):** plain chat works end-to-end (live-accepted 2026-08-14, a
+**Status (M8 hotfix complete — acceptance re-run pending):** plain chat works end-to-end (live-accepted 2026-08-14, a
 real Qwen Code v0.21.11 install answered through the gateway),
 **prompt-emulated tool calling is implemented AND live-accepted** (ADR-023):
 the gateway teaches DeepSeek a control-envelope protocol, parses the
@@ -29,11 +29,17 @@ exact failing request now returns a real `tool_calls` response. **M7
 acceptance PASSED (user-run, 2026-08-15, re-run after the hotfix):**
 three sequential tool interactions plus a final answer built from the
 results (capture records 66–71). **M8 (real coding acceptance, ADR-030)
-is READY — awaiting the user run:** a deterministic buggy fixture is
+was attempted twice and both attempts failed on mid-loop simulation;
+the post-M8 hotfix (ADR-031 → ADR-032 superseded → ADR-033) is applied
+and live-re-verified:** simulation markers in the model's own output now
+trigger the bounded repair, and the retry runs on a STRIPPED history
+compilation (no imitable block template) — a replay of the exact failing
+turn now returns a real `tool_calls` response. **The M8 acceptance RE-RUN
+is pending:** a deterministic buggy fixture is
 committed at `acceptance/m8-buggy-repo/` (stdlib-only, one failing test,
 both states offline-verified), the coding-loop wire shapes are
-regression-pinned in `tests/test_m8_coding_shapes.py` (suite 416 passed),
-and the readiness check found ZERO required gateway code changes — the
+regression-pinned in `tests/test_m8_coding_shapes.py` (suite 422 passed
+after the hotfix) — the
 checklist is below. Four
 post-M6 live bugs were fixed and live-re-verified (ADR-024/025/026/027).
 The verified wire facts live in `docs/UPSTREAM_NOTES.md`; the fixtured
@@ -235,15 +241,21 @@ Do not rely on it as the only source of project requirements;
 
 ## M8 acceptance (user-run checklist)
 
-**Status: READY — awaiting user run (offline side complete 2026-08-15).**
+**Status: READY — awaiting the user-run RE-RUN (hotfixed 2026-08-15).**
+The first two acceptance attempts failed on the mid-loop simulation
+failure mode (turn 2 narrated the remaining loop in the gateway's
+internal block format); the post-M8 hotfix (ADR-031 → ADR-032
+superseded → ADR-033) fixed exactly that mode and live-re-verified it by
+replaying the captured turn-2 request (now `finish_reason: tool_calls`).
 The deterministic buggy fixture is committed at `acceptance/m8-buggy-repo/`
 (ADR-030): one library module + one stdlib-only unittest suite, exactly one
 failing test whose location and nature are NOT stated anywhere in the
 fixture docs. Both states offline-verified: buggy = `Ran 9 tests ...
 FAILED (failures=1)` (a single `AssertionError: 1 != 1.5`); fixed = `Ran 9
 tests ... OK`. Offline regression for the coding-loop wire shapes:
-`tests/test_m8_coding_shapes.py` (suite 413 → 416 passed). Expected gateway
-code change for the live run: ZERO — the M6/M7 machinery is tool-agnostic.
+`tests/test_m8_coding_shapes.py` (suite 416 → 422 passed after the
+hotfix). The gateway code that carries the live run includes the post-M8
+hotfix (ADR-031/033 simulation repair); the main path is unchanged.
 
 Prompt (EXACT, from ROADMAP M8):
 
@@ -290,12 +302,17 @@ Find and fix the bug, then run the tests and explain what changed.
    - the first turn may be slow (buffered tool turn, ADR-028); a pre-loop
      plain-text first attempt costs the ADR-029 anti-simulation retry —
      a slow first turn ending in a real tool call is the hotfix working;
+   - a MID-loop turn may also be slow: if its first attempt simulates,
+     the ADR-031/033 repair retry runs (gateway log line `tool repair
+retry 1/1 (triggers: simulation_marker)`) — a slow mid-loop turn
+     ending in a real tool call is the post-M8 hotfix working;
    - a turn whose tool result is the FAILING test output is expected and
      correct — the agent must see the failure to fix it;
    - if an answer ever simulates tool execution again (fabricated test
-     output, no tool shown in the UI): that is the ADR-029 failure mode
-     escaping both defenses — note the line count in `requests.jsonl` and
-     report it (capture is request-only; the response side needs replay).
+     output, no tool shown in the UI): that is the simulation failure
+     mode escaping ALL defenses (ADR-029/031/033) — note the line count
+     in `requests.jsonl` and report it (capture is request-only; the
+     response side needs replay).
 
 8. After a PASS: reset the fixture for future re-runs (step 1), record the
    pass here + in `docs/PROGRESS.md`, and commit.

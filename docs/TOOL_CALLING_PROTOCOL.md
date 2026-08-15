@@ -158,6 +158,27 @@ presumed to be the legitimate final answer and must NOT be repaired —
 final-answer turns also carry tools, and repairing them could break loop
 termination.
 
+Exception for HIGH-PRECISION simulation markers (ADR-031): a mid-loop
+text answer IS repaired (bounded, same policy) when the attempt's own
+assembled output carries a simulation marker — the control start
+sentinel appearing as data, or the compiler's internal history header
+`[assistant tool call]`. Both are unambiguous "tool call requested"
+markers a genuine final answer never contains, so the termination guard
+stays intact for marker-less text. Detection scans ONLY the current
+inference output — compiled history and tool RESULTS are input and never
+inspected (shell/test output may contain anything).
+
+Repair-retry base after a simulation trigger (ADR-033): the retry is
+rebuilt on a STRIPPED compilation of the same history — every
+tool-shaped message omitted, assistant text kept — because the live M8
+failure showed the model copying whatever block format its context
+displays (even annotated headers, ADR-032, superseded). The stripped
+retry context presents no imitable template; the retry keeps the tool
+instructions and a repair hint that names the envelope as the only way
+to request a tool. Retries triggered for other reasons keep the
+original prompt verbatim. Canonical history is never stripped — only
+the discarded retry-branch prompt is.
+
 ## Tool arguments
 
 Public OpenAI response:

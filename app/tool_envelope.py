@@ -27,6 +27,11 @@ Guarantees:
   normalized ``{}`` fallback), pragmatic schema compatibility.
 * The gateway never fabricates tool calls: anything not fully valid is
   rendered as the plain text the model actually produced.
+* Simulation markers (ADR-031): :data:`SIMULATION_MARKERS` names the
+  strings whose presence in a turn's flushed OUTPUT marks prose-simulated
+  tool use (imitation of the control protocol or of the prompt compiler's
+  internal history blocks). The server checks them against the assembled
+  buffered-turn text to decide its bounded repair retry.
 * Injection boundary: ONLY the current inference output is ever parsed.
   Tool RESULTS live in the compiled prompt (input), never in this parser,
   and a later model turn re-parses from scratch with the tools of ITS OWN
@@ -52,9 +57,22 @@ __all__ = [
     "EmittedToolCall",
     "ToolCallEmitted",
     "EnvelopeParser",
+    "SIMULATION_MARKERS",
     "new_tool_call_id",
     "parse_envelope_from_text",
 ]
+
+#: Simulation markers (ADR-031): strings that belong ONLY to the control
+#: protocol or to the prompt compiler's internal history blocks. Their
+#: presence in a tool-enabled turn's flushed OUTPUT means the model
+#: imitated the gateway's own format instead of emitting an envelope —
+#: prose-simulated tool use. The M8 live failure wrote whole simulated
+#: loops as ``[assistant tool call]`` / ``[tool result]`` blocks. The
+#: server checks these against the ASSEMBLED buffered-turn text
+#: (chunk-split-proof); scope is the current inference output only —
+#: compiled history and tool results are INPUT and never inspected
+#: (injection boundary).
+SIMULATION_MARKERS = (TOOL_CALL_START_SENTINEL, "[assistant tool call]")
 
 
 @dataclass(frozen=True)
