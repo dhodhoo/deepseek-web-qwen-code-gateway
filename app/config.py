@@ -36,6 +36,12 @@ Environment variables (see .env.example):
 * ``DSQG_UPSTREAM_TIMEOUT_SECONDS`` — M9: upstream request timeout
   (default ``60``; a stall/inactivity timeout on the streaming call per
   curl_cffi semantics, total timeout on control-plane calls)
+* ``DSQG_ACCOUNT_TOKENS``      — M10 (ADR-037): comma-separated DeepSeek
+  auth tokens, ONE per account (multi-account routing). Mutually
+  exclusive with ``DEEPSEEK_AUTH_TOKEN``; cannot be combined with
+  ``DSQG_COOKIES_FILE`` (cookies are per-account credentials)
+* ``DSQG_ACCOUNT_COOLDOWN_SECONDS`` — M10: 429 cooldown window per
+  account (default ``300``; must be > 0)
 
 ``python -m app.main`` additionally merges the repository-root ``.env``
 file under the real environment via :func:`load_env_file` (ADR-022):
@@ -50,6 +56,7 @@ from typing import Mapping
 
 from pydantic import BaseModel, ConfigDict, SecretStr
 
+from .accounts import DEFAULT_ACCOUNT_COOLDOWN_SECONDS
 from .backends.base import LLMBackend
 from .reliability import (
     DEFAULT_MAX_RETRIES,
@@ -61,6 +68,7 @@ __all__ = [
     "DeepSeekWebSettings",
     "GatewaySettings",
     "build_backend",
+    "build_router",
     "load_env_file",
     "DEFAULT_BACKEND_TYPE",
     "FAKE_BACKEND_TYPE",
@@ -216,6 +224,14 @@ class GatewaySettings(BaseModel):
 
     backend_type: str = DEFAULT_BACKEND_TYPE
     deepseek_web: DeepSeekWebSettings | None = None
+    # --- M10 (ADR-037): multi-account routing ---------------------------
+    #: ALL configured DeepSeek accounts (``None`` for the fake backend).
+    #: Single-account configs (``DEEPSEEK_AUTH_TOKEN``) keep ``None`` here
+    #: and expose the one account through ``deepseek_web`` exactly as
+    #: before M10; ``DSQG_ACCOUNT_TOKENS`` fills this tuple (in config
+    #: order) and ``deepseek_web`` mirrors its first entry.
+    deepseek_accounts: tuple[DeepSeekWebSettings, ...] | None = None
+    account_cooldown_seconds: float = DEFAULT_ACCOUNT_COOLDOWN_SECONDS
     # --- HTTP surface (M2) ------------------------------------------------
     gateway_api_key: SecretStr | None = None
     allow_no_auth: bool = False
@@ -275,19 +291,64 @@ class GatewaySettings(BaseModel):
             "DSQG_UPSTREAM_TIMEOUT_SECONDS",
             DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
         )
+        # M10 (ADR-037): 429 cooldown window for the account router.
+        common["account_cooldown_seconds"] = _parse_seconds(
+            source.get("DSQG_ACCOUNT_COOLDOWN_SECONDS"),
+            "DSQG_ACCOUNT_COOLDOWN_SECONDS",
+            DEFAULT_ACCOUNT_COOLDOWN_SECONDS,
+        )
 
         if backend_type == FAKE_BACKEND_TYPE:
             return cls(backend_type=FAKE_BACKEND_TYPE, **common)  # type: ignore[arg-type]
 
         if backend_type == DEFAULT_BACKEND_TYPE:
             token = (source.get("DEEPSEEK_AUTH_TOKEN") or "").strip()
+            tokens_raw = (source.get("DSQG_ACCOUNT_TOKENS") or "").strip()
+            if token and tokens_raw:
+                raise ConfigError(
+                    "DEEPSEEK_AUTH_TOKEN and DSQG_ACCOUNT_TOKENS are "
+                    "mutually exclusive; configure exactly one mechanism "
+                    "(single account OR multi-account)"
+                )
+            cookies_raw = (source.get("DSQG_COOKIES_FILE") or "").strip()
+            if tokens_raw:
+                # M10 (ADR-037): multi-account config. One token per
+                # account; validation messages name the variable only,
+                # never a value (secrets never in errors).
+                entries = [part.strip() for part in tokens_raw.split(",")]
+                if any(not entry for entry in entries):
+                    raise ConfigError(
+                        "DSQG_ACCOUNT_TOKENS contains an empty entry "
+                        "(check for stray commas)"
+                    )
+                if len(set(entries)) != len(entries):
+                    raise ConfigError(
+                        "DSQG_ACCOUNT_TOKENS contains duplicate tokens; "
+                        "every account needs its own credential"
+                    )
+                if cookies_raw:
+                    raise ConfigError(
+                        "DSQG_COOKIES_FILE cannot be combined with "
+                        "DSQG_ACCOUNT_TOKENS: cookies are per-account "
+                        "credentials and per-account cookie files arrive "
+                        "with the persistence milestone"
+                    )
+                accounts = tuple(
+                    DeepSeekWebSettings(auth_token=SecretStr(entry))
+                    for entry in entries
+                )
+                return cls(
+                    backend_type=DEFAULT_BACKEND_TYPE,
+                    deepseek_web=accounts[0],
+                    deepseek_accounts=accounts,
+                    **common,  # type: ignore[arg-type]
+                )
             if not token:
                 raise ConfigError(
                     "DEEPSEEK_AUTH_TOKEN is required for backend "
                     "'deepseek_web' (see .env.example); or set "
                     "GATEWAY_BACKEND=fake for credential-free development"
                 )
-            cookies_raw = (source.get("DSQG_COOKIES_FILE") or "").strip()
             return cls(
                 backend_type=DEFAULT_BACKEND_TYPE,
                 deepseek_web=DeepSeekWebSettings(
@@ -301,6 +362,27 @@ class GatewaySettings(BaseModel):
             f"Unknown GATEWAY_BACKEND {backend_type!r}; expected "
             f"{DEFAULT_BACKEND_TYPE!r} or {FAKE_BACKEND_TYPE!r}"
         )
+
+
+def _build_deepseek_backend(
+    settings: GatewaySettings, account_settings: DeepSeekWebSettings
+) -> LLMBackend:
+    """One ``DeepSeekWebBackend`` for one account's settings (M10).
+
+    Each account gets its OWN backend instance — own vendored client,
+    own PoW solver, own call gate — so accounts are concurrency-isolated
+    (ADR-037 point 2). The vendored import stays lazy (fake-backend
+    development never touches the private-API dependency path).
+    """
+    from .backends.deepseek_web import DeepSeekWebBackend
+
+    return DeepSeekWebBackend(
+        account_settings.auth_token.get_secret_value(),
+        cookies_file=account_settings.cookies_file,
+        # M9 (ADR-036): bounded upstream timeout (stall semantics on
+        # the streaming call; see vendor/deepseek4free/dsk/api.py).
+        request_timeout=settings.upstream_timeout_seconds,
+    )
 
 
 def build_backend(settings: GatewaySettings) -> LLMBackend:
@@ -321,14 +403,56 @@ def build_backend(settings: GatewaySettings) -> LLMBackend:
                 "backend 'deepseek_web' requires deepseek_web settings; "
                 "build settings via GatewaySettings.from_env()"
             )
-        from .backends.deepseek_web import DeepSeekWebBackend
+        return _build_deepseek_backend(settings, settings.deepseek_web)
 
-        return DeepSeekWebBackend(
-            settings.deepseek_web.auth_token.get_secret_value(),
-            cookies_file=settings.deepseek_web.cookies_file,
-            # M9 (ADR-036): bounded upstream timeout (stall semantics on
-            # the streaming call; see vendor/deepseek4free/dsk/api.py).
-            request_timeout=settings.upstream_timeout_seconds,
+    raise ConfigError(f"Unknown backend_type {settings.backend_type!r}")
+
+
+def build_router(settings: GatewaySettings):
+    """Construct the account router for the configured backend (M10).
+
+    Single source of truth for "which accounts exist": ``DEEPSEEK_AUTH_TOKEN``
+    (or an injected backend) yields the one-account router with id
+    ``default`` — byte-for-byte the pre-M10 behavior; ``DSQG_ACCOUNT_TOKENS``
+    yields ``acct-1..N`` in config order, each with its own backend
+    instance. Account state itself (healthy/cooldown/invalid) starts
+    fresh on every restart — the registry is in-memory (ADR-037).
+    """
+    from .accounts import (
+        AccountRecord,
+        AccountRouter,
+    )
+
+    if settings.backend_type == FAKE_BACKEND_TYPE:
+        from .backends.fake import FakeBackend
+
+        return AccountRouter.single(
+            FakeBackend(), cooldown_seconds=settings.account_cooldown_seconds
+        )
+
+    if settings.backend_type == DEFAULT_BACKEND_TYPE:
+        if settings.deepseek_accounts:
+            records = [
+                AccountRecord(
+                    id=f"acct-{index}",
+                    label=f"DeepSeek account {index}",
+                    backend=_build_deepseek_backend(settings, account_settings),
+                )
+                for index, account_settings in enumerate(
+                    settings.deepseek_accounts, start=1
+                )
+            ]
+            return AccountRouter(
+                records, cooldown_seconds=settings.account_cooldown_seconds
+            )
+        if settings.deepseek_web is None:
+            raise ConfigError(
+                "backend 'deepseek_web' requires deepseek_web settings; "
+                "build settings via GatewaySettings.from_env()"
+            )
+        return AccountRouter.single(
+            _build_deepseek_backend(settings, settings.deepseek_web),
+            cooldown_seconds=settings.account_cooldown_seconds,
         )
 
     raise ConfigError(f"Unknown backend_type {settings.backend_type!r}")

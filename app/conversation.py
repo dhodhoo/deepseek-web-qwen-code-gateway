@@ -359,6 +359,7 @@ class ConversationStore:
         *,
         session_id: str,
         parent_message_id: str | None,
+        account_id: str | None = None,
     ) -> Conversation:
         """Advance canonical state after a turn completed (ADR-020 point 5).
 
@@ -368,6 +369,10 @@ class ConversationStore:
         lives; ``parent_message_id`` is stored verbatim (``None`` when the
         backend exposed no id — it is never carried over from a previous
         turn, which would re-branch under the old parent).
+
+        M10 (ADR-037): ``account_id`` persists the conversation→account
+        binding (sticky routing). ``None`` keeps any existing binding
+        (legacy callers and single-account tests).
         """
         with self._lock:
             now = self._clock()
@@ -383,6 +388,8 @@ class ConversationStore:
             conversation.messages = [*incoming, assistant_message]
             conversation.backend_session_id = session_id
             conversation.backend_parent_message_id = parent_message_id
+            if account_id is not None:
+                conversation.backend_account_id = account_id
             conversation.updated_at = now
             conversation.status = CONVERSATION_STATUS_ACTIVE
             return conversation

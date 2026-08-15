@@ -56,6 +56,7 @@ from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
+from .accounts import ACCOUNT_INVALID, AccountRouter
 from .backends.base import LLMBackend
 from .backends.errors import BackendErrorCategory, BackendFailure
 from .backends.events import (
@@ -65,7 +66,7 @@ from .backends.events import (
     MessageStarted,
     TextDelta,
 )
-from .config import GatewaySettings, build_backend
+from .config import GatewaySettings, build_router
 from .conversation import (
     CanonicalMessage,
     CanonicalToolCall,
@@ -274,6 +275,12 @@ class _TurnContext:
     ``None`` when the request starts a brand-new conversation (no stored
     history matched); the conversation row is only born when the turn
     commits (commit-on-finish), so failed first turns leave no debris.
+
+    M10 (ADR-037): ``account_id`` / ``backend`` / ``router`` carry the
+    ROUTED account for this turn — sticky reuse for a live conversation
+    link, least-active selection for a new session. ``backend`` is the
+    selected account's own backend instance; the commit and fail helpers
+    use ``router`` to record the account-level outcome of the turn.
     """
 
     store: ConversationStore
@@ -282,6 +289,9 @@ class _TurnContext:
     conversation: Conversation | None
     session_id: str
     parent_message_id: str | None
+    account_id: str | None = None
+    backend: LLMBackend | None = None
+    router: AccountRouter | None = None
 
 
 class _TurnRecorder:
@@ -392,19 +402,33 @@ def _strip_tool_history(
 
 def _prepare_turn(
     request: Request,
-    backend_: LLMBackend,
     canonical: list[CanonicalMessage],
     tool_instructions: str | None = None,
 ) -> tuple[_TurnContext, str, str | None]:
-    """Resolve the conversation; choose backend session and prompt (ADR-020).
+    """Resolve the conversation; choose ACCOUNT, session and prompt.
+
+    M4/ADR-020 resolution is unchanged; M10 (ADR-037) layers account
+    routing ON TOP of it. STICKY: a matched conversation with a live
+    backend link keeps the account that created the session (never
+    round-robin per turn — ARCHITECTURE.md), and a cooling-down account
+    keeps its sticky sessions too (the upstream session survives a
+    rate-limit window). The router selects ONLY when a new backend
+    session is needed, and only among usable accounts (healthy or
+    cooldown-expired). A FINAL ``create_session`` failure records the
+    selected account's consequence before crossing as an HTTP error
+    through the app-level handler.
 
     Matched conversation with a live backend link → reuse its session and
     compile ONLY the trailing delta messages (the upstream session already
     holds prior context). Otherwise create a fresh backend session and
     compile the request's FULL history (rebuild from canonical state —
-    always correct, and exactly what a restart requires). ``create_session``
-    may raise ``BackendFailure``; it crosses as an HTTP error through the
-    app-level handler.
+    always correct, and exactly what a restart requires). The router
+    selects ONLY when a new backend session is needed, and only among
+    usable accounts (healthy or cooldown-expired) — with one refinement:
+    a matched conversation whose link died REBUILDS on its bound account
+    when that account is still usable for sticky (cooldown allowed), so
+    the M9/ADR-020 rebuild contract holds even while an account cools
+    down (single-account deployments stay byte-for-byte unchanged).
 
     ``tool_instructions`` (M6, ADR-023) — the deterministic tool-control
     block from :func:`app.tools.build_tool_instructions` — is appended
@@ -423,22 +447,58 @@ def _prepare_turn(
     keep the exact pinned M2–M7 rendering.
     """
     store: ConversationStore = request.app.state.store
-    conversation, delta = store.resolve(backend_.backend_type, canonical)
+    router: AccountRouter = request.app.state.router
+    conversation, delta = store.resolve(router.backend_type, canonical)
 
+    # M10 (ADR-037): sticky account. A live link on a usable account
+    # keeps its own backend; an invalid/disabled/unknown account releases
+    # the link so the conversation rebuilds on a usable account instead.
+    account = None
     if conversation is not None and conversation.backend_session_id is not None:
+        bound_id = conversation.backend_account_id
+        if bound_id is None:
+            # Pre-M10 binding (legacy/tests): the single default account.
+            bound_id = router.default_account.id
+        account = router.sticky_account(bound_id)
+        if account is None:
+            store.invalidate_backend_link(conversation)
+
+    if account is not None:
         session_id = conversation.backend_session_id
         parent_message_id = conversation.backend_parent_message_id
         prompt_messages = delta
     else:
+        # M10 (ADR-037): a matched conversation whose link died REBUILDS
+        # on its bound account when that account is still usable for
+        # sticky (enabled, not invalid — cooldown allowed): the ADR-020
+        # rebuild contract must hold even while the account cools down
+        # (a final 429 must not make the sole account unreachable to the
+        # very conversation it just failed). Only a DEAD bound account
+        # (invalid/disabled/unknown) — or a genuinely new conversation —
+        # goes through least-active selection among the usable accounts.
+        if (
+            conversation is not None
+            and conversation.backend_account_id is not None
+        ):
+            account = router.sticky_account(conversation.backend_account_id)
+        if account is None:
+            account = router.select_for_new_conversation(store)
         # M9 (ADR-036): session creation is a pre-byte backend call too,
         # so it gets the same bounded transport retry (a transient network
         # hiccup here used to fail the whole request immediately).
-        session = with_transport_retry(
-            backend_.create_session,
-            policy=request.app.state.retry_policy,
-            on_retry=_make_on_retry(request.app.state.retry_policy),
-            metrics=request.app.state.metrics,
-        )
+        try:
+            session = with_transport_retry(
+                account.backend.create_session,
+                policy=request.app.state.retry_policy,
+                on_retry=_make_on_retry(request.app.state.retry_policy),
+                metrics=request.app.state.metrics,
+            )
+        except BackendFailure as failure:
+            # M10 (ADR-037): a FINAL session-creation failure punishes
+            # the selected account (401-class → invalid + link release;
+            # 429-class → cooldown) before surfacing as the mapped error.
+            router.record_failure(account.id, failure.category, store)
+            raise
         session_id = session.session_id
         parent_message_id = None
         prompt_messages = canonical
@@ -472,11 +532,14 @@ def _prepare_turn(
             retry_base = f"{retry_base}\n\n{tool_instructions}"
     context = _TurnContext(
         store=store,
-        backend_type=backend_.backend_type,
+        backend_type=router.backend_type,
         incoming=canonical,
         conversation=conversation,
         session_id=session_id,
         parent_message_id=parent_message_id,
+        account_id=account.id,
+        backend=account.backend,
+        router=router,
     )
     return context, prompt, retry_base
 
@@ -488,6 +551,10 @@ def _commit_turn(
 
     Returns the (possibly newly created) conversation so callers can
     post-process the backend link (M7 repair invalidation, ADR-028).
+
+    M10 (ADR-037): the commit persists the conversation→account binding
+    (sticky routing) and records account-level SUCCESS — healthy state
+    restored, cooldown cleared, failure counters reset.
     """
     conversation = context.store.commit_turn(
         context.backend_type,
@@ -496,8 +563,11 @@ def _commit_turn(
         recorder.assistant_message(),
         session_id=context.session_id,
         parent_message_id=recorder.parent_message_id,
+        account_id=context.account_id,
     )
     recorder.committed = True
+    if context.router is not None and context.account_id is not None:
+        context.router.record_success(context.account_id)
     return conversation
 
 
@@ -505,6 +575,23 @@ def _invalidate_turn(context: _TurnContext) -> None:
     """Drop a failed turn's backend link; the next request rebuilds."""
     if context.conversation is not None:
         context.store.invalidate_backend_link(context.conversation)
+
+
+def _fail_turn(context: _TurnContext, failure: BackendFailure) -> None:
+    """Drop the backend link AND record the M10 account consequence.
+
+    Called ONLY where a FINAL ``BackendFailure`` surfaces (the M9
+    transport-retry budget has already absorbed every transient retry),
+    so whatever arrives here is final: 401-class invalidates the account
+    and releases its conversations' links; 429-class starts its cooldown
+    (ADR-037). Mid-stream failures take the same path — the stream is
+    already committed, but the account-level truth still holds.
+    """
+    _invalidate_turn(context)
+    if context.router is not None and context.account_id is not None:
+        context.router.record_failure(
+            context.account_id, failure.category, context.store
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +844,7 @@ def _start_buffered_tool_stream(
             metrics=metrics,
         )
     except BackendFailure as failure:
-        _invalidate_turn(context)
+        _fail_turn(context, failure)
         status, error_body = backend_failure_to_response(failure)
         raise GatewayHttpError(status, error_body) from failure
     _finish_tool_turn(context, recorder, attempts_used)
@@ -835,8 +922,8 @@ def _observed_events(events, *, context: _TurnContext, recorder: _TurnRecorder):
             if isinstance(event, MessageFinished) and not recorder.committed:
                 _commit_turn(context, recorder)
             yield event
-    except BackendFailure:
-        _invalidate_turn(context)
+    except BackendFailure as failure:
+        _fail_turn(context, failure)
         raise
 
 
@@ -906,18 +993,18 @@ def _start_stream_response(
             metrics=metrics,
         )
     except BackendFailure as failure:
-        _invalidate_turn(context)
+        _fail_turn(context, failure)
         status, error_body = backend_failure_to_response(failure)
         raise GatewayHttpError(status, error_body) from failure
     if isinstance(primed, BackendError):
         # Headers are not committed yet: convert to an HTTP status too.
-        _invalidate_turn(context)
         failure = BackendFailure(
             category=_category_or_internal(primed.kind),
             message=primed.message,
             retryable=primed.retryable,
             status_code=primed.status_code,
         )
+        _fail_turn(context, failure)
         status, error_body = backend_failure_to_response(failure)
         raise GatewayHttpError(status, error_body) from failure
     return StreamingResponse(
@@ -938,20 +1025,37 @@ def create_app(
     backend: LLMBackend | None = None,
     store: ConversationStore | None = None,
     metrics: MetricsCollector | None = None,
+    router: AccountRouter | None = None,
 ) -> FastAPI:
     """Build the gateway application.
 
-    ``settings`` defaults to :meth:`GatewaySettings.from_env`; ``backend``
-    defaults to :func:`build_backend(settings)`; ``store`` defaults to a
-    fresh bounded in-memory :class:`ConversationStore` (ADR-020);
-    ``metrics`` defaults to a fresh :class:`MetricsCollector` (M9,
-    ADR-036). All four are injectable for tests (the whole surface is
+    ``settings`` defaults to :meth:`GatewaySettings.from_env`; ``store``
+    defaults to a fresh bounded in-memory :class:`ConversationStore`
+    (ADR-020); ``metrics`` defaults to a fresh :class:`MetricsCollector`
+    (M9, ADR-036). All are injectable for tests (the whole surface is
     testable offline with ``FakeBackend``).
+
+    M10 (ADR-037): ``router`` is the account registry every chat request
+    routes through. It defaults to :func:`build_router(settings)` — or,
+    when a bare ``backend`` is injected (the pre-M10 test pattern), a
+    one-account router wrapping it (id ``default``), so every existing
+    call site keeps its exact behavior. Passing both ``backend`` and
+    ``router`` is a programming error. ``app.state.backend`` stays the
+    FIRST account's backend for compatibility.
     """
     if settings is None:
         settings = GatewaySettings.from_env()
-    if backend is None:
-        backend = build_backend(settings)
+    if router is None:
+        if backend is None:
+            router = build_router(settings)
+        else:
+            router = AccountRouter.single(
+                backend,
+                cooldown_seconds=settings.account_cooldown_seconds,
+            )
+    elif backend is not None:
+        raise ValueError("pass either backend or router, not both")
+    backend = router.default_account.backend
     if metrics is None:
         metrics = MetricsCollector()
 
@@ -966,6 +1070,8 @@ def create_app(
     )
     app.state.settings = settings
     app.state.backend = backend
+    # M10 (ADR-037): the account registry behind every routing decision.
+    app.state.router = router
     app.state.store = store if store is not None else ConversationStore()
     # M9 (ADR-036): reliability knobs shared by every request path — the
     # bounded transport-retry policy (from settings) and the collector
@@ -1052,14 +1158,23 @@ def create_app(
     @app.get("/health")
     def health(request: Request) -> dict:
         """Process/service health (never exposes secrets)."""
-        backend_: LLMBackend = request.app.state.backend
-        snapshot = backend_.health_check()
+        router_: AccountRouter = request.app.state.router
+        snapshot = router_.default_account.backend.health_check()
+        # M10 (ADR-037): ready when the local backend reports ready AND
+        # at least one enabled account is not invalid. Single-account
+        # deployments keep the exact pre-M10 semantics until a final 401
+        # retires the account.
+        accounts_ok = any(
+            account.enabled and account.health_status != ACCOUNT_INVALID
+            for account in router_.accounts
+        )
+        ok = snapshot.ready and accounts_ok
         return {
-            "ok": snapshot.ready,
+            "ok": ok,
             "version": __version__,
             "backend": {
                 "type": snapshot.backend_type,
-                "status": "ready" if snapshot.ready else "not_ready",
+                "status": "ready" if ok else "not_ready",
             },
         }
 
@@ -1072,6 +1187,22 @@ def create_app(
         ids, never secrets.
         """
         return request.app.state.metrics.snapshot()
+
+    @app.get("/admin/accounts")
+    def admin_accounts(request: Request) -> dict:
+        """Masked account registry view (M10, ADR-037).
+
+        Unauthenticated like ``/admin/metrics``: the gateway binds
+        locally and the payload is STRUCTURALLY secret-free — ids,
+        labels, derived state (disabled > invalid > cooldown > healthy),
+        cooldown counters and timestamps. Credentials live only inside
+        the account backends and are never serialized by this module.
+        Read-only in M10: account lifecycle management arrives with the
+        M12 admin UI.
+        """
+        router_: AccountRouter = request.app.state.router
+        store_: ConversationStore = request.app.state.store
+        return {"accounts": router_.summary(store_)}
 
     @app.get(
         "/v1/models",
@@ -1092,7 +1223,6 @@ def create_app(
         # exclude_none serialization), which FastAPI passes through as-is
         # regardless of this annotation.
         cfg: GatewaySettings = request.app.state.settings
-        backend_: LLMBackend = request.app.state.backend
         # M9 (ADR-036): the bounded transport-retry policy and the
         # metrics collector live on app.state (built in create_app).
         policy: RetryPolicy = request.app.state.retry_policy
@@ -1170,8 +1300,12 @@ def create_app(
         pre_loop = not tool_call_index(canonical)
 
         context, prompt, retry_base = _prepare_turn(
-            request, backend_, canonical, tool_instructions
+            request, canonical, tool_instructions
         )
+        # M10 (ADR-037): the ROUTED account's backend serves this turn —
+        # sticky for existing sessions, least-active selection for new
+        # ones; account consequences attach on commit/final failure.
+        backend_: LLMBackend = context.backend
 
         if tools_enabled and metrics is not None:
             metrics.record_tool_turn()
@@ -1215,7 +1349,7 @@ def create_app(
                     metrics=metrics,
                 )
             except BackendFailure as failure:
-                _invalidate_turn(context)
+                _fail_turn(context, failure)
                 status, error_body = backend_failure_to_response(failure)
                 raise GatewayHttpError(status, error_body) from failure
             _finish_tool_turn(context, recorder, attempts_used)
@@ -1257,7 +1391,7 @@ def create_app(
                     metrics=metrics,
                 )
             except BackendFailure as failure:
-                _invalidate_turn(context)
+                _fail_turn(context, failure)
                 status, error_body = backend_failure_to_response(failure)
                 raise GatewayHttpError(status, error_body) from failure
             finish_reason = recorder.finish_reason
