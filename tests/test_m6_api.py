@@ -360,6 +360,9 @@ class TestToolHistoryRoundTrip:
                     TextDelta("The file prints hello."),
                     MessageFinished("stop"),
                 ],
+                # ADR-035: the mid-loop plain answer pays one bounded
+                # retry and repeats itself (attempt 2 flushes).
+                fake_text_turn("The file prints hello."),
             ]
         )
         client = _client(_settings(), backend)
@@ -417,6 +420,9 @@ class TestToolHistoryRoundTrip:
             turns=[
                 _envelope_turn(),
                 fake_text_turn("done"),
+                # ADR-035: the mid-loop plain answer pays one bounded
+                # retry and repeats itself.
+                fake_text_turn("done"),
             ]
         )
         client = _client(_settings(), backend)
@@ -450,7 +456,8 @@ class TestToolHistoryRoundTrip:
             headers=AUTH,
         )
         assert response.status_code == 200
-        # Prefix matched → same session, delta-only prompt.
+        # Prefix matched → same session, delta-only prompt (pinned on
+        # attempt 1; ADR-035 adds the bounded retry as attempt 2).
         assert len(backend.sessions_created) == 1
         assert "[user]\nRead src/main.py" not in backend.turn_calls[1].prompt
 

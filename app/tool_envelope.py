@@ -62,17 +62,28 @@ __all__ = [
     "parse_envelope_from_text",
 ]
 
-#: Simulation markers (ADR-031): strings that belong ONLY to the control
-#: protocol or to the prompt compiler's internal history blocks. Their
-#: presence in a tool-enabled turn's flushed OUTPUT means the model
-#: imitated the gateway's own format instead of emitting an envelope —
-#: prose-simulated tool use. The M8 live failure wrote whole simulated
-#: loops as ``[assistant tool call]`` / ``[tool result]`` blocks. The
+#: Simulation markers (ADR-031, extended by ADR-034): strings that belong
+#: ONLY to the control protocol, to the prompt compiler's history blocks,
+#: or to serialized chat transcripts. Their presence in a tool-enabled
+#: turn's flushed OUTPUT means the model imitated the gateway's own
+#: format instead of emitting an envelope — prose-simulated tool use.
+#: The live M8 failures wrote simulated loops as ``[assistant tool
+#: call]`` / ``[tool result]`` blocks (the pre-ADR-034 history format)
+#: and, later, fake ``[User]`` / ``[user]`` / ``[assistant]`` turn
+#: transcripts (capture record 91, 2026-08-15). All markers are
+#: high-precision: a genuine final answer never contains them. The
 #: server checks these against the ASSEMBLED buffered-turn text
 #: (chunk-split-proof); scope is the current inference output only —
 #: compiled history and tool results are INPUT and never inspected
 #: (injection boundary).
-SIMULATION_MARKERS = (TOOL_CALL_START_SENTINEL, "[assistant tool call]")
+SIMULATION_MARKERS = (
+    TOOL_CALL_START_SENTINEL,
+    "[assistant tool call]",
+    "[tool result]",
+    "[user]",
+    "[User]",
+    "[assistant]",
+)
 
 
 @dataclass(frozen=True)

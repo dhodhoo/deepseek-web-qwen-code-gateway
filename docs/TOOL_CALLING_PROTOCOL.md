@@ -150,23 +150,29 @@ file contents — instead of emitting an envelope. Such output must never
 be treated as a tool call, and the instructions should forbid it
 explicitly ("never simulate or narrate tool execution in prose").
 
-Implemented behavior (ADR-029): when a tool-enabled turn yields no valid
-call AND the request history holds no assistant tool call yet (PRE-loop),
-the same bounded repair turn applies before falling back to honest text.
-Once the history already carries tool calls (MID-loop), a text answer is
-presumed to be the legitimate final answer and must NOT be repaired —
-final-answer turns also carry tools, and repairing them could break loop
-termination.
+Implemented behavior (ADR-029 → ADR-031 → ADR-035): EVERY tool-enabled
+turn that ends without a valid envelope gets ONE bounded repair retry
+before falling back to honest text — pre-loop plain text (ADR-029),
+marker-bearing simulation (ADR-031), and marker-less mid-loop prose
+alike (ADR-035, logged as `no_envelope`). The old termination guard —
+marker-less mid-loop text presumed final, never repaired — was REMOVED
+after live evidence falsified its premise three times: mid-loop turns
+keep emitting marker-less intent prose ("I'll read the test file...")
+instead of an envelope. Termination is still guaranteed BY CONSTRUCTION:
+the budget is exactly one retry, and the non-simulation repair hint
+explicitly permits a plain answer ("If no tool is actually needed,
+answer normally in plain text"), so a genuine final answer answers
+plainly again on attempt 2 and its text flushes. Accepted cost: every
+envelope-less text answer pays one extra backend call.
 
-Exception for HIGH-PRECISION simulation markers (ADR-031): a mid-loop
-text answer IS repaired (bounded, same policy) when the attempt's own
-assembled output carries a simulation marker — the control start
-sentinel appearing as data, or the compiler's internal history header
-`[assistant tool call]`. Both are unambiguous "tool call requested"
-markers a genuine final answer never contains, so the termination guard
-stays intact for marker-less text. Detection scans ONLY the current
-inference output — compiled history and tool RESULTS are input and never
-inspected (shell/test output may contain anything).
+HIGH-PRECISION simulation markers (ADR-031, extended by ADR-034) still
+matter for the RETRY BASE: a text answer carrying a marker — the
+control start sentinel as data, `[assistant tool call]`, `[tool result]`,
+or fake conversation turns `[user]` / `[User]` / `[assistant]` — is
+prose-simulated tool use and its retry is rebuilt on the stripped base
+(see below). Detection scans ONLY the current inference output —
+compiled history and tool RESULTS are input and never inspected
+(shell/test output may contain anything).
 
 Repair-retry base after a simulation trigger (ADR-033): the retry is
 rebuilt on a STRIPPED compilation of the same history — every
@@ -175,9 +181,18 @@ failure showed the model copying whatever block format its context
 displays (even annotated headers, ADR-032, superseded). The stripped
 retry context presents no imitable template; the retry keeps the tool
 instructions and a repair hint that names the envelope as the only way
-to request a tool. Retries triggered for other reasons keep the
-original prompt verbatim. Canonical history is never stripped — only
-the discarded retry-branch prompt is.
+to request a tool. Retries triggered for other reasons — including
+marker-less `no_envelope` retries — keep the original prompt verbatim
+(full context, informed calls). Canonical history is never stripped —
+only the discarded retry-branch prompt is.
+
+Main-path history rendering (ADR-034): historical assistant tool calls
+compile BYTE-IDENTICAL to the instructed envelope itself
+(`<<<DSQG_TOOL_CALL>>>` + the same JSON line + the end sentinel), so
+the context's most tool-like pattern IS the valid request format —
+imitation becomes a valid tool request instead of a failure mode. Tool
+RESULTS keep their own `[tool result]` data blocks (results never use
+the envelope format).
 
 ## Tool arguments
 
@@ -275,6 +290,8 @@ Store enough mapping so a later `role=tool` message can be associated with:
 ## Assistant history reconstruction
 
 When the next request includes an assistant tool-call message, compile it back into backend context in a stable way.
+
+Implemented (M6, ADR-023; envelope rendering ADR-034): historical assistant tool calls compile to the control-envelope block itself (byte-identical to the instructed format); `role=tool` results compile to `[tool result]` data blocks.
 
 Do not rely only on remote DeepSeek memory.
 

@@ -8,7 +8,7 @@ protocol it uses the official OpenAI Node.js SDK (pinned exactly at
 standards-correct OpenAI Chat Completions API rather than a Qwen-specific
 HTTP protocol.
 
-**Status (M8 hotfix complete — acceptance re-run pending):** plain chat works end-to-end (live-accepted 2026-08-14, a
+**Status (M8 hotfix round 2 complete — fourth acceptance attempt pending):** plain chat works end-to-end (live-accepted 2026-08-14, a
 real Qwen Code v0.21.11 install answered through the gateway),
 **prompt-emulated tool calling is implemented AND live-accepted** (ADR-023):
 the gateway teaches DeepSeek a control-envelope protocol, parses the
@@ -29,17 +29,22 @@ exact failing request now returns a real `tool_calls` response. **M7
 acceptance PASSED (user-run, 2026-08-15, re-run after the hotfix):**
 three sequential tool interactions plus a final answer built from the
 results (capture records 66–71). **M8 (real coding acceptance, ADR-030)
-was attempted twice and both attempts failed on mid-loop simulation;
-the post-M8 hotfix (ADR-031 → ADR-032 superseded → ADR-033) is applied
-and live-re-verified:** simulation markers in the model's own output now
-trigger the bounded repair, and the retry runs on a STRIPPED history
-compilation (no imitable block template) — a replay of the exact failing
-turn now returns a real `tool_calls` response. **The M8 acceptance RE-RUN
-is pending:** a deterministic buggy fixture is
+was attempted three times; every attempt died on the model answering in
+prose instead of emitting the control envelope. The post-M8 hotfix round 1
+(ADR-031 → ADR-032 superseded → ADR-033) fixed marker-bearing simulation;
+round 2 (ADR-034 + ADR-035) is applied and live-re-verified after the
+third attempt falsified the remaining guard:** historical assistant tool
+calls now compile BYTE-IDENTICAL to the instructed envelope (imitation
+becomes a valid tool request, ADR-034), and EVERY tool-enabled turn that
+ends without a valid envelope gets ONE bounded repair retry — the mid-loop
+termination guard was removed after live falsification (ADR-035). Replays
+of BOTH killer records from the third attempt now return real `tool_calls`
+responses. **The M8 acceptance RE-RUN (fourth attempt) is pending:** a
+deterministic buggy fixture is
 committed at `acceptance/m8-buggy-repo/` (stdlib-only, one failing test,
 both states offline-verified), the coding-loop wire shapes are
-regression-pinned in `tests/test_m8_coding_shapes.py` (suite 422 passed
-after the hotfix) — the
+regression-pinned in `tests/test_m8_coding_shapes.py` (suite 424 passed
+after hotfix round 2) — the
 checklist is below. Four
 post-M6 live bugs were fixed and live-re-verified (ADR-024/025/026/027).
 The verified wire facts live in `docs/UPSTREAM_NOTES.md`; the fixtured
@@ -143,17 +148,17 @@ The OpenAI SDK appends the resource path.
 
 ## What to expect today (M7)
 
-| Behavior                                                                                                              | Status                                                                                                                                                                                                                                        |
-| --------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Plain chat, streaming (agent turns)                                                                                   | Works — `stream:true` + `stream_options.include_usage` accepted; no usage chunk is emitted (the client tolerates absence)                                                                                                                     |
-| Plain chat, non-streaming (side queries)                                                                              | Works                                                                                                                                                                                                                                         |
-| Multi-turn continuity                                                                                                 | Works — resolved from the request's own history (ADR-020); restart-safe                                                                                                                                                                       |
-| `tools[]` / `tool_choice`                                                                                             | **Prompt-emulated tool calling (M6, ADR-023)** — a valid model envelope becomes structured `tool_calls`; `tool_choice: "none"` disables tools; missing/malformed envelopes get ONE bounded repair retry, then honest plain text (M7, ADR-028) |
-| Assistant `tool_calls` / `role=tool` history                                                                          | **Accepted and compiled (M6)** — `[assistant tool call]` / `[tool result]` prompt blocks; malformed entries 400 with locations; orphan tool results compile as-is and log a warning (M7)                                                      |
-| Tool loop                                                                                                             | **Repeated tool-result/model cycles (M7)** — one tool call per model turn; ids persist across turns via an index derived from the re-sent history; live-probed with 3 sequential interactions                                                 |
-| Non-standard extras (`reasoning_effort`, `enable_thinking`, `chat_template_kwargs`, `metadata`, `cache_control`, ...) | Accepted and ignored (lenient parsing)                                                                                                                                                                                                        |
-| `max_tokens` (always sent, possibly huge)                                                                             | Accepted; DeepSeek applies its own upstream limits                                                                                                                                                                                            |
-| Embeddings (`/v1/embeddings`, client hardcodes `text-embedding-ada-002`)                                              | Not implemented — out of core milestones; the endpoint 404s                                                                                                                                                                                   |
+| Behavior                                                                                                              | Status                                                                                                                                                                                                                                                                         |
+| --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Plain chat, streaming (agent turns)                                                                                   | Works — `stream:true` + `stream_options.include_usage` accepted; no usage chunk is emitted (the client tolerates absence)                                                                                                                                                      |
+| Plain chat, non-streaming (side queries)                                                                              | Works                                                                                                                                                                                                                                                                          |
+| Multi-turn continuity                                                                                                 | Works — resolved from the request's own history (ADR-020); restart-safe                                                                                                                                                                                                        |
+| `tools[]` / `tool_choice`                                                                                             | **Prompt-emulated tool calling (M6, ADR-023)** — a valid model envelope becomes structured `tool_calls`; `tool_choice: "none"` disables tools; missing/malformed envelopes get ONE bounded repair retry, then honest plain text (M7, ADR-028)                                  |
+| Assistant `tool_calls` / `role=tool` history                                                                          | **Accepted and compiled (M6)** — historical tool calls compile to control-ENVELOPE blocks byte-identical to the instructed format (ADR-034), results to `[tool result]` blocks; malformed entries 400 with locations; orphan tool results compile as-is and log a warning (M7) |
+| Tool loop                                                                                                             | **Repeated tool-result/model cycles (M7)** — one tool call per model turn; ids persist across turns via an index derived from the re-sent history; live-probed with 3 sequential interactions                                                                                  |
+| Non-standard extras (`reasoning_effort`, `enable_thinking`, `chat_template_kwargs`, `metadata`, `cache_control`, ...) | Accepted and ignored (lenient parsing)                                                                                                                                                                                                                                         |
+| `max_tokens` (always sent, possibly huge)                                                                             | Accepted; DeepSeek applies its own upstream limits                                                                                                                                                                                                                             |
+| Embeddings (`/v1/embeddings`, client hardcodes `text-embedding-ada-002`)                                              | Not implemented — out of core milestones; the endpoint 404s                                                                                                                                                                                                                    |
 
 ## Wire verification status (M5 — traffic-verified)
 
@@ -241,21 +246,29 @@ Do not rely on it as the only source of project requirements;
 
 ## M8 acceptance (user-run checklist)
 
-**Status: READY — awaiting the user-run RE-RUN (hotfixed 2026-08-15).**
-The first two acceptance attempts failed on the mid-loop simulation
-failure mode (turn 2 narrated the remaining loop in the gateway's
-internal block format); the post-M8 hotfix (ADR-031 → ADR-032
-superseded → ADR-033) fixed exactly that mode and live-re-verified it by
-replaying the captured turn-2 request (now `finish_reason: tool_calls`).
+**Status: READY — awaiting the user-run FOURTH attempt (hotfix round 2,
+2026-08-15).**
+The first three acceptance attempts all died on the model answering in
+prose instead of emitting the control envelope — attempts 1–2 on
+marker-bearing mid-loop simulation, attempt 3 on MARKER-LESS mid-loop
+intent prose that the termination guard then flushed unrepaired. Hotfix
+round 1 (ADR-031 → ADR-032 superseded → ADR-033) fixed the marker-bearing
+mode; hotfix round 2 (ADR-034 + ADR-035) removed the falsified guard —
+EVERY envelope-less tool turn now gets the one bounded retry — and
+re-pinned main-path history rendering so historical tool calls display as
+the instructed envelope itself (imitation becomes a valid request). Both
+killer records of attempt 3 replay to real `tool_calls` responses.
 The deterministic buggy fixture is committed at `acceptance/m8-buggy-repo/`
 (ADR-030): one library module + one stdlib-only unittest suite, exactly one
 failing test whose location and nature are NOT stated anywhere in the
 fixture docs. Both states offline-verified: buggy = `Ran 9 tests ...
 FAILED (failures=1)` (a single `AssertionError: 1 != 1.5`); fixed = `Ran 9
 tests ... OK`. Offline regression for the coding-loop wire shapes:
-`tests/test_m8_coding_shapes.py` (suite 416 → 422 passed after the
-hotfix). The gateway code that carries the live run includes the post-M8
-hotfix (ADR-031/033 simulation repair); the main path is unchanged.
+`tests/test_m8_coding_shapes.py` (suite 416 → 424 passed after hotfix
+round 2). The gateway code that carries the live run includes the post-M8
+hotfixes round 1 AND round 2 (ADR-031/033 simulation repair plus
+ADR-034/035 envelope-rendered history and universal bounded repair); the
+public wire contract is unchanged.
 
 Prompt (EXACT, from ROADMAP M8):
 
@@ -306,11 +319,16 @@ Find and fix the bug, then run the tests and explain what changed.
      the ADR-031/033 repair retry runs (gateway log line `tool repair
 retry 1/1 (triggers: simulation_marker)`) — a slow mid-loop turn
      ending in a real tool call is the post-M8 hotfix working;
+   - since ADR-035 ANY tool-enabled turn that ends without an envelope —
+     including a genuine FINAL answer — pays ONE bounded retry (gateway
+     log line `tool repair retry 1/1 (triggers: no_envelope)`); the
+     retry's text flushes, so a slow turn ending in honest prose is the
+     bounded repair working, not a stall;
    - a turn whose tool result is the FAILING test output is expected and
      correct — the agent must see the failure to fix it;
    - if an answer ever simulates tool execution again (fabricated test
      output, no tool shown in the UI): that is the simulation failure
-     mode escaping ALL defenses (ADR-029/031/033) — note the line count
+     mode escaping ALL defenses (ADR-029/031/033/034/035) — note the line count
      in `requests.jsonl` and report it (capture is request-only; the
      response side needs replay).
 
@@ -442,16 +460,18 @@ of those tools.**
      assistant prose on a tool turn.
 5. If a turn takes noticeably longer than M6 turns: tool-enabled turns
    are buffered end-to-end (ADR-028), and a turn that needed the bounded
-   repair costs two backend calls — since ADR-029 this also applies to a
-   PRE-loop turn that first answers plain text without an envelope (the
-   anti-simulation retry), so a slow FIRST turn with a correct tool call
-   or honest text at the end is the hotfix working, not a regression.
+   repair costs two backend calls — since ADR-035 EVERY tool-enabled turn
+   that ends without an envelope pays that one retry (pre-loop plain text,
+   mid-loop prose, a genuine final answer alike), so a slow turn with a
+   correct tool call or honest text at the end is the hotfix working, not
+   a regression.
    A turn that ultimately answers plain text after a repair still keeps
    the session usable (the next request self-heals via canonical rebuild
    if the turn used more than one attempt).
 6. If an answer ever LOOKS like simulated tool execution again ("Saya
    akan membaca file…" followed by fabricated results, no tool shown in
-   the UI): that is the ADR-029 failure mode escaping both defenses —
+   the UI): that is the simulation failure mode escaping ALL defenses
+   (ADR-029/031/033/034/035) —
    note the line count in `GATEWAY_DIAGNOSTICS_DIR/requests.jsonl` for
    the turn and report it (capture is request-only, so the response side
    needs the replay treatment).

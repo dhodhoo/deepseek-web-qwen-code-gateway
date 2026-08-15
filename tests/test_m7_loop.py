@@ -10,10 +10,12 @@ Covers the five M7 build items offline:
 * streaming tool-control buffering — tool-enabled turns are fully
   buffered before any SSE byte; pre-response failures answer with an
   HTTP status; chunk shapes stay identical to M6;
-* bounded repair policy — one retry when a ``required`` turn yields no
-  envelope or when an envelope is malformed/truncated; the retry prompt
-  carries a STATIC hint; the fallback after exhaustion is honest text;
-  multi-attempt turns invalidate the backend link after committing;
+* bounded repair policy — since ADR-035 every tool-enabled turn that
+  ends without a valid envelope gets ONE repair retry (marker-less
+  mid-loop text included, under the ``no_envelope`` label); the retry
+  prompt carries a STATIC hint; the fallback after exhaustion is honest
+  text; multi-attempt turns invalidate the backend link after
+  committing;
 * history validation — lenient (ADR-023): orphan tool results compile
   as-is (tool name ``unknown``, id verbatim) and findings are logged,
   never rejected.
@@ -284,6 +286,9 @@ class TestBoundedRepairPolicy:
                 fake_text_turn("I can just answer directly."),
                 _envelope_turn(arguments='{"file_path":"b.py"}'),
                 fake_text_turn("done"),
+                # ADR-035: the follow-up's plain answer pays one bounded
+                # retry and repeats itself.
+                fake_text_turn("done"),
             ]
         )
         client = _client(backend)
@@ -468,13 +473,20 @@ class TestBoundedRepairPolicy:
         assert call["function"]["name"] == "read_file"
         assert call["function"]["arguments"] == '{"file_path":"src/main.py"}'
 
-    def test_mid_loop_plain_text_does_not_repair(self) -> None:
-        # ADR-029: once the history carries an assistant tool call the
-        # turn is MID-loop — a text answer is presumed the legitimate
-        # FINAL answer and must NOT be repaired (loop termination must
-        # stay possible on tool-carrying turns).
+    def test_mid_loop_plain_text_pays_one_bounded_repair_then_flushes(self) -> None:
+        # ADR-035 (supersedes the ADR-029 termination guard): a
+        # marker-less text answer mid-loop gets the ONE bounded repair
+        # retry too — live record 90 proved such prose is often a
+        # broken tool request, not a final answer. A genuine final
+        # answer answers plainly again (the hint permits it) and its
+        # second-attempt text flushes: termination is preserved by the
+        # budget, not by skipping the retry.
         backend = FakeBackend(
-            turns=[_envelope_turn(), fake_text_turn("The final answer.")]
+            turns=[
+                _envelope_turn(),
+                fake_text_turn("The final answer."),
+                fake_text_turn("The final answer."),
+            ]
         )
         client = _client(backend)
         first = client.post(
@@ -495,17 +507,23 @@ class TestBoundedRepairPolicy:
             ),
             headers=AUTH,
         ).json()
-        # Exactly ONE inference for the final answer — no repair retry,
-        # and the delta-reuse link stayed intact.
-        assert len(backend.turn_calls) == 2
+        # Two inferences for the final answer turn (ADR-035): attempt 1
+        # flushed plain text, the bounded retry repeated it, and the
+        # second-attempt text is what reaches the client.
+        assert len(backend.turn_calls) == 3
         assert second["choices"][0]["finish_reason"] == "stop"
         assert second["choices"][0]["message"]["content"] == "The final answer."
         assert REPAIR_HINT_MARKER not in backend.turn_calls[1].prompt
+        assert REPAIR_HINT_MARKER in backend.turn_calls[2].prompt
         assert len(backend.sessions_created) == 1
 
-    def test_valid_envelope_first_attempt_keeps_the_link(self) -> None:
+    def test_mid_loop_text_retry_reuses_the_delta_prompt(self) -> None:
         backend = FakeBackend(
-            turns=[_envelope_turn(), fake_text_turn("The file prints hello.")]
+            turns=[
+                _envelope_turn(),
+                fake_text_turn("The file prints hello."),
+                fake_text_turn("The file prints hello."),
+            ]
         )
         client = _client(backend)
         first = client.post(
@@ -529,9 +547,16 @@ class TestBoundedRepairPolicy:
             headers=AUTH,
         )
         assert second.status_code == 200
-        # Single-attempt turns keep the M6 behavior: same session, delta.
+        # ADR-035: the mid-loop text turn pays ONE bounded retry, but
+        # its FIRST attempt still got the M6 delta prompt (no full
+        # rebuild), and the retry reuses that same delta prompt + hint.
         assert len(backend.sessions_created) == 1
+        assert len(backend.turn_calls) == 3
         assert "[user]\nRead src/main.py" not in backend.turn_calls[1].prompt
+        assert backend.turn_calls[2].prompt.startswith(
+            backend.turn_calls[1].prompt
+        )
+        assert REPAIR_HINT_MARKER in backend.turn_calls[2].prompt
 
     def test_repair_failure_answers_with_http_status(self) -> None:
         failure = BackendFailure(
@@ -650,6 +675,11 @@ class TestMultiCycleLoop:
                     TextDelta("The bug was an off-by-one in the loop bound."),
                     MessageFinished("stop"),
                 ],
+                # ADR-035: the final answer turn pays ONE bounded repair
+                # retry and repeats the answer, which then flushes.
+                fake_text_turn(
+                    "The bug was an off-by-one in the loop bound."
+                ),
             ]
         )
         client = _client(backend)
@@ -697,10 +727,12 @@ class TestMultiCycleLoop:
             == "The bug was an off-by-one in the loop bound."
         )
 
-        # Four inferences, one session: no repair happened, so the M4/M6
-        # delta reuse stayed intact across the whole loop.
-        assert len(backend.turn_calls) == 4
+        # Five inferences, one session: the three tool cycles needed no
+        # repair, so the M4/M6 delta reuse stayed intact across the loop;
+        # the final answer turn pays the ONE bounded retry (ADR-035).
+        assert len(backend.turn_calls) == 5
         assert len(backend.sessions_created) == 1
+        assert REPAIR_HINT_MARKER in backend.turn_calls[4].prompt
         # Every delta prompt resolved its tool result to the RIGHT tool
         # name through the persistent ID index (never "unknown"), with
         # the id preserved verbatim.
@@ -740,7 +772,11 @@ class TestLenientHistoryValidation:
     def test_orphan_tool_result_compiles_as_unknown_and_is_logged(
         self, caplog
     ) -> None:
-        backend = FakeBackend(turns=[fake_text_turn("done")])
+        # ADR-035: the mid-loop plain answer pays one bounded retry and
+        # repeats itself (second scripted turn).
+        backend = FakeBackend(
+            turns=[fake_text_turn("done"), fake_text_turn("done")]
+        )
         client = _client(backend)
         messages = [
             {"role": "user", "content": "go"},
@@ -783,7 +819,15 @@ class TestLenientHistoryValidation:
         )
 
     def test_clean_tool_history_logs_nothing(self, caplog) -> None:
-        backend = FakeBackend(turns=[_envelope_turn(), fake_text_turn("done")])
+        # ADR-035: the mid-loop plain answer pays one bounded retry and
+        # repeats itself (third scripted turn).
+        backend = FakeBackend(
+            turns=[
+                _envelope_turn(),
+                fake_text_turn("done"),
+                fake_text_turn("done"),
+            ]
+        )
         client = _client(backend)
         first = client.post(
             "/v1/chat/completions",

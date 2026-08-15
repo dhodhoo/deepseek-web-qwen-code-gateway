@@ -7,12 +7,18 @@ conversation manager can compile per-turn deltas through the exact same
 code path (ADR-020). ``compile_messages_to_prompt`` keeps its M2 behavior.
 
 Extended in M6 (ADR-023): tool-shaped messages compile instead of being
-rejected — assistant ``tool_calls`` render as ``[assistant tool call]``
-blocks and ``role=tool`` messages as ``[tool result]`` blocks
+rejected — assistant ``tool_calls`` render as history blocks and
+``role=tool`` messages as ``[tool result]`` blocks
 (docs/TOOL_CALLING_PROTOCOL.md). Arguments are normalized to canonical
 compact JSON on the way in, so the client's re-sent history round-trips
 through structural equality. Null-content assistant messages remain
 rejected UNLESS they carry tool_calls.
+
+Re-pinned post-M8 (ADR-034): assistant ``tool_calls`` now render
+byte-identical to the CONTROL ENVELOPE the model is instructed to emit
+(the pre-ADR-034 ``[assistant tool call]`` blocks were copied verbatim
+by the model as prose simulations — live evidence 2026-08-14/15). The
+``[tool result]`` rendering is unchanged.
 """
 
 from __future__ import annotations
@@ -28,6 +34,8 @@ from app.prompt_compiler import (
     extract_text,
     messages_to_canonical,
 )
+from app.tool_envelope import parse_envelope_from_text
+from app.tools import CanonicalTool
 
 
 def _msg(role: str, content=None, **extra) -> ChatMessage:
@@ -140,8 +148,9 @@ class TestCompileMessages:
         ) == (
             "[user]\nhi\n\n"
             "[assistant]\nthinking\n\n"
-            "[assistant tool call]\nid: call_1\ntool: run\n"
-            'arguments: {"cmd":"ls"}'
+            "<<<DSQG_TOOL_CALL>>>\n"
+            '{"name":"run","arguments":{"cmd":"ls"}}\n'
+            "<<<DSQG_END_TOOL_CALL>>>"
         )
 
     def test_tool_result_resolves_its_name_from_the_assistant_call(self) -> None:
@@ -161,7 +170,9 @@ class TestCompileMessages:
                 _msg("tool", "done", tool_call_id="call_1"),
             ]
         ) == (
-            "[assistant tool call]\nid: call_1\ntool: run\narguments: {}\n\n"
+            "<<<DSQG_TOOL_CALL>>>\n"
+            '{"name":"run","arguments":{}}\n'
+            "<<<DSQG_END_TOOL_CALL>>>\n\n"
             "[tool result]\nid: call_1\ntool: run\n"
             "result:\ndone\n[end tool result]"
         )
@@ -372,7 +383,42 @@ class TestCompileCanonical:
         ) == "[tool result]\nid: c1\ntool: unknown\nresult:\nr\n[end tool result]"
         assert compile_canonical_to_prompt(
             [CanonicalMessage(role="assistant", content=None, tool_calls=(call,))]
-        ) == "[assistant tool call]\nid: c1\ntool: run\narguments: {}"
+        ) == (
+            "<<<DSQG_TOOL_CALL>>>\n"
+            '{"name":"run","arguments":{}}\n'
+            "<<<DSQG_END_TOOL_CALL>>>"
+        )
+
+    def test_history_envelope_is_itself_a_valid_envelope(self) -> None:
+        # ADR-034 core property: history tool calls render byte-identical
+        # to the envelope the model is instructed to emit, so imitating
+        # the history IS a valid tool request. The compiled block must
+        # parse as a valid envelope for the very tool it names, with no
+        # leftover visible text.
+        call = CanonicalToolCall(
+            id="c1", function_name="run", arguments_json='{"cmd":"ls"}'
+        )
+        prompt = compile_canonical_to_prompt(
+            [
+                CanonicalMessage(
+                    role="assistant", content=None, tool_calls=(call,)
+                )
+            ]
+        )
+        tool = CanonicalTool(
+            name="run",
+            description="",
+            schema={
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+            },
+        )
+        text_parts, emitted = parse_envelope_from_text(prompt, [tool])
+        assert emitted is not None
+        assert emitted.name == "run"
+        assert emitted.arguments_json == '{"cmd":"ls"}'
+        assert text_parts == []
 
     def test_null_content_assistant_without_tool_calls_still_rejected(self) -> None:
         with pytest.raises(

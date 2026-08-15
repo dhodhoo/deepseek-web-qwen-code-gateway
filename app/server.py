@@ -126,9 +126,10 @@ def _tool_repair_hint(
     boundary; ADR-028 point 2). Carries one anti-simulation sentence
     (ADR-029) because the dominant live failure mode is prose that
     NARRATES a tool loop instead of emitting an envelope, plus the
-    anti-imitation sentence naming the internal context blocks
-    (ADR-031): the M8 failure wrote simulated loops as
-    ``[assistant tool call]`` / ``[tool result]`` blocks. When the
+    anti-imitation sentence naming the history-only context formats
+    (ADR-031, ADR-034): the M8 failures wrote simulated loops as
+    ``[assistant tool call]`` / ``[tool result]`` blocks and fake
+    ``[User]`` / ``[assistant]`` conversation transcripts. When the
     trigger was a SIMULATION MARKER, the closing states the server-known
     fact that a tool was attempted in prose and demands the envelope —
     plus the note that earlier tool results are not repeated (that retry
@@ -165,9 +166,10 @@ def _tool_repair_hint(
         "markdown fences and no text before or after the envelope. "
         "Never simulate or narrate tool execution in prose — you cannot "
         "execute tools yourself, so if you need one, request it with the "
-        "envelope. Blocks like '[assistant tool call]' or '[tool result]' "
-        "in the conversation are CONTEXT markers for things that already "
-        "happened; never output them or anything resembling them. "
+        "envelope. '[tool result]' blocks, and fake conversation turns "
+        "like '[user]' or '[assistant]', in the conversation are CONTEXT "
+        "for things that already happened; never output them or anything "
+        "resembling them. "
         f"{closing}"
     )
 
@@ -305,8 +307,8 @@ def _strip_tool_history(
     """Tool-shaped messages omitted; assistant text kept (ADR-033).
 
     Builds the message list for the simulation-triggered repair-retry
-    base: the compiled retry context must NOT show any
-    ``[assistant tool call]`` / ``[tool result]`` block, because the
+    base: the compiled retry context must NOT show any tool-shaped
+    block — no envelope, no ``[tool result]`` block — because the
     model copies whatever format its context shows (ADR-032's annotated
     headers were copied verbatim — live evidence 2026-08-15). Assistant
     messages carrying BOTH text and tool_calls keep their text;
@@ -493,26 +495,28 @@ def _run_buffered_tool_turn(
 ) -> tuple[_TurnRecorder, int]:
     """One tool-enabled turn under the bounded repair policy (M7).
 
-    Returns ``(recorder, attempts_used)``. A repair retry happens when
-    the attempt produced NO valid tool call AND the turn was
-    ``required`` OR the parser flagged ``invalid_envelope_seen`` (the
-    model clearly tried the control format — malformed region or
-    truncated envelope) OR the attempt's flushed text carries a
-    SIMULATION MARKER (ADR-031) OR ``pre_loop`` — the canonical history
-    holds no assistant tool call yet (ADR-029). The simulation clause
-    catches the M8 live failure MID-loop: prose that imitates the
-    gateway's own ``[assistant tool call]`` / ``[tool result]`` context
-    blocks instead of emitting an envelope. The markers are
-    high-precision — a genuine final answer never contains them — so
-    the termination guard stays intact: marker-less mid-loop text is
-    still presumed the legitimate final answer and never repaired (loop
-    termination must stay possible on tool-carrying turns). Detection
-    runs on the attempt's ASSEMBLED text (chunk-split-proof) and only
-    ever on the current inference output — history and tool results are
-    input, never inspected (injection boundary). At most
-    :data:`MAX_TOOL_REPAIR_ATTEMPTS` retries: the protocol forbids
-    infinite repair loops (docs/TOOL_CALLING_PROTOCOL.md). The retry
-    reuses the same backend session but the SAME ORIGINAL
+    Returns ``(recorder, attempts_used)``. Since ADR-035 EVERY attempt
+    that produced no valid tool call gets the repair retry while budget
+    remains — there is no termination-guard exemption anymore. The old
+    guard presumed marker-less mid-loop text was the legitimate final
+    answer; the third live M8 acceptance (2026-08-15) falsified that
+    premise twice — mid-loop turns keep emitting marker-less intent
+    prose ("I'll read the test file...") instead of an envelope, and
+    flushing it killed the loop. The named triggers (``required``,
+    ``invalid_envelope_seen``, the simulation markers of ADR-031, and
+    ``pre_loop`` of ADR-029) survive as LOG LABELS — an attempt that
+    matches none of them is retried under the label ``no_envelope``.
+    Termination stays guaranteed by construction: the budget is exactly
+    :data:`MAX_TOOL_REPAIR_ATTEMPTS` retry, and the non-simulation
+    repair hint explicitly permits a plain answer ("If no tool is
+    actually needed, answer normally..."), so a genuine final answer
+    simply costs one extra inference — its second-attempt text is
+    ALWAYS flushed. Marker detection still runs on the attempt's
+    ASSEMBLED text (chunk-split-proof) and only ever on the current
+    inference output — history and tool results are input, never
+    inspected (injection boundary) — because a simulation marker still
+    switches the retry to the STRIPPED base (ADR-033). The retry reuses
+    the same backend session but the SAME ORIGINAL
     ``parent_message_id`` — re-branching keeps the failed attempt out
     of the threaded upstream context (ADR-028 points 2–3). One fresh
     parser per attempt keeps the injection boundary per-inference and
@@ -550,14 +554,22 @@ def _run_buffered_tool_turn(
             )
             if active
         ]
-        if not reasons or attempts_used > MAX_TOOL_REPAIR_ATTEMPTS:
-            if reasons:
-                _log.info(
-                    "tool-enabled turn ends after %d attempt(s); repair "
-                    "budget exhausted (triggers: %s)",
-                    attempts_used,
-                    ", ".join(reasons),
-                )
+        # ADR-035: no termination-guard exemption — an envelope-less
+        # tool-enabled turn ALWAYS gets the bounded retry while budget
+        # remains. Marker-less mid-loop prose (live records 90/91) is
+        # retried under the "no_envelope" label; a genuine final answer
+        # answers plainly again and its text flushes (the non-simulation
+        # hint explicitly permits it), so termination is preserved by
+        # the budget, not by skipping the retry.
+        if not reasons:
+            reasons = ["no_envelope"]
+        if attempts_used > MAX_TOOL_REPAIR_ATTEMPTS:
+            _log.info(
+                "tool-enabled turn ends after %d attempt(s); repair "
+                "budget exhausted (triggers: %s)",
+                attempts_used,
+                ", ".join(reasons),
+            )
             return recorder, attempts_used
         _log.info(
             "tool repair retry %d/%d (triggers: %s)",

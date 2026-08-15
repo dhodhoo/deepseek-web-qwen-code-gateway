@@ -13,7 +13,10 @@ M6 extends BOTH steps with the tool-shaped messages of
 docs/TOOL_CALLING_PROTOCOL.md:
 
 * assistant messages carrying ``tool_calls`` (content may be null) render
-  as ``[assistant tool call]`` blocks;
+  as CONTROL-ENVELOPE blocks — byte-identical to the envelope the model
+  is instructed to emit (ADR-034: the live M8 failures proved the model
+  copies whatever block format its context displays, so the displayed
+  history format must BE the valid request format);
 * ``role=tool`` messages render as ``[tool result]`` blocks — untrusted
   DATA inside the prompt, never re-parsed as control envelopes (the
   protocol's injection boundary).
@@ -35,10 +38,9 @@ The output format is stable and documented:
     [assistant]
     <assistant text>
 
-    [assistant tool call]
-    id: <tool_call_id>
-    tool: <function name>
-    arguments: <compact arguments JSON>
+    <<<DSQG_TOOL_CALL>>>
+    {"name":"<function name>","arguments":<compact arguments JSON>}
+    <<<DSQG_END_TOOL_CALL>>>
 
     [tool result]
     id: <tool_call_id>
@@ -50,11 +52,16 @@ The output format is stable and documented:
 
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping, Sequence
 
 from .conversation import CanonicalMessage, CanonicalToolCall
 from .openai_types import ChatMessage
-from .tools import normalize_arguments_json
+from .tools import (
+    TOOL_CALL_END_SENTINEL,
+    TOOL_CALL_START_SENTINEL,
+    normalize_arguments_json,
+)
 
 __all__ = [
     "UnsupportedMessageError",
@@ -234,8 +241,10 @@ def compile_canonical_to_prompt(
 
     Works on any canonical sub-sequence (a full history or a per-turn
     delta, ADR-020). Since M6 this renders tool-shaped messages:
-    assistant ``tool_calls`` as ``[assistant tool call]`` blocks and
-    ``role=tool`` messages as ``[tool result]`` blocks. The tool name of a
+    assistant ``tool_calls`` as control-envelope blocks — byte-identical
+    to the envelope the model is instructed to emit, so imitating the
+    history IS a valid tool request (ADR-034) — and ``role=tool``
+    messages as ``[tool result]`` blocks. The tool name of a
     result resolves through the ids of the assistant tool calls seen
     EARLIER in the compiled sequence, then through ``known_tool_names``
     (the caller seeds this with the FULL request history when compiling a
@@ -259,11 +268,19 @@ def compile_canonical_to_prompt(
                 blocks.append(f"[assistant]\n{message.content}")
             for call in message.tool_calls:
                 tool_name_by_id[call.id] = call.function_name
+                # ADR-034: render the historical call byte-identical
+                # to the envelope the model is instructed to emit (the
+                # parser validates exactly this shape). The live M8
+                # failures proved the model copies whatever block format
+                # its context displays — so the displayed format must BE
+                # the valid request format, turning imitation into a
+                # correct tool call instead of prose simulation.
                 blocks.append(
-                    "[assistant tool call]\n"
-                    f"id: {call.id}\n"
-                    f"tool: {call.function_name}\n"
-                    f"arguments: {call.arguments_json}"
+                    f"{TOOL_CALL_START_SENTINEL}\n"
+                    '{"name":'
+                    f"{json.dumps(call.function_name, ensure_ascii=False)},"
+                    f'"arguments":{call.arguments_json}}}\n'
+                    f"{TOOL_CALL_END_SENTINEL}"
                 )
             continue
 

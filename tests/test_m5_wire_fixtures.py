@@ -241,13 +241,22 @@ class TestToolHistoryTurn:
 
     def test_tool_history_compiles_and_streams_200(self) -> None:
         follow_up = "This file defines and runs a minimal main()."
+        # ADR-035: this is a MID-loop text answer (tools present, tool
+        # history in the messages), so it pays the one bounded repair
+        # retry; attempt 2 repeats the answer and its bytes reach the
+        # stream. The prompt assertions below pin attempt 1.
         backend = FakeBackend(
             turns=[
                 [
                     MessageStarted(),
                     TextDelta(follow_up),
                     MessageFinished("stop"),
-                ]
+                ],
+                [
+                    MessageStarted(),
+                    TextDelta(follow_up),
+                    MessageFinished("stop"),
+                ],
             ]
         )
         client = _client(_settings(), backend)
@@ -263,13 +272,13 @@ class TestToolHistoryTurn:
         assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
 
         prompt = backend.turn_calls[0].prompt
-        # The assistant tool call renders with its id and normalized
-        # arguments; the result renders as DATA under [tool result].
+        # ADR-034: the assistant tool call renders as the control
+        # ENVELOPE itself (byte-identical to the instructed format); the
+        # result renders as DATA under [tool result].
         assert (
-            "[assistant tool call]\n"
-            "id: call_9f1d2c3b4a5e6f70\n"
-            "tool: read_file\n"
-            'arguments: {"file_path":"src/main.py"}' in prompt
+            "<<<DSQG_TOOL_CALL>>>\n"
+            '{"name":"read_file","arguments":{"file_path":"src/main.py"}}\n'
+            "<<<DSQG_END_TOOL_CALL>>>" in prompt
         )
         assert (
             "[tool result]\n"

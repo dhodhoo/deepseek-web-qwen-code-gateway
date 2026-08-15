@@ -79,13 +79,16 @@ def gateway_base_url():
     Scripted turn order (consumed sequentially by the tests below):
     1. non-stream envelope, 2. streamed envelope, 3. envelope for the
     round-trip test's first call, 4. plain follow-up after the tool
-    result comes back as history.
+    result comes back as history, 5. the same answer again — since
+    ADR-035 every envelope-less tool-enabled turn pays ONE bounded
+    repair retry, and the repeated answer flushes.
     """
     backend = FakeBackend(
         turns=[
             _envelope_turn(),
             _chunked_envelope_turn(),
             _envelope_turn(),
+            fake_text_turn("It prints hello."),
             fake_text_turn("It prints hello."),
         ]
     )

@@ -25,15 +25,15 @@ update the fixtures if the real client drifts.
 
 ## Files
 
-Behavior column reflects the CURRENT gateway (M6); the fixtures
-themselves are M5 provenance.
+Behavior column reflects the CURRENT gateway (M6, post-M8 hotfix
+ADR-034); the fixtures themselves are M5 provenance.
 
 | File                                | Shape                                                                                                                                                                                              | Gateway behavior (current, M6)                                                                                                                                                         |
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `agent_turn_stream_with_tools.json` | Agent turn: `stream: true` + `stream_options.include_usage`, non-empty `tools[]`, no `tool_choice` (plain turn)                                                                                    | 200; tools normalized and ENABLED — `[available tools]` instructions appended to the compiled prompt and envelope parsing active (plain-text backend answer stays plain text; ADR-023) |
 | `plain_chat_non_stream.json`        | Side query: explicit `stream: false`, no tools                                                                                                                                                     | 200 non-stream JSON                                                                                                                                                                    |
 | `side_query_respond_in_schema.json` | Structured side query (**traffic-verified**): explicit `stream: false`, `tool_choice: 'required'`, single `respond_in_schema` tool                                                                 | 200 non-stream; tool enabled with the MUST variant of the instructions (ADR-023); a backend answer without an envelope stays honest plain text                                         |
-| `tool_history_turn.json`            | Tool-loop continuation: assistant `tool_calls` (`content: null`, arguments as JSON string) + `role=tool` with content as an ARRAY of text parts                                                    | 200 since M6 — compiled to `[assistant tool call]` / `[tool result]` prompt blocks (was the pinned 400 M6 target in M5)                                                                |
+| `tool_history_turn.json`            | Tool-loop continuation: assistant `tool_calls` (`content: null`, arguments as JSON string) + `role=tool` with content as an ARRAY of text parts                                                    | 200 since M6 — compiled to a control-envelope block / `[tool result]` prompt block (was the pinned 400 M6 target in M5; envelope rendering per ADR-034)                                |
 | `non_standard_extras.json`          | Non-standard fields the client may send (`reasoning_effort`, `enable_thinking`, `thinking`, `chat_template_kwargs`, `preserve_thinking`, `metadata`, `cache_control`, `vl_high_resolution_images`) | 200; lenient parsing, extras ignored                                                                                                                                                   |
 
 Verified wire facts encoded here:
