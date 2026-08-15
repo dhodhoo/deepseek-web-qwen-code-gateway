@@ -21,6 +21,7 @@ changes only in later milestones)::
       "backend_attempts": 6,
       "backend_failures": {"RATE_LIMITED": 2},
       "transport_retries": 2,
+      "session_failovers": 1,
       "tool_turns": 1,
       "tool_repair_retries": 1,
       "tool_repair_budget_exhausted": 0,
@@ -60,6 +61,7 @@ class MetricsCollector:
         self._backend_attempts = 0
         self._backend_failures: dict[str, int] = {}
         self._transport_retries = 0
+        self._session_failovers = 0
         self._tool_turns = 0
         self._tool_repair_retries = 0
         self._tool_repair_budget_exhausted = 0
@@ -104,6 +106,13 @@ class MetricsCollector:
         with self._lock:
             self._transport_retries += 1
 
+    def record_session_failover(self) -> None:
+        """M11 (ADR-038): one session failover ESTABLISHED on another
+        account (counted before the re-run attempt, regardless of that
+        attempt's turn outcome)."""
+        with self._lock:
+            self._session_failovers += 1
+
     # ---------------------------------------------------------------- tools
 
     def record_tool_turn(self) -> None:
@@ -134,6 +143,7 @@ class MetricsCollector:
                 "backend_attempts": self._backend_attempts,
                 "backend_failures": dict(self._backend_failures),
                 "transport_retries": self._transport_retries,
+                "session_failovers": self._session_failovers,
                 "tool_turns": self._tool_turns,
                 "tool_repair_retries": self._tool_repair_retries,
                 "tool_repair_budget_exhausted": self._tool_repair_budget_exhausted,

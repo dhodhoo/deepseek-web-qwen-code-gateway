@@ -740,6 +740,10 @@ class TestApiRouting:
 
     def test_final_429_cools_account_and_rebuild_stays_bound(self) -> None:
         # M9 budget: RATE_LIMITED is retryable → 1 + 2 scripted attempts.
+        # M11 (ADR-038) re-pin: acct-2 is DISABLED, so the failover has
+        # no usable target — the failing request must surface the
+        # ORIGINAL 429 byte-identical (failover is best-effort
+        # transparency; it never changes an error it cannot absorb).
         rate_limited = _failure(BackendErrorCategory.RATE_LIMITED)
         b1 = FakeBackend(
             turns=[
@@ -754,15 +758,14 @@ class TestApiRouting:
         client, router, store = _multi_client(
             [b1, b2], settings=_settings(retry_backoff_seconds=0.0)
         )
+        router.set_enabled("acct-2", False, store)
 
         client.post(
             "/v1/chat/completions", json=_chat([_user("one")]), headers=AUTH
         )
-        client.post(
-            "/v1/chat/completions", json=_chat([_user("beta")]), headers=AUTH
-        )
 
-        # Continuation of A on acct-1 exhausts the budget → final 429.
+        # Continuation of A on acct-1 exhausts the budget → final 429,
+        # unchanged: no usable failover target exists.
         failed = client.post(
             "/v1/chat/completions",
             json=_chat([_user("one"), _assistant("A1"), _user("two")]),
@@ -774,19 +777,28 @@ class TestApiRouting:
         assert rows[0]["state"] == ACCOUNT_COOLDOWN
         assert rows[0]["cooldown_remaining_seconds"] > 0
         assert rows[0]["consecutive_failures"] == 1
+        assert rows[1]["state"] == ACCOUNT_DISABLED
+        # No failover was ESTABLISHED → the marker stays untouched.
+        snapshot = client.app.state.metrics.snapshot()
+        assert snapshot["session_failovers"] == 0
         conversation = _conversation_starting_with(store, "one")
         assert conversation.backend_session_id is None
         assert conversation.backend_account_id == "acct-1"
 
-        # New conversations route around the cooling account.
-        response = client.post(
+        # New conversations have nowhere to go: acct-1 cools (cooldown
+        # blocks NEW conversations) and acct-2 is disabled → the fleet
+        # no-usable-account error.
+        blocked = client.post(
             "/v1/chat/completions",
             json=_chat([_user("gamma")]),
             headers=AUTH,
         )
-        assert response.json()["choices"][0]["message"]["content"] == "C1"
+        assert blocked.status_code == 429
+        body = blocked.json()["error"]
+        assert body["code"] == "RATE_LIMITED"
+        assert "No usable backend account" in body["message"]
         assert len(b1.sessions_created) == 1
-        assert len(b2.sessions_created) == 2
+        assert len(b2.sessions_created) == 0
 
         # The failed conversation REBUILDS on its bound account (cooldown
         # never disqualifies a sticky-bound rebuild — ADR-037 refinement):
@@ -822,33 +834,33 @@ class TestApiRouting:
         client.post(
             "/v1/chat/completions", json=_chat([_user("one")]), headers=AUTH
         )
-        failed = client.post(
+        # M11 (ADR-038) re-pin: this request no longer surfaces the 401.
+        # The bounded in-request failover records acct-1's consequence
+        # (invalid), establishes ONE session on acct-2, rehydrates the
+        # FULL canonical history there, and re-runs the same turn — the
+        # failing request succeeds transparently.
+        response = client.post(
             "/v1/chat/completions",
             json=_chat([_user("one"), _assistant("A1"), _user("two")]),
             headers=AUTH,
         )
-        assert failed.status_code == 502
-        assert failed.json()["error"]["code"] == "AUTH_INVALID"
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == "R1"
         assert len(b1.turn_calls) == 2  # no retry for the 401-class
         assert _accounts(client)[0]["state"] == ACCOUNT_INVALID
+        # Metrics marker: exactly one established failover.
+        snapshot = client.app.state.metrics.snapshot()
+        assert snapshot["session_failovers"] == 1
+        # The conversation is bound to the failover account (never
+        # migrated back), and the re-run got the FULL history on a
+        # fresh session (parent_message_id reset).
         conversation = _conversation_starting_with(store, "one")
-        assert conversation.backend_session_id is None
-
-        # Next request rebuilds on ANOTHER account with the full
-        # canonical history (the ADR-020 path, no mid-conversation
-        # migration — M11 owns that).
-        retry = client.post(
-            "/v1/chat/completions",
-            json=_chat([_user("one"), _assistant("A1"), _user("two")]),
-            headers=AUTH,
-        )
-        assert retry.status_code == 200
-        assert retry.json()["choices"][0]["message"]["content"] == "R1"
-        rebuild_call = b2.turn_calls[-1]
-        assert rebuild_call.session_id == "fake-session-1"
-        assert "one" in rebuild_call.prompt and "two" in rebuild_call.prompt
         assert conversation.backend_account_id == "acct-2"
         assert conversation.backend_session_id == "fake-session-1"
+        rebuild_call = b2.turn_calls[-1]
+        assert rebuild_call.session_id == "fake-session-1"
+        assert rebuild_call.parent_message_id is None
+        assert "one" in rebuild_call.prompt and "two" in rebuild_call.prompt
 
         # New conversations also avoid the invalid account; the fleet is
         # still healthy overall.
@@ -859,6 +871,7 @@ class TestApiRouting:
         )
         assert response.json()["choices"][0]["message"]["content"] == "B1"
         assert len(b1.sessions_created) == 1
+        assert len(b2.sessions_created) == 2
         assert client.get("/health").json()["ok"] is True
 
     def test_all_accounts_unusable_maps_429_or_502(self) -> None:

@@ -60,16 +60,25 @@ class FakeBackend(LLMBackend):
     def __init__(
         self,
         turns: Sequence[Sequence[BackendEvent | BaseException]] | None = None,
+        create_failures: Sequence[BaseException] | None = None,
     ) -> None:
         """``turns``: one scripted turn per upcoming ``stream_turn`` call.
 
         Each turn is a sequence of normalized events to yield in order;
         a ``BaseException`` instance in the sequence is raised at that point
         (use :class:`BackendFailure` to exercise the error taxonomy).
+
+        ``create_failures`` (M11, ADR-038): an optional queue of exceptions
+        consumed by ``create_session`` — the NEXT queued exception is raised
+        instead of creating a session. Default ``None`` keeps the exact
+        pre-M11 always-succeed behavior.
         """
         self._turns: list[list[BackendEvent | BaseException]] = [
             list(turn) for turn in (turns or [])
         ]
+        self._create_failures: list[BaseException] = list(
+            create_failures or []
+        )
         #: Every stream_turn call, in order (for assertions).
         self.turn_calls: list[TurnCall] = []
         #: Every session created, in order.
@@ -83,6 +92,9 @@ class FakeBackend(LLMBackend):
     # -------------------------------------------------------------- session
 
     def create_session(self) -> BackendSession:
+        if self._create_failures:
+            # M11 (ADR-038): scripted session-creation failure (consumed).
+            raise self._create_failures.pop(0)
         session = BackendSession(
             session_id=f"fake-session-{len(self.sessions_created) + 1}"
         )

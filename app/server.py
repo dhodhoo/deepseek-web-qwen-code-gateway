@@ -41,6 +41,15 @@ New conversations — or conversations whose backend link was invalidated
 after a failure — create a fresh backend session and rebuild the prompt
 from the request's FULL history. Canonical history advances only when a
 turn finishes (``MessageFinished``); partial turns never touch it.
+
+M11 (ADR-038) session failover: a FINAL consequence-bearing pre-byte
+backend failure (401- or 429-class — the account-scoped categories)
+triggers exactly ONE bounded failover attempt: a fresh session is
+established on another usable account, the request's FULL canonical
+history is rehydrated into the prompt, and the same turn re-runs there.
+When another usable account exists the failing request succeeds
+transparently; otherwise the ORIGINAL error surfaces byte-identical.
+Mid-stream failures (after any response byte) never fail over.
 """
 
 from __future__ import annotations
@@ -56,8 +65,8 @@ from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
-from .accounts import ACCOUNT_INVALID, AccountRouter
-from .backends.base import LLMBackend
+from .accounts import ACCOUNT_INVALID, AccountRecord, AccountRouter
+from .backends.base import BackendSession, LLMBackend
 from .backends.errors import BackendErrorCategory, BackendFailure
 from .backends.events import (
     BackendError,
@@ -117,6 +126,18 @@ _log = logging.getLogger("dsqg.server")
 #: i.e. at most two backend calls per turn. The protocol demands the bound
 #: ("Avoid infinite repair loops", docs/TOOL_CALLING_PROTOCOL.md).
 MAX_TOOL_REPAIR_ATTEMPTS = 1
+
+#: M11 (ADR-038): the consequence-bearing failure categories — exactly
+#: the two ACCOUNT-SCOPED conditions for which another account is a
+#: genuinely different upstream identity (401-class dead credential,
+#: 429-class per-account quota window). Every other category is
+#: fleet-wide evidence on the shared DeepSeek upstream: the M9
+#: transport retry absorbs its transient shapes, and failing over
+#: during a global outage would only double the upstream load.
+FAILOVER_CATEGORIES = (
+    BackendErrorCategory.AUTH_INVALID,
+    BackendErrorCategory.RATE_LIMITED,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +437,9 @@ def _prepare_turn(
     session is needed, and only among usable accounts (healthy or
     cooldown-expired). A FINAL ``create_session`` failure records the
     selected account's consequence before crossing as an HTTP error
-    through the app-level handler.
+    through the app-level handler — unless M11 (ADR-038) failover
+    establishes ONE session on another usable account first, in which
+    case the request continues transparently on that account.
 
     Matched conversation with a live backend link → reuse its session and
     compile ONLY the trailing delta messages (the upstream session already
@@ -498,38 +521,26 @@ def _prepare_turn(
             # the selected account (401-class → invalid + link release;
             # 429-class → cooldown) before surfacing as the mapped error.
             router.record_failure(account.id, failure.category, store)
-            raise
+            # M11 (ADR-038): on a consequence-bearing category, ONE
+            # bounded failover may still establish a session on another
+            # usable account; otherwise the ORIGINAL failure surfaces
+            # byte-identical (failover is best-effort transparency).
+            if failure.category not in FAILOVER_CATEGORIES:
+                raise
+            established = _failover_session(request, account.id, failure)
+            if established is None:
+                raise
+            account, session = established
         session_id = session.session_id
         parent_message_id = None
         prompt_messages = canonical
 
-    # M6/M7: when compiling a DELTA, the assistant tool call a tool
-    # result belongs to may stay in stored state — seed the name map from
-    # the request's FULL canonical history so results never degrade to
-    # "unknown" on the delta path. M7: through the persistent tool-call
-    # ID index (ADR-028 point 4), which also backs history validation.
-    known_tool_names = {
-        call_id: call.function_name
-        for call_id, call in tool_call_index(canonical).items()
-    }
-    prompt = compile_canonical_to_prompt(prompt_messages, known_tool_names)
-    if tool_instructions is not None:
-        prompt = f"{prompt}\n\n{tool_instructions}"
-    # ADR-033: the simulation-triggered repair retry is rebuilt on a
-    # STRIPPED compilation — tool-shaped messages omitted entirely — so
-    # the retry context presents NO imitable block template (the model
-    # copies whatever format its context shows; ADR-032's annotated
-    # headers were copied verbatim, live evidence 2026-08-15). The
-    # stripped shape is exactly the empirically reliable pre-loop turn:
-    # text blocks + tool instructions. If stripping leaves nothing, the
-    # retry falls back to the original prompt. Tool-disabled turns have
-    # no retry base at all.
-    retry_base = None
-    if tool_instructions is not None:
-        retry_messages = _strip_tool_history(prompt_messages)
-        if retry_messages:
-            retry_base = compile_canonical_to_prompt(retry_messages)
-            retry_base = f"{retry_base}\n\n{tool_instructions}"
+    # M6/M7 + ADR-033 compilation, shared byte-for-byte with the M11
+    # failover rehydration (see _compile_turn): the two compilation
+    # sites can never drift apart.
+    prompt, retry_base = _compile_turn(
+        prompt_messages, canonical, tool_instructions
+    )
     context = _TurnContext(
         store=store,
         backend_type=router.backend_type,
@@ -592,6 +603,157 @@ def _fail_turn(context: _TurnContext, failure: BackendFailure) -> None:
         context.router.record_failure(
             context.account_id, failure.category, context.store
         )
+
+
+# ---------------------------------------------------------------------------
+# M11 (ADR-038): bounded in-request session failover + canonical rehydration
+# ---------------------------------------------------------------------------
+
+
+def _compile_turn(
+    messages: Sequence[CanonicalMessage],
+    canonical: list[CanonicalMessage],
+    tool_instructions: str | None,
+) -> tuple[str, str | None]:
+    """Compile ``(prompt, retry_base)`` for one turn (byte-pinned paths).
+
+    ``messages`` are the turn's prompt messages — the trailing delta on
+    the session-reuse path, the request's FULL history on every rebuild
+    (ADR-020) and on every M11 failover rehydration. ``canonical`` is
+    the request's full canonical history, the SOLE source of the known
+    tool-name index.
+
+    M6/M7: when compiling a DELTA, the assistant tool call a tool
+    result belongs to may stay in stored state — seed the name map from
+    the request's FULL canonical history so results never degrade to
+    "unknown" on the delta path. M7: through the persistent tool-call
+    ID index (ADR-028 point 4), which also backs history validation.
+
+    Shared by :func:`_prepare_turn` and the failover rehydration
+    (:func:`_attempt_with_failover`) so the two compilations can never
+    drift. The ADR-033 retry base is a STRIPPED recompilation of the
+    SAME prompt messages — every tool-shaped message omitted — and
+    exists only for tool-enabled turns (``None`` otherwise).
+    """
+    known_tool_names = {
+        call_id: call.function_name
+        for call_id, call in tool_call_index(canonical).items()
+    }
+    prompt = compile_canonical_to_prompt(messages, known_tool_names)
+    if tool_instructions is not None:
+        prompt = f"{prompt}\n\n{tool_instructions}"
+    retry_base = None
+    if tool_instructions is not None:
+        retry_messages = _strip_tool_history(messages)
+        if retry_messages:
+            retry_base = compile_canonical_to_prompt(retry_messages)
+            retry_base = f"{retry_base}\n\n{tool_instructions}"
+    return prompt, retry_base
+
+
+def _failover_session(
+    request: Request,
+    from_account_id: str | None,
+    failure: BackendFailure,
+) -> tuple[AccountRecord, BackendSession] | None:
+    """Establish ONE failover session on another usable account (M11).
+
+    ADR-038: selection runs AFTER the failed account's consequence was
+    recorded — invalid (401-class) or cooling (429-class) — so it can
+    never re-pick that account. Returns ``(account, session)`` with the
+    ``session_failovers`` metrics marker recorded and one secret-free
+    log line emitted. Returns ``None`` when failover cannot establish:
+    no usable account remains, or the failover account's session
+    creation failed FINALLY (its consequence recorded too). Never
+    raises — failover is best-effort transparency: when it cannot
+    establish, the caller surfaces the ORIGINAL failure byte-identically.
+    """
+    router: AccountRouter = request.app.state.router
+    store: ConversationStore = request.app.state.store
+    metrics: MetricsCollector | None = request.app.state.metrics
+    policy: RetryPolicy = request.app.state.retry_policy
+    try:
+        account = router.select_for_new_conversation(store)
+    except BackendFailure:
+        return None
+    try:
+        session = with_transport_retry(
+            account.backend.create_session,
+            policy=policy,
+            on_retry=_make_on_retry(policy),
+            metrics=metrics,
+        )
+    except BackendFailure as create_failure:
+        router.record_failure(account.id, create_failure.category, store)
+        return None
+    if metrics is not None:
+        metrics.record_session_failover()
+    _log.info(
+        "session failover: account %s -> %s (category=%s)",
+        from_account_id,
+        account.id,
+        failure.category.value,
+    )
+    return account, session
+
+
+def _attempt_with_failover(
+    request: Request,
+    context: _TurnContext,
+    prompt: str,
+    retry_base: str | None,
+    canonical: list[CanonicalMessage],
+    tool_instructions: str | None,
+    run,
+):
+    """One PRE-byte turn attempt under the bounded M11 failover wrap.
+
+    ``run(context, prompt, retry_base)`` executes the attempt (it may
+    raise ``BackendFailure``). On a FINAL consequence-bearing failure
+    (the M9 budget already absorbed the transient ones) the M10
+    consequence is recorded, ONE failover session is established on
+    another usable account, the request's FULL canonical history is
+    REHYDRATED into the prompt (identical rebuild compilation — tool
+    history/IDs preserved by construction, ADR-038 point 3), and the
+    same attempt re-runs there with ``parent_message_id=None`` on the
+    fresh session.
+
+    Failover never chains and never changes an error it cannot absorb:
+    an establishment failure surfaces the ORIGINAL error byte-identical
+    (best-effort transparency); a re-run failure surfaces ITSELF with
+    the failover account's consequence recorded (the latest truth).
+    Non-consequence categories surface unchanged. Mid-stream failures
+    never reach this wrap (ADR-036 committed-stream rule).
+    """
+    try:
+        return run(context, prompt, retry_base)
+    except BackendFailure as failure:
+        _fail_turn(context, failure)
+        if failure.category not in FAILOVER_CATEGORIES:
+            raise
+        established = _failover_session(request, context.account_id, failure)
+        if established is None:
+            raise
+        account, session = established
+        new_context = _TurnContext(
+            store=context.store,
+            backend_type=context.backend_type,
+            incoming=canonical,
+            conversation=context.conversation,
+            session_id=session.session_id,
+            parent_message_id=None,
+            account_id=account.id,
+            backend=account.backend,
+            router=context.router,
+        )
+        new_prompt, new_retry_base = _compile_turn(
+            canonical, canonical, tool_instructions
+        )
+        try:
+            return run(new_context, new_prompt, new_retry_base)
+        except BackendFailure as rerun_failure:
+            _fail_turn(new_context, rerun_failure)
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -809,8 +971,60 @@ def _finish_tool_turn(
         context.store.invalidate_backend_link(conversation)
 
 
+def _run_tool_turn_with_failover(
+    request: Request,
+    context: _TurnContext,
+    prompt: str,
+    tools: Sequence[CanonicalTool],
+    *,
+    required: bool,
+    pre_loop: bool,
+    retry_base: str | None,
+    canonical: list[CanonicalMessage],
+    tool_instructions: str | None,
+    policy: RetryPolicy,
+    metrics: MetricsCollector | None,
+) -> _TurnRecorder:
+    """One buffered tool-enabled turn under the M11 failover wrap.
+
+    The whole buffered turn (repair policy + transport retries included)
+    is PRE-byte, so its FINAL consequence-bearing failure is a failover
+    site (ADR-038): the wrap records the consequence, establishes ONE
+    session on another usable account, rehydrates the full canonical
+    history, and re-runs the same turn there. The successful attempt's
+    context is committed by :func:`_finish_tool_turn` INSIDE the run —
+    a failover re-run therefore binds the conversation to the failover
+    account (ADR-038 point 4).
+    """
+
+    def _run(ctx: _TurnContext, pr: str, rb: str | None) -> _TurnRecorder:
+        recorder, attempts_used = _run_buffered_tool_turn(
+            ctx.backend,
+            ctx,
+            pr,
+            tools,
+            required=required,
+            pre_loop=pre_loop,
+            retry_base=rb,
+            policy=policy,
+            metrics=metrics,
+        )
+        _finish_tool_turn(ctx, recorder, attempts_used)
+        return recorder
+
+    return _attempt_with_failover(
+        request,
+        context,
+        prompt,
+        retry_base,
+        canonical,
+        tool_instructions,
+        _run,
+    )
+
+
 def _start_buffered_tool_stream(
-    backend_: LLMBackend,
+    request: Request,
     context: _TurnContext,
     cfg: GatewaySettings,
     prompt: str,
@@ -818,36 +1032,40 @@ def _start_buffered_tool_stream(
     *,
     required: bool,
     pre_loop: bool,
-    retry_base: str | None = None,
+    retry_base: str | None,
+    canonical: list[CanonicalMessage],
+    tool_instructions: str | None,
     policy: RetryPolicy,
     metrics: MetricsCollector | None = None,
 ) -> StreamingResponse:
     """SSE response for a tool-enabled turn (M7 buffered path, ADR-028).
 
-    The turn — including any bounded repair retry — runs to completion
-    BEFORE the response starts, so every failure is pre-response and
-    answers with a real HTTP status (the Qwen Code client keys retries
-    off status; docs/UPSTREAM_NOTES.md), and no envelope fragment can
-    leak partially. The buffered outcome is re-emitted through the
-    unchanged M3/M6 SSE renderer.
+    The turn — including any bounded repair retry and the M11 failover —
+    runs to completion BEFORE the response starts, so every failure is
+    pre-response and answers with a real HTTP status (the Qwen Code
+    client keys retries off status; docs/UPSTREAM_NOTES.md), and no
+    envelope fragment can leak partially. The buffered outcome is
+    re-emitted through the unchanged M3/M6 SSE renderer.
     """
     try:
-        recorder, attempts_used = _run_buffered_tool_turn(
-            backend_,
+        recorder = _run_tool_turn_with_failover(
+            request,
             context,
             prompt,
             tools,
             required=required,
             pre_loop=pre_loop,
             retry_base=retry_base,
+            canonical=canonical,
+            tool_instructions=tool_instructions,
             policy=policy,
             metrics=metrics,
         )
     except BackendFailure as failure:
-        _fail_turn(context, failure)
+        # Consequences were already recorded inside the failover wrap
+        # (_fail_turn per attempt); only the status mapping happens here.
         status, error_body = backend_failure_to_response(failure)
         raise GatewayHttpError(status, error_body) from failure
-    _finish_tool_turn(context, recorder, attempts_used)
     # M9 (ADR-036): the synthesized stream always carries a terminal
     # marker (strict terminal), so it is never empty and never degenerate.
     events = _synthesized_events(recorder)
@@ -928,12 +1146,14 @@ def _observed_events(events, *, context: _TurnContext, recorder: _TurnRecorder):
 
 
 def _start_stream_response(
-    backend_: LLMBackend,
+    request: Request,
     context: _TurnContext,
     cfg: GatewaySettings,
     prompt: str,
     parser: EnvelopeParser | None = None,
     *,
+    canonical: list[CanonicalMessage],
+    tool_instructions: str | None = None,
     policy: RetryPolicy,
     metrics: MetricsCollector | None = None,
 ) -> StreamingResponse:
@@ -954,57 +1174,73 @@ def _start_stream_response(
     the bounded transport retry — each attempt builds a FRESH pipeline
     (fresh recorder, fresh backend generator), so a retryable pre-byte
     failure (rate limit, network, zero-event/first-event truncation)
-    re-issues the turn before any status goes out. Mid-stream failures
-    (after HTTP 200 is committed) are never retried; they become an
+    re-issues the turn before any status goes out. M11 (ADR-038):
+    priming is a failover SITE — the whole priming attempt (transport
+    retries + first-event error included) sits inside the bounded
+    failover wrap, so a FINAL consequence-bearing priming failure can
+    re-run on another account's fresh session with the full canonical
+    history rehydrated. Mid-stream failures (after HTTP 200 is
+    committed) are NEVER retried and never fail over; they become an
     in-stream error envelope instead (app/streaming.py, ADR-019) — same
     contract when the strict-terminal guard fires on a truncated stream.
 
     Note: the route only ever passes ``parser=None`` (tool-enabled turns
-    use the buffered path, M7); retried priming therefore never reuses a
-    partially fed parser.
+    use the buffered path, M7); retried or failed-over priming therefore
+    never reuses a partially fed parser.
     """
 
-    def _prime_attempt():
-        pipeline = _observed_events(
-            _strict_terminal(
-                _tool_aware_events(
-                    backend_.stream_turn(
-                        context.session_id,
-                        prompt,
-                        parent_message_id=context.parent_message_id,
-                    ),
-                    parser,
-                )
-            ),
-            context=context,
-            recorder=_TurnRecorder(),
-        )
-        # A zero-event turn raises the (retryable) truncation failure
-        # from _strict_terminal here — StopIteration can no longer escape
-        # priming, so STREAM_EMPTY is unreachable via the routes (ADR-036).
-        primed = next(pipeline)
-        return pipeline, primed
+    def _attempt(ctx: _TurnContext, pr: str, _rb: str | None):
+        def _prime_attempt():
+            pipeline = _observed_events(
+                _strict_terminal(
+                    _tool_aware_events(
+                        ctx.backend.stream_turn(
+                            ctx.session_id,
+                            pr,
+                            parent_message_id=ctx.parent_message_id,
+                        ),
+                        parser,
+                    )
+                ),
+                context=ctx,
+                recorder=_TurnRecorder(),
+            )
+            # A zero-event turn raises the (retryable) truncation failure
+            # from _strict_terminal here — StopIteration can no longer
+            # escape priming, so STREAM_EMPTY is unreachable via the
+            # routes (ADR-036).
+            primed = next(pipeline)
+            return pipeline, primed
 
-    try:
         events, primed = with_transport_retry(
             _prime_attempt,
             policy=policy,
             on_retry=_make_on_retry(policy),
             metrics=metrics,
         )
-    except BackendFailure as failure:
-        _fail_turn(context, failure)
-        status, error_body = backend_failure_to_response(failure)
-        raise GatewayHttpError(status, error_body) from failure
-    if isinstance(primed, BackendError):
-        # Headers are not committed yet: convert to an HTTP status too.
-        failure = BackendFailure(
-            category=_category_or_internal(primed.kind),
-            message=primed.message,
-            retryable=primed.retryable,
-            status_code=primed.status_code,
+        if isinstance(primed, BackendError):
+            # Headers are not committed yet: raise as BackendFailure so
+            # the failover wrap / status mapping handles it uniformly.
+            raise BackendFailure(
+                category=_category_or_internal(primed.kind),
+                message=primed.message,
+                retryable=primed.retryable,
+                status_code=primed.status_code,
+            )
+        return events, primed
+
+    try:
+        events, primed = _attempt_with_failover(
+            request,
+            context,
+            prompt,
+            None,
+            canonical,
+            tool_instructions,
+            _attempt,
         )
-        _fail_turn(context, failure)
+    except BackendFailure as failure:
+        # Consequences were already recorded inside the failover wrap.
         status, error_body = backend_failure_to_response(failure)
         raise GatewayHttpError(status, error_body) from failure
     return StreamingResponse(
@@ -1302,10 +1538,6 @@ def create_app(
         context, prompt, retry_base = _prepare_turn(
             request, canonical, tool_instructions
         )
-        # M10 (ADR-037): the ROUTED account's backend serves this turn —
-        # sticky for existing sessions, least-active selection for new
-        # ones; account consequences attach on commit/final failure.
-        backend_: LLMBackend = context.backend
 
         if tools_enabled and metrics is not None:
             metrics.record_tool_turn()
@@ -1315,7 +1547,7 @@ def create_app(
                 # M7 (ADR-028): buffered tool turn + bounded repair — the
                 # whole turn completes before any SSE byte is committed.
                 return _start_buffered_tool_stream(
-                    backend_,
+                    request,
                     context,
                     cfg,
                     prompt,
@@ -1323,80 +1555,111 @@ def create_app(
                     required=required,
                     pre_loop=pre_loop,
                     retry_base=retry_base,
+                    canonical=canonical,
+                    tool_instructions=tool_instructions,
                     policy=policy,
                     metrics=metrics,
                 )
             # Tool-disabled streaming stays on the M3 path, plus the M9
-            # bounded transport retry around priming + strict terminal.
+            # bounded transport retry around priming + strict terminal,
+            # and the M11 failover wrap around the priming attempt.
             return _start_stream_response(
-                backend_, context, cfg, prompt, policy=policy, metrics=metrics
+                request,
+                context,
+                cfg,
+                prompt,
+                canonical=canonical,
+                policy=policy,
+                metrics=metrics,
             )
 
         if tools_enabled:
             # M7 (ADR-028): the non-streaming tool path shares the
             # buffered attempt loop — same repair policy, same commit and
-            # link-invalidation rules as the streaming tool path.
+            # link-invalidation rules as the streaming tool path. M11
+            # (ADR-038): the whole turn additionally sits under the
+            # bounded failover wrap.
             try:
-                recorder, attempts_used = _run_buffered_tool_turn(
-                    backend_,
+                recorder = _run_tool_turn_with_failover(
+                    request,
                     context,
                     prompt,
                     tools,
                     required=required,
                     pre_loop=pre_loop,
                     retry_base=retry_base,
+                    canonical=canonical,
+                    tool_instructions=tool_instructions,
                     policy=policy,
                     metrics=metrics,
                 )
             except BackendFailure as failure:
-                _fail_turn(context, failure)
+                # Consequences were recorded inside the failover wrap.
                 status, error_body = backend_failure_to_response(failure)
                 raise GatewayHttpError(status, error_body) from failure
-            _finish_tool_turn(context, recorder, attempts_used)
             finish_reason: str | None = recorder.finish_reason
         else:
             # M9 (ADR-036): the whole non-streaming drain is pre-byte, so
             # it sits inside the bounded transport retry; strict terminal
             # turns a markerless stream into the retryable truncation
-            # failure instead of a fabricated ``stop`` answer.
-            def _plain_attempt() -> _TurnRecorder:
-                local = _TurnRecorder()
-                for event in backend_.stream_turn(
-                    context.session_id,
-                    prompt,
-                    parent_message_id=context.parent_message_id,
-                ):
-                    local.observe(event)
-                    if isinstance(event, BackendError):
-                        # Defensive: current backends raise BackendFailure
-                        # (ADR-011/014); handle the event surface too.
-                        raise BackendFailure(
-                            category=_category_or_internal(event.kind),
-                            message=event.message,
-                            retryable=event.retryable,
-                            status_code=event.status_code,
-                        )
-                    # ReasoningDelta / MessageStarted / BackendMessageId /
-                    # UnknownDelta need no response rendering; the recorder
-                    # keeps whatever canonical state needs (M4).
-                if not local.finished:
-                    raise _truncation_failure()
-                return local
+            # failure instead of a fabricated ``stop`` answer. M11
+            # (ADR-038): the drain is a failover site — a FINAL
+            # consequence-bearing failure re-runs the same turn on
+            # another account's fresh session with the full canonical
+            # history rehydrated, and the commit binds the conversation
+            # to whichever account succeeded.
+            def _attempt(ctx: _TurnContext, pr: str, _rb: str | None):
+                def _plain_attempt() -> _TurnRecorder:
+                    local = _TurnRecorder()
+                    for event in ctx.backend.stream_turn(
+                        ctx.session_id,
+                        pr,
+                        parent_message_id=ctx.parent_message_id,
+                    ):
+                        local.observe(event)
+                        if isinstance(event, BackendError):
+                            # Defensive: current backends raise
+                            # BackendFailure (ADR-011/014); handle the
+                            # event surface too.
+                            raise BackendFailure(
+                                category=_category_or_internal(event.kind),
+                                message=event.message,
+                                retryable=event.retryable,
+                                status_code=event.status_code,
+                            )
+                        # ReasoningDelta / MessageStarted / BackendMessageId /
+                        # UnknownDelta need no response rendering; the
+                        # recorder keeps whatever canonical state needs
+                        # (M4).
+                    if not local.finished:
+                        raise _truncation_failure()
+                    return local
 
-            try:
-                recorder = with_transport_retry(
+                local_recorder = with_transport_retry(
                     _plain_attempt,
                     policy=policy,
                     on_retry=_make_on_retry(policy),
                     metrics=metrics,
                 )
+                if not local_recorder.committed:
+                    _commit_turn(ctx, local_recorder)
+                return local_recorder
+
+            try:
+                recorder = _attempt_with_failover(
+                    request,
+                    context,
+                    prompt,
+                    retry_base,
+                    canonical,
+                    tool_instructions,
+                    _attempt,
+                )
             except BackendFailure as failure:
-                _fail_turn(context, failure)
+                # Consequences were recorded inside the failover wrap.
                 status, error_body = backend_failure_to_response(failure)
                 raise GatewayHttpError(status, error_body) from failure
             finish_reason = recorder.finish_reason
-            if not recorder.committed:
-                _commit_turn(context, recorder)
 
         tool_calls_out = [
             ToolCallOut(
