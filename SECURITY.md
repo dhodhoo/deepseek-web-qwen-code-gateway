@@ -17,6 +17,16 @@ Include:
 
 Never include DeepSeek tokens, gateway keys, cookies, raw prompts, source code, or unredacted diagnostics in a report.
 
+## Service and Terms of Service warning
+
+This project is not affiliated with or endorsed by DeepSeek and does not use the
+official DeepSeek API. It adapts access to `chat.deepseek.com` into an
+unofficial API. Before using the project, review and comply with DeepSeek's
+current Terms of Service, acceptable-use rules, and applicable laws. You are
+responsible for your account, credentials, requests, and any consequences of
+use. Service behavior, availability, and compatibility may change without
+notice.
+
 ## Security boundaries
 
 - Qwen Code executes filesystem, shell, and other coding tools; the gateway does not.

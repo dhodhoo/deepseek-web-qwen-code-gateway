@@ -27,6 +27,8 @@
 
 > [!WARNING]
 > **Experimental / local-first.** Production-ready scope is limited to local/private deployment and controlled LAN use. Direct public-internet exposure is intentionally out of scope. DeepSeek Web access depends on an unofficial private API path and may break or be rate-limited.
+>
+> **Terms of Service:** This project is not affiliated with or endorsed by DeepSeek and does not use the official DeepSeek API. It adapts access to `chat.deepseek.com` into an unofficial API. Review and comply with DeepSeek's current Terms of Service, acceptable-use rules, and applicable laws before using it. You are responsible for your account, credentials, requests, and any consequences of use.
 
 ## At a glance
 
