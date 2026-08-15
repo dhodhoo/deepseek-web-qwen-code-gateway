@@ -42,6 +42,9 @@ __all__ = [
     "CanonicalMessage",
     "Conversation",
     "ConversationStore",
+    "ToolHistoryFindings",
+    "tool_call_index",
+    "validate_tool_history",
 ]
 
 #: The only conversation status in M4. Later milestones may add states
@@ -130,6 +133,75 @@ class CanonicalMessage:
             tool_call_id=data.get("tool_call_id"),
             name=data.get("name"),
         )
+
+
+# ---------------------------------------------------------------------------
+# M7: persistent tool-call ID index + history validation (ADR-028)
+# ---------------------------------------------------------------------------
+
+
+def tool_call_index(
+    messages: Sequence[CanonicalMessage],
+) -> dict[str, CanonicalToolCall]:
+    """Persistent tool-call ID mapping derived from canonical history (M7).
+
+    Maps every assistant tool-call id in the history to its
+    :class:`CanonicalToolCall`; the FIRST occurrence of an id wins
+    (deterministic). Derived per request rather than stored: the index
+    persists across turns because the client re-sends the full history,
+    survives LRU eviction and restarts, and can never drift from the
+    canonical state it indexes (ADR-028 point 4).
+    """
+    index: dict[str, CanonicalToolCall] = {}
+    for message in messages:
+        for call in message.tool_calls or ():
+            index.setdefault(call.id, call)
+    return index
+
+
+@dataclass(frozen=True)
+class ToolHistoryFindings:
+    """Anomalies found by :func:`validate_tool_history` (M7, ADR-028).
+
+    Findings are observability only — the lenient-in policy never rejects
+    a request because of them (ADR-023).
+    """
+
+    #: tool_call_ids of role=tool messages matching no assistant tool call.
+    orphan_tool_results: tuple[str, ...] = ()
+    #: number of role=tool messages without a usable tool_call_id.
+    missing_tool_call_ids: int = 0
+
+    @property
+    def clean(self) -> bool:
+        return not self.orphan_tool_results and not self.missing_tool_call_ids
+
+
+def validate_tool_history(
+    messages: Sequence[CanonicalMessage],
+) -> ToolHistoryFindings:
+    """Check the tool pairing invariant over a canonical history (M7).
+
+    The master prompt's invariant is ``assistant(tool_calls=[call_X]) →
+    tool(tool_call_id=call_X) → next inference``. This reports — never
+    rejects — violations of the PAIRING half: tool results whose id no
+    assistant tool call ever issued, and tool results without an id.
+    A tool call with no result YET is normal mid-loop and not reported.
+    """
+    index = tool_call_index(messages)
+    orphans: list[str] = []
+    missing = 0
+    for message in messages:
+        if message.role != "tool":
+            continue
+        if not message.tool_call_id:
+            missing += 1
+        elif message.tool_call_id not in index:
+            orphans.append(message.tool_call_id)
+    return ToolHistoryFindings(
+        orphan_tool_results=tuple(orphans),
+        missing_tool_call_ids=missing,
+    )
 
 
 # ---------------------------------------------------------------------------

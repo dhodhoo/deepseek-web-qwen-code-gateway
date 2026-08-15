@@ -8,18 +8,23 @@ protocol it uses the official OpenAI Node.js SDK (pinned exactly at
 standards-correct OpenAI Chat Completions API rather than a Qwen-specific
 HTTP protocol.
 
-**Status (M6):** plain chat works end-to-end (live-accepted 2026-08-14, a
-real Qwen Code v0.21.11 install answered through the gateway), and
+**Status (M7):** plain chat works end-to-end (live-accepted 2026-08-14, a
+real Qwen Code v0.21.11 install answered through the gateway),
 **prompt-emulated tool calling is implemented AND live-accepted** (ADR-023):
 the gateway teaches DeepSeek a control-envelope protocol, parses the
 answer, and emits real OpenAI structured `tool_calls`. **M6 acceptance
 PASSED (user-run, 2026-08-15):** real Qwen Code executed a multi-call loop
 of `list_directory` / `read_file` tool calls through the gateway and
-answered from the results. Four post-M6 live bugs found during the first
-attempt were fixed and live-re-verified (ADR-024/025/026/027). The
-verified wire facts live in `docs/UPSTREAM_NOTES.md`; the fixtured request
-shapes live in `tests/fixtures/qwen_code_wire/`; the tool protocol lives
-in `docs/TOOL_CALLING_PROTOCOL.md`.
+answered from the results. **M7 (multi-turn tool loop hardening, ADR-028)
+is IMPLEMENTED and live-probed:** buffered tool turns, one bounded repair
+retry on missing/malformed envelopes, repeated tool-result/model cycles,
+persistent tool-call ids, lenient history validation — the probe ran three
+sequential tool interactions plus a final answer through the real backend
+(first-try, 13.5 s). M7 acceptance is user-run (checklist below). Four
+post-M6 live bugs were fixed and live-re-verified (ADR-024/025/026/027).
+The verified wire facts live in `docs/UPSTREAM_NOTES.md`; the fixtured
+request shapes live in `tests/fixtures/qwen_code_wire/`; the tool protocol
+lives in `docs/TOOL_CALLING_PROTOCOL.md`.
 
 ## Recommended `~/.qwen/settings.json`
 
@@ -116,19 +121,19 @@ http://127.0.0.1:8000/v1/chat/completions
 
 The OpenAI SDK appends the resource path.
 
-## What to expect today (M6)
+## What to expect today (M7)
 
-| Behavior                                                                                                              | Status                                                                                                                                                                                        |
-| --------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Plain chat, streaming (agent turns)                                                                                   | Works — `stream:true` + `stream_options.include_usage` accepted; no usage chunk is emitted (the client tolerates absence)                                                                     |
-| Plain chat, non-streaming (side queries)                                                                              | Works                                                                                                                                                                                         |
-| Multi-turn continuity                                                                                                 | Works — resolved from the request's own history (ADR-020); restart-safe                                                                                                                       |
-| `tools[]` / `tool_choice`                                                                                             | **Prompt-emulated tool calling (M6, ADR-023)** — a valid model envelope becomes structured `tool_calls`; malformed envelopes flush as honest plain text; `tool_choice: "none"` disables tools |
-| Assistant `tool_calls` / `role=tool` history                                                                          | **Accepted and compiled (M6)** — `[assistant tool call]` / `[tool result]` prompt blocks; malformed entries 400 with locations                                                                |
-| Tool call frequency                                                                                                   | One tool call per model turn (M6); repeated cycles, bounded repair and persistent ids arrive in M7                                                                                            |
-| Non-standard extras (`reasoning_effort`, `enable_thinking`, `chat_template_kwargs`, `metadata`, `cache_control`, ...) | Accepted and ignored (lenient parsing)                                                                                                                                                        |
-| `max_tokens` (always sent, possibly huge)                                                                             | Accepted; DeepSeek applies its own upstream limits                                                                                                                                            |
-| Embeddings (`/v1/embeddings`, client hardcodes `text-embedding-ada-002`)                                              | Not implemented — out of core milestones; the endpoint 404s                                                                                                                                   |
+| Behavior                                                                                                              | Status                                                                                                                                                                                                                                        |
+| --------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Plain chat, streaming (agent turns)                                                                                   | Works — `stream:true` + `stream_options.include_usage` accepted; no usage chunk is emitted (the client tolerates absence)                                                                                                                     |
+| Plain chat, non-streaming (side queries)                                                                              | Works                                                                                                                                                                                                                                         |
+| Multi-turn continuity                                                                                                 | Works — resolved from the request's own history (ADR-020); restart-safe                                                                                                                                                                       |
+| `tools[]` / `tool_choice`                                                                                             | **Prompt-emulated tool calling (M6, ADR-023)** — a valid model envelope becomes structured `tool_calls`; `tool_choice: "none"` disables tools; missing/malformed envelopes get ONE bounded repair retry, then honest plain text (M7, ADR-028) |
+| Assistant `tool_calls` / `role=tool` history                                                                          | **Accepted and compiled (M6)** — `[assistant tool call]` / `[tool result]` prompt blocks; malformed entries 400 with locations; orphan tool results compile as-is and log a warning (M7)                                                      |
+| Tool loop                                                                                                             | **Repeated tool-result/model cycles (M7)** — one tool call per model turn; ids persist across turns via an index derived from the re-sent history; live-probed with 3 sequential interactions                                                 |
+| Non-standard extras (`reasoning_effort`, `enable_thinking`, `chat_template_kwargs`, `metadata`, `cache_control`, ...) | Accepted and ignored (lenient parsing)                                                                                                                                                                                                        |
+| `max_tokens` (always sent, possibly huge)                                                                             | Accepted; DeepSeek applies its own upstream limits                                                                                                                                                                                            |
+| Embeddings (`/v1/embeddings`, client hardcodes `text-embedding-ada-002`)                                              | Not implemented — out of core milestones; the endpoint 404s                                                                                                                                                                                   |
 
 ## Wire verification status (M5 — traffic-verified)
 
@@ -167,8 +172,11 @@ assistant(tool_calls=[call_A])
 Never emit orphan tool calls or lose their IDs. Implemented in M6
 (ADR-023): the gateway mints `call_dsqg_<hex>` ids, stores the emitted
 call in canonical history, and compiles re-sent tool history back to
-deterministic prompt blocks. Cross-request persistent id mapping (M7)
-will extend this; today ids round-trip through the client's own history.
+deterministic prompt blocks. M7 (ADR-028) completed this: ids persist
+across turns through an index derived per request from the re-sent
+history (first occurrence wins — no server-side registry), and
+`validate_tool_history` logs (never rejects) orphan results, which
+compile as-is with tool name `unknown`.
 
 ## Plain-text pseudo tool calls
 
@@ -196,7 +204,12 @@ M3/M5 cover the text path (`tests/test_api_streaming.py`,
 `tests/test_m5_sdk_compat.py` parse every emitted chunk through a real
 OpenAI SDK); M6 covers the tool path (`tests/test_m6_api.py`,
 `tests/test_m6_sdk_compat.py` — opener + arguments chunks, finish
-override, honest flush of malformed envelopes).
+override, honest flush of malformed envelopes). Since M7 (ADR-028),
+tool-enabled turns are BUFFERED end-to-end before the first chunk: the
+client sees identical chunk shapes, but first-byte latency equals the
+whole turn, and tool-turn failures arrive as HTTP statuses (never
+mid-stream error envelopes). `tests/test_m7_loop.py` pins the buffered
+shapes and the repair path.
 
 ## Qwen project instructions
 
@@ -281,3 +294,46 @@ structured tool call:
    bounded repair is M7 scope.
 
 Rollback is unchanged: `/model` back to the previous provider.
+
+## M7 acceptance (user-run checklist)
+
+**Status: PENDING.** Gateway side is ready — offline suite 410 passed and
+the live probe ran three sequential tool interactions plus a final answer
+through the real backend first-try (see docs/PROGRESS.md, "M7 LIVE PROBE").
+The exit per ROADMAP M7: **Qwen Code completes at least three sequential
+tool interactions and receives a final answer; the gateway executes none
+of those tools.**
+
+1. `.env` configured as above; start `python -m app.main`; check `/health`.
+   A FRESH Qwen Code session is recommended (fresh conversation = clean
+   tool-history trail).
+2. In Qwen Code: `/model` → DeepSeek Web Gateway.
+3. Give ONE multi-step task that needs at least three tools, e.g. (run
+   inside this repository):
+
+   ```text
+   Tampilkan daftar file di direktori docs, lalu baca docs/ROADMAP.md dan
+   docs/TOOL_CALLING_PROTOCOL.md, kemudian jawab: apa exit criterion
+   milestone M7 dan apa dua sentinel control envelope-nya?
+   ```
+
+   Any task with the same shape works (list + two reads, or
+   list/read/grep in any order). Do NOT pre-attach files with `@` — the
+   point is that the model must request them through tools.
+
+4. Pass criteria:
+   - Qwen Code executes ≥3 sequential tool calls (each shown/confirmed in
+     the UI) and then produces a final answer built from the results;
+   - the gateway executes NONE of those tools — it only translates model
+     decisions into `tool_calls` and compiles the results back (verify in
+     `GATEWAY_DIAGNOSTICS_DIR/requests.jsonl`: alternating assistant
+     `tool_calls` / `role=tool` requests, all with verbatim `call_dsqg_`
+     ids);
+   - no raw sentinel text (`<<<DSQG_TOOL_CALL>>>`) reaches the UI as
+     assistant prose on a tool turn.
+5. If a turn takes noticeably longer than M6 turns: tool-enabled turns
+   are buffered end-to-end (ADR-028), and a turn that needed the bounded
+   repair costs two backend calls. Both are by design; a turn that
+   ultimately answers plain text after a repair still keeps the session
+   usable (the next request self-heals via canonical rebuild if the turn
+   used more than one attempt).

@@ -12,8 +12,10 @@ strategy") over the sentinels defined in :mod:`app.tools`:
       ├─ end sentinel found → validate
       │     ├─ valid → emit ONE ToolCallEmitted, discard later text
       │     └─ invalid → flush the raw region as text (honest), keep
-      │        scanning (M6; the bounded model repair turn arrives in M7)
-      └─ stream ends early → flush the raw region as text
+      │        scanning, set ``invalid_envelope_seen`` (M7: the server's
+      │        bounded repair policy may retry the turn — ADR-028)
+      └─ stream ends early → flush the raw region as text (truncation
+         also sets ``invalid_envelope_seen``)
 
 Guarantees:
 
@@ -104,6 +106,12 @@ class EnvelopeParser:
     :class:`ToolCallEmitted` (the FIRST valid envelope wins; all text after
     a valid envelope is discarded per the protocol's "no text around the
     envelope" rule).
+
+    :attr:`invalid_envelope_seen` (M7, ADR-028) records whether the model
+    clearly TRIED to use the control format but failed it — an invalid
+    region between sentinels, or a truncated envelope at end of stream.
+    The server's bounded repair policy reads it to decide on one repair
+    retry. Plain held-back text never sets it, nor does a valid emission.
     """
 
     def __init__(self, tools: Sequence[CanonicalTool]) -> None:
@@ -113,6 +121,19 @@ class EnvelopeParser:
         #: The validated tool call, once one is emitted.
         self.emitted_call: EmittedToolCall | None = None
         self._done = False
+        self._invalid_envelope_seen = False
+
+    @property
+    def invalid_envelope_seen(self) -> bool:
+        """True once a malformed/truncated envelope was flushed (M7).
+
+        Read-only; set inside :meth:`feed` (invalid region between both
+        sentinels) and :meth:`finalize` (stream ended inside an
+        envelope). Consumed by the server's bounded repair policy
+        (ADR-028 point 2); one fresh parser per attempt keeps the flag
+        scoped to its own inference.
+        """
+        return self._invalid_envelope_seen
 
     # ------------------------------------------------------------------ feed
 
@@ -140,7 +161,10 @@ class EnvelopeParser:
                     outputs.append(ToolCallEmitted(call=call))
                     break
                 # Invalid region: flush it raw (honest — never silently
-                # drop model output) and keep scanning the remainder.
+                # drop model output) and keep scanning the remainder. The
+                # flag tells the server the model attempted the format
+                # (M7 bounded repair trigger, ADR-028).
+                self._invalid_envelope_seen = True
                 outputs.append(
                     TOOL_CALL_START_SENTINEL + content + TOOL_CALL_END_SENTINEL
                 )
@@ -167,12 +191,15 @@ class EnvelopeParser:
         """End of stream: flush whatever is still held back.
 
         A truncated envelope (no end sentinel) is flushed as raw text —
-        the M6 honest fallback (the bounded repair policy arrives in M7).
+        the honest fallback — and flags ``invalid_envelope_seen`` so the
+        server's bounded repair policy (ADR-028) can retry the turn.
         """
         if self._done:
             return []
         outputs: list[Any] = []
         if self._in_envelope:
+            # Stream ended INSIDE an envelope: truncated tool attempt.
+            self._invalid_envelope_seen = True
             outputs.append(TOOL_CALL_START_SENTINEL + self._pending)
         elif self._pending:
             outputs.append(self._pending)

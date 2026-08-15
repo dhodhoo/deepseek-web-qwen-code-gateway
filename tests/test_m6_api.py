@@ -141,10 +141,16 @@ class TestNonStreamToolCallResponse:
 
     def test_unknown_tool_envelope_stays_honest_text(self) -> None:
         # The gateway never fabricates tool calls: an envelope naming a
-        # tool that was not supplied renders as the model's plain text.
+        # tool that was not supplied is never emitted. Since M7
+        # (ADR-028) it also triggers one bounded repair retry (the model
+        # clearly tried the format); when the retry still names an
+        # unknown tool, the honest fallback is the retry's plain text.
         unknown = ENVELOPE_TEXT.replace("read_file", "never_offered")
         backend = FakeBackend(
-            turns=[[MessageStarted(), TextDelta(unknown), MessageFinished("stop")]]
+            turns=[
+                [MessageStarted(), TextDelta(unknown), MessageFinished("stop")],
+                [MessageStarted(), TextDelta(unknown), MessageFinished("stop")],
+            ]
         )
         client = _client(_settings(), backend)
         body = client.post(
@@ -156,6 +162,15 @@ class TestNonStreamToolCallResponse:
         assert choice["finish_reason"] == "stop"
         assert choice["message"]["content"] == unknown
         assert "tool_calls" not in choice["message"]
+        # Exactly one repair retry; its prompt carries the static hint
+        # listing the VALID tool names (never echoed model output).
+        assert len(backend.turn_calls) == 2
+        hint_prompt = backend.turn_calls[1].prompt
+        assert (
+            "did not use the required tool-call control format" in hint_prompt
+        )
+        assert "read_file" in hint_prompt
+        assert "never_offered" not in hint_prompt
 
 
 class TestStreamingToolCallResponse:

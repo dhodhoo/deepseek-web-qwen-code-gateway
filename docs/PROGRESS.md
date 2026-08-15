@@ -4,9 +4,11 @@ The coding agent must update this file after every milestone.
 
 ## Current status
 
-**Current milestone:** M6 — One emulated tool call
+**Current milestone:** M7 — Multi-turn tool loop
 
-**State:** COMPLETE — **M6 ACCEPTANCE PASSED (user-run, 2026-08-15)**. Real Qwen Code v0.21.11 executed structured tool calls through the gateway: a multi-turn loop of `list_directory` / `read_file` calls (7 calls across successive turns, incl. adapting after a permission denial), tool results compiled back, final answers incorporating the results; Qwen Code's background memory agent ran its own tool loop through the same gateway concurrently without issue. The four live bugs from the first attempt are fixed and live-verified (post-M6 hotfix addendum below; ADR-024/025/026/027). Remaining honest wrinkles are recorded in Known limitations (model sometimes answers plain text instead of an envelope — bounded repair is M7 scope). M7 (multi-turn tool loop hardening) not started — awaits explicit instruction.
+**State:** IMPLEMENTED + LIVE-PROBED — **awaiting user-run acceptance**. Offline suite 384 → 410 passed (tests/test*m7_loop.py: bounded repair policy, buffered streaming tool turns, the 3-cycle loop through the real app, persistent id index, lenient history validation — ADR-028). Live probe PASSED (2026-08-15): three sequential tool interactions (`list_directory` → `read_file` → `read_file`) plus a final answer through the real DeepSeek backend, 13.5 s, unique `call_dsqg*` ids round-tripping verbatim, everything first-try on the session-reuse/delta path. M7 exit (ROADMAP): real Qwen Code completes ≥3 sequential tool interactions and receives a final answer while the gateway executes none of those tools — that final step is user-run like every milestone's acceptance (checklist in docs/QWEN_CODE_INTEGRATION.md). M8 not started — awaits explicit instruction.
+
+**Previous milestone:** M6 — One emulated tool call — COMPLETE, **ACCEPTANCE PASSED (user-run, 2026-08-15)**. Real Qwen Code v0.21.11 executed structured tool calls through the gateway: a multi-turn loop of `list_directory` / `read_file` calls (7 calls across successive turns, incl. adapting after a permission denial), tool results compiled back, final answers incorporating the results; Qwen Code's background memory agent ran its own tool loop through the same gateway concurrently without issue. The four live bugs from the first attempt are fixed and live-verified (post-M6 hotfix addendum below; ADR-024/025/026/027).
 
 ## Completed
 
@@ -18,6 +20,7 @@ The coding agent must update this file after every milestone.
 - M4 (2026-08-14): canonical conversation state — bounded in-memory store, history-prefix resolution, backend session reuse, parent-message threading, commit-on-finish + rebuild-on-failure, reconstruction tests.
 - M5 (2026-08-14): real Qwen Code wire compatibility — tools[]/tool_choice accepted and ignored (plain chat usable), opt-in sanitized diagnostic capture layer, source-verified wire fixtures + fixture tests, SDK-driven wire-compat tests, Qwen Code integration/wiring doc.
 - M6 (2026-08-14): one emulated tool call — lenient tools normalization, deterministic [available tools] prompt compiler, strict control-envelope parser (honest plain text on any malformed envelope), tool-shaped history compilation (assistant tool_calls + role=tool), structured OpenAI tool_calls output in both response modes, gateway-minted call_dsqg ids, canonical compact-arguments round trip.
+- M7 (2026-08-15): multi-turn tool loop hardening — buffered tool turns (tool-enabled turns drained fully before any response byte in BOTH response modes; failures pre-response → HTTP status; re-emitted through the unchanged sse_stream so M6 chunk shapes are preserved), bounded repair (≤1 retry per turn with a static hint listing valid tool names — never echoed model output; re-branches on the ORIGINAL parent_message_id), backend-link invalidation after multi-attempt turns (next request rebuilds from canonical — ADR-020 self-heal), persistent tool-call ID index derived per request from canonical history, lenient tool-history validation (log-only, never rejects). ADR-028.
 
 ## Tests run
 
@@ -106,14 +109,49 @@ request-only by design); the model also answered the first question
 as plain text (with a hallucinated shell block) instead of an
 envelope. Both are M7 repair/instrumentation territory, not gateway
 regressions.
+
+M7 suite (2026-08-15):
+.venv\Scripts\python.exe -m pytest -q
+384 -> 410 passed, 3 deselected (live tests excluded by default
+marker). New: tests/test_m7_loop.py (26 tests) — tool_call_index
+(first-occurrence-wins), lenient validate_tool_history, the parser's
+invalid_envelope_seen flag, bounded repair policy (required/optional
+triggers, one-retry cap, static hint never echoing model output,
+re-branch on the original parent_message_id, link invalidation +
+canonical rebuild on the NEXT request, repair-failure -> HTTP 429
+pre-response), buffered streaming tool turns (M6 chunk shapes
+preserved, repair emits only the final outcome, streaming failure ->
+502 before any byte), the 3-cycle loop through the real app with
+FakeBackend (3 sequential tool interactions + final answer, ids
+verbatim, delta prompts resolving tool names/results, canonical
+history 8 messages), lenient history logging (orphan ids, never
+content). Two M5-era fixtures + the M6 unknown-tool test updated to
+repair-then-fallback semantics (scripted plain/malformed models now
+cost exactly two backend calls).
+
+M7 LIVE PROBE (2026-08-15, real DeepSeek backend through the full
+pipeline, stream=true, probe script deleted after use): THREE
+sequential tool interactions on the FIRST TRY — list_directory(docs)
+-> read_file(docs/ROADMAP.md) -> read_file(docs/TOOL_CALLING_PROTOCOL.md)
+-> final answer (stop); 13.5 s total; three unique gateway-minted
+call_dsqg_ ids round-tripping verbatim through role=tool.tool_call_id;
+every tool turn finish_reason=tool_calls; every continuation on the
+session-reuse/delta path (one backend session). The model followed the
+envelope protocol first-try each turn, so bounded repair was NOT
+triggered live — it cannot be forced reliably against a cooperating
+model and stays covered offline. The probe's sentinel "leak" flag was
+a false positive by design: the task asked the model to QUOTE the two
+sentinel strings, so their appearance in the final (stop) answer is
+legitimate content; on tool_calls turns a leak is structurally
+impossible (the parser consumes the envelope).
 ```
 
 ## Known limitations
 
-- **M6 ACCEPTANCE PASSED 2026-08-15 (user-run)** — see the "Tests run" entry for the full capture evidence. Residual wrinkles observed during the acceptance run (all M7 territory, none a gateway regression): (a) DeepSeek sometimes answers in plain text instead of emitting the envelope (the first turn produced a hallucinated shell block; one follow-up needed client retries + an @file rephrase) — bounded repair (re-prompt once on a missing/malformed envelope) is M7 scope; (b) diagnostics capture is REQUEST-only, so response-side failure modes of a retried turn cannot be forensically reconstructed — response-side opt-in capture is an M7 instrumentation candidate; (c) Qwen Code's background agents (memory "dream" passes) share the serialized backend — expected queueing under the ADR-027 call gate, observed working.
+- **M6 ACCEPTANCE PASSED 2026-08-15 (user-run)** — see the "Tests run" entry for the full capture evidence. Residual wrinkles observed during that run: (a) DeepSeek sometimes answers in plain text instead of emitting the envelope (the first turn produced a hallucinated shell block; one follow-up needed client retries + an @file rephrase) — ADDRESSED in M7 (ADR-028): such turns now get one bounded repair retry with a static hint before falling back to honest text; (b) diagnostics capture is REQUEST-only, so response-side failure modes of a retried turn cannot be forensically reconstructed — response-side opt-in capture remains a future instrumentation candidate (not scheduled); (c) Qwen Code's background agents (memory "dream" passes) share the serialized backend — expected queueing under the ADR-027 call gate, observed working.
 - Live Qwen Code acceptance PASSED 2026-08-14 (user-run): plain chat works through a real Qwen Code v0.21.11 install; captures traffic-verified the wire fixtures (docs/UPSTREAM_NOTES.md, "Live traffic verification"). The M5-era MONITOR flag "byte-identical re-submissions before success" is now EXPLAINED: first attempts failed on the parent_message_id wire bug (ADR-025, 422) and/or the gateway crashing under concurrent requests (ADR-027, wasmtime PoW race), and the client's retry then hit the rebuild path — creating the visible duplicate DeepSeek chat with the full prompt re-sent. Structured tool calling arrived in M6 (live smoke passed first try); the user's first tool-execution acceptance attempt surfaced the FOUR live bugs fixed in the post-M6 hotfix (ADR-024/025/026/027) — the acceptance step is user-run again and prepared turnkey.
 - Backend calls are serialized by a process-wide call gate (ADR-027): the vendored client is not thread-safe (shared wasmtime PoW solver + per-turn parser seam), so concurrent OpenAI requests queue at the adapter boundary. A long turn delays any concurrent request until it finishes — expected for a single-account backend; before the gate, the same traffic killed the process.
-- M6 tool calling is intentionally single-shot (ADR-023): one tool call per model turn; text after a valid envelope is discarded; an invalid/truncated envelope flushes as honest plain text with NO bounded repair (re-prompting) — repair, repeated tool-result/model cycles, and persistent cross-request tool-call id mapping are all M7 scope. `tool_choice: "none"` fully disables tools; any other value with valid tools enables the envelope protocol.
+- Tool calling (M6+M7, ADR-023/028): ONE tool call per model turn (parallel calls deferred); text after a valid envelope is discarded; tool-ENABLED turns are buffered end-to-end before any response byte (first-byte latency = full turn length; tool turns are short in practice), so their failures answer as HTTP statuses, never in-stream error envelopes. A missing/malformed envelope triggers at most ONE repair retry (≤2 backend calls per turn); after any multi-attempt turn the backend link is invalidated and the NEXT request rebuilds from canonical history. `tool_choice: "none"` fully disables tools; any other value with valid tools enables the envelope protocol. Bounded repair could not be triggered live against a cooperating model — it is covered offline only.
 - Live multi-turn acceptance against chat.deepseek.com: the delta+parent strategy is NOW live-verified (post-M6 hotfix ADR-025 — upstream requires `parent_message_id` as a u32 number; after the fix, tool-history turn 2 succeeds on the session-reuse path). The formal pytest live test `tests/test_live_upstream.py::test_live_multi_turn_threads_parent_message_id` has still never run (marker `live`); the probe covered the same behavior. If upstream ever rejects parent threading again, the rebuild path (fresh session + full-history prompt) remains correct and is the documented fallback.
 - Qwen Code agent turns carry ~69 tools; the `[available tools]` block is compacted to fit the upstream prompt budget (ADR-024: first-line descriptions capped at 150 chars, schema `description` keys stripped). The total prompt for a full agent turn is still ~85KB (dominated by the client's own history) — if DeepSeek Web's prompt budget shrinks or history grows, history-side budgeting becomes necessary (not before).
 - Conversation state is in-memory only (bounded 256, least-recently-updated eviction) and dies with the process; continuity self-heals because every request carries its own history. SQLite persistence deferred (ADR-020).
@@ -122,11 +160,60 @@ regressions.
 - Sampling parameters are accepted but ignored; no usage chunk in streams (no upstream token counts; Qwen Code tolerates absence).
 - Reasoning/thinking content is intentionally NOT surfaced in streams.
 - Embeddings are not implemented (`/v1/embeddings` 404s; Qwen Code's embedContent hardcodes `text-embedding-ada-002` — out of core milestones).
-- Multi-turn tool loop (M7), multi-account, UI, Docker intentionally not started.
+- Multi-account, UI, Docker intentionally not started.
 
 ## Next action
 
-**M6 is CLOSED — acceptance passed (user-run, 2026-08-15).** Real Qwen Code executed structured `list_directory`/`read_file` tool calls through the gateway and answered from the results; the four post-M6 hotfix bugs (ADR-024/025/026/027) held up under real traffic. The only remaining work in this milestone band is optional polish the acceptance surfaced (all M7-scoped): bounded repair for turns where the model answers plain text instead of an envelope, and opt-in response-side capture for forensics. Next milestone is M7 (multi-turn tool loop hardening: persistent tool-call id mapping, repeated cycles, bounded repair policy, history validation) — but per the milestone gate, do NOT start M7 without the user's explicit go-ahead.
+**M7 is IMPLEMENTED and live-probed — acceptance is user-run.** The multi-turn tool loop (buffered tool turns, bounded repair, persistent tool-call ids, lenient history validation — ADR-028) is offline-green (410 passed) and live-verified by probe: three sequential tool interactions plus a final answer through the real DeepSeek backend, first-try, ids round-tripping verbatim. The M7 EXIT per ROADMAP is: real Qwen Code completes at least three sequential tool interactions and receives a final answer; the gateway executes none of those tools. Repro checklist: docs/QWEN_CODE_INTEGRATION.md ("M7 acceptance"). After that passes, the next milestone is M8 (deterministic bug-fix repository benchmark) — per the milestone gate, do NOT start M8 without the user's explicit go-ahead.
+
+---
+
+## 2026-08-15 — M7: Multi-turn tool loop
+
+### Completed
+
+- ADR-028 written DESIGN-FIRST (before code), five interlocking decisions; consequences filled after the offline suite + live probe.
+- Buffered tool turns (app/server.py): every tool-ENABLED turn — both response modes — is drained through the envelope parser completely per attempt BEFORE any response byte; the final outcome is re-emitted as synthesized normalized events (MessageStarted / TextDelta\* / ToolCallEmitted? / MessageFinished) through the UNCHANGED `sse_stream`, so M6 chunk shapes stay byte-compatible. Every tool-turn failure now happens pre-response → real HTTP status (never an in-stream error envelope); tool-DISABLED streaming stays on the exact M3 path.
+- Bounded repair policy: `MAX_TOOL_REPAIR_ATTEMPTS = 1` (≤2 backend calls per turn). Trigger: no valid call AND (`tool_choice == "required"` OR the parser's new `invalid_envelope_seen`). The retry appends a STATIC, deterministic hint (`_tool_repair_hint`) listing the client-supplied tool names — it NEVER echoes model output (injection boundary) — and re-branches on the SAME ORIGINAL `parent_message_id`, so the failed attempt never enters the threaded upstream context.
+- Link invalidation after multi-attempt turns: commit the final result to canonical FIRST, then invalidate the backend link (session + parent) — the next request rebuilds from canonical history (ADR-020 self-healing). Single-attempt turns keep the M6 behavior exactly (link intact, delta reuse).
+- Persistent tool-call ID index (app/conversation.py): `tool_call_index(messages)` derives `id → CanonicalToolCall` from canonical history per request (first occurrence wins) — deliberately NOT a stored registry; it survives eviction/restarts because the client re-sends full history. Backs `_prepare_turn`'s tool-name seeding and history validation.
+- Lenient history validation (app/conversation.py + server handler): `validate_tool_history` reports orphan tool results and missing `tool_call_id`s; findings never reject a request (ADR-023 lenient-in) — the history compiles as-is and the server logs a minimal warning (`dsqg.server`: counts + ≤3 ids, never content).
+- EnvelopeParser (app/tool_envelope.py): read-only `invalid_envelope_seen` flag — set on an invalid-region flush (feed) and a truncated-envelope flush (finalize); never by plain held-back text or after a valid emission. One fresh parser per attempt keeps it scoped to its own inference.
+- New suite tests/test_m7_loop.py (26 tests): index semantics, lenient validation findings, the invalid-envelope flag across valid/plain/malformed/truncated feeds, repair policy (required + optional triggers, the one-retry cap, hint content, re-branch parent threading, link invalidation + rebuild, valid-first-try keeps the link, repair-failure → 429 pre-response), buffered streaming (M6 chunk shapes, repair emits only the final outcome, honest exhaustion, 502 pre-response on backend failure), the 3-cycle multi-turn loop through the real app (finish reasons tool_calls×3 + stop, ids verbatim, delta prompts resolve names/results, 8 canonical messages), lenient logging (caplog).
+- Migrated tests: test_m5_wire_fixtures.py's two `tool_choice: "required"` fixtures and test_m6_api.py's unknown-tool test now script two backend turns and assert the repair-then-fallback semantics (hint marker present, valid tool names listed, unknown names absent).
+- LIVE PROBE PASSED (script deleted after use): three sequential tool interactions on the first try through the real backend (streamed) plus a final answer — 13.5 s total, three unique `call_dsqg_` ids verbatim through `role=tool.tool_call_id`, all continuations on the session-reuse/delta path. Repair was not triggered live (the model cooperated first-try; cannot be forced reliably — covered offline).
+- Docs synchronized: DECISIONS.md (ADR-028), API_CONTRACT.md (buffered tool turns, repair, error surface, link invalidation), QWEN_CODE_INTEGRATION.md (M7 capability + user-run M7 acceptance checklist), UPSTREAM_NOTES.md (M7 live observations), this file.
+
+### Files changed
+
+```text
+app/server.py (buffered tool turns, repair hint + policy, link
+  invalidation after multi-attempt turns, dispatch, lenient-validation
+  logging, MAX_TOOL_REPAIR_ATTEMPTS),
+app/conversation.py (tool_call_index, ToolHistoryFindings,
+  validate_tool_history),
+app/tool_envelope.py (invalid_envelope_seen flag),
+tests/test_m7_loop.py (new),
+tests/test_m5_wire_fixtures.py, tests/test_m6_api.py (repair semantics),
+docs/DECISIONS.md (ADR-028), docs/API_CONTRACT.md,
+docs/QWEN_CODE_INTEGRATION.md, docs/UPSTREAM_NOTES.md, docs/PROGRESS.md
+```
+
+### Tests executed
+
+```text
+.venv\Scripts\python.exe -m pytest -q
+410 passed, 3 deselected (live tests excluded by default marker)
+M7 live probe against the real DeepSeek backend: PASSED (3 sequential
+tool interactions + final answer, first-try, 13.5 s; script deleted).
+```
+
+### Honest gaps
+
+- The M7 EXIT — real Qwen Code completing ≥3 sequential tool interactions with a final answer — is user-run and has not happened yet (the probe covered the same pattern through the real backend; M6 acceptance already showed Qwen Code driving a 7-call loop).
+- Bounded repair has never fired live (cooperating model); offline coverage is the evidence. If a future live run surfaces repeated plain-text answers under `tool_choice: "required"`, the repair path is the first place to look (log: two backend calls per such turn).
+- The M7 live probe did not exercise Qwen Code's 69-tool agent shape (two declared tools); the M6 acceptance + post-M6 hotfix already covered that shape end-to-end.
+- Live multi-turn pytest (`-m live`) still has never run (unchanged).
 
 ---
 

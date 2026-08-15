@@ -143,9 +143,13 @@ class TestAgentTurnStreamWithTools:
     def test_tool_choice_required_is_tolerated(self) -> None:
         # Qwen Code only ever sends tool_choice 'required' or 'none'
         # (never 'auto'). Since M6 'required' adds the MUST-envelope
-        # instruction to the prompt; the scripted answer is still plain
-        # text, which the client tolerates (observed live in M5).
-        backend = FakeBackend(turns=[fake_text_turn(AGENT_TURN)])
+        # instruction to the prompt; since M7 (ADR-028) a missing
+        # envelope additionally triggers ONE bounded repair retry. The
+        # scripted model ignores both and answers plain text anyway,
+        # which the client tolerates (observed live in M5).
+        backend = FakeBackend(
+            turns=[fake_text_turn(AGENT_TURN), fake_text_turn(AGENT_TURN)]
+        )
         client = _client(_settings(), backend)
         payload = _load_fixture("agent_turn_stream_with_tools.json")
         payload["stream"] = False
@@ -153,6 +157,13 @@ class TestAgentTurnStreamWithTools:
         response = client.post("/v1/chat/completions", json=payload, headers=AUTH)
         assert response.status_code == 200
         assert response.json()["choices"][0]["message"]["content"] == AGENT_TURN
+        # Bounded repair: exactly two backend calls; the retry prompt
+        # carries the static repair hint (never echoed model output).
+        assert len(backend.turn_calls) == 2
+        assert (
+            "did not use the required tool-call control format"
+            in backend.turn_calls[1].prompt
+        )
 
 
 class TestPlainChatNonStream:
@@ -181,14 +192,18 @@ class TestSideQueryRespondInSchema:
     Traffic-verified shape (2026-08-14): alongside each user submission
     Qwen Code fires a non-streaming side query with ``tool_choice:
     'required'`` and a single ``respond_in_schema`` tool. Since M6 the
-    gateway compiles that tool into a MUST-envelope instruction, but the
-    scripted answer is plain text and the client tolerates it (observed
-    live: the session continued normally).
+    gateway compiles that tool into a MUST-envelope instruction; since
+    M7 (ADR-028) a missing envelope triggers one bounded repair retry.
+    The scripted model ignores both and keeps answering plain text, and
+    the client tolerates it (observed live: the session continued
+    normally).
     """
 
     def test_plain_text_200_despite_required_single_tool(self) -> None:
         answer = "Listing directory contents"
-        backend = FakeBackend(turns=[fake_text_turn(answer)])
+        backend = FakeBackend(
+            turns=[fake_text_turn(answer), fake_text_turn(answer)]
+        )
         client = _client(_settings(), backend)
         response = client.post(
             "/v1/chat/completions",
@@ -203,6 +218,8 @@ class TestSideQueryRespondInSchema:
             "role": "assistant",
             "content": answer,
         }
+        # One bounded repair retry happened before the honest fallback.
+        assert len(backend.turn_calls) == 2
 
 
 class TestToolHistoryTurn:

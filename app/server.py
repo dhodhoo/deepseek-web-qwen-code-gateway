@@ -14,7 +14,11 @@ Endpoints (docs/API_CONTRACT.md):
   response (both response modes), and tool-shaped HISTORY (assistant
   ``tool_calls`` + ``role=tool``) compiles into the prompt — see
   docs/TOOL_CALLING_PROTOCOL.md. ``tool_choice: 'none'`` disables tools;
-  ``'required'`` demands an envelope answer.
+  ``'required'`` demands an envelope answer. M7 (ADR-028) hardens the
+  loop: tool-enabled turns are fully buffered before any response byte,
+  ONE bounded repair retry runs when an envelope is missing or
+  malformed, and incoming tool history is validated leniently (findings
+  logged, never rejected).
 
 M5 diagnostic capture: when ``GATEWAY_DIAGNOSTICS_DIR`` is configured,
 every authenticated chat-completions request is appended (sanitized —
@@ -42,9 +46,11 @@ turn finishes (``MessageFinished``); partial turns never touch it.
 from __future__ import annotations
 
 import hmac
+import logging
 import time
 import uuid
 from dataclasses import dataclass
+from typing import Iterator, Sequence
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -56,6 +62,7 @@ from .backends.events import (
     BackendError,
     BackendMessageId,
     MessageFinished,
+    MessageStarted,
     TextDelta,
 )
 from .config import GatewaySettings, build_backend
@@ -64,6 +71,8 @@ from .conversation import (
     CanonicalToolCall,
     Conversation,
     ConversationStore,
+    tool_call_index,
+    validate_tool_history,
 )
 from .diagnostics import RequestRecorder
 from .error_mapping import backend_failure_to_response, openai_error_body
@@ -84,9 +93,49 @@ from .prompt_compiler import (
 )
 from .streaming import STREAM_EMPTY, sse_stream
 from .tool_envelope import EmittedToolCall, EnvelopeParser, ToolCallEmitted
-from .tools import build_tool_instructions, normalize_tools
+from .tools import (
+    TOOL_CALL_END_SENTINEL,
+    TOOL_CALL_START_SENTINEL,
+    CanonicalTool,
+    build_tool_instructions,
+    normalize_tools,
+)
 
 __all__ = ["create_app", "GatewayHttpError"]
+
+_log = logging.getLogger("dsqg.server")
+
+#: M7 (ADR-028 point 2): at most ONE repair retry per tool-enabled turn —
+#: i.e. at most two backend calls per turn. The protocol demands the bound
+#: ("Avoid infinite repair loops", docs/TOOL_CALLING_PROTOCOL.md).
+MAX_TOOL_REPAIR_ATTEMPTS = 1
+
+
+def _tool_repair_hint(tools: Sequence[CanonicalTool], *, required: bool) -> str:
+    """Static, deterministic repair hint for the bounded retry (M7).
+
+    Built ONLY from client-supplied tool names — model output is never
+    echoed back into a prompt (injection boundary; ADR-028 point 2).
+    """
+    names = ", ".join(tool.name for tool in tools)
+    closing = (
+        "You MUST request exactly one tool call now."
+        if required
+        else "If no tool is actually needed, answer normally in plain text "
+        "without any envelope."
+    )
+    return (
+        "Your previous response did not use the required tool-call control "
+        "format, so it could not be executed. Respond again with EXACTLY "
+        "one control envelope and no other text:\n\n"
+        f"{TOOL_CALL_START_SENTINEL}\n"
+        f'{{"name":"<one of: {names}>","arguments":{{...}}}}\n'
+        f"{TOOL_CALL_END_SENTINEL}\n\n"
+        "The envelope must contain exactly one JSON object; 'name' must be "
+        "one of the tools listed in the available-tools block; 'arguments' "
+        "must be a JSON object matching that tool's parameters schema; no "
+        f"markdown fences and no text before or after the envelope. {closing}"
+    )
 
 
 class GatewayHttpError(Exception):
@@ -161,6 +210,7 @@ class _TurnRecorder:
         "parent_message_id",
         "finished",
         "committed",
+        "finish_reason",
     )
 
     def __init__(self) -> None:
@@ -169,6 +219,7 @@ class _TurnRecorder:
         self.parent_message_id: str | None = None
         self.finished = False
         self.committed = False
+        self.finish_reason: str | None = None
 
     def observe(self, event) -> None:
         if isinstance(event, TextDelta):
@@ -179,6 +230,7 @@ class _TurnRecorder:
             self.parent_message_id = event.id
         elif isinstance(event, MessageFinished):
             self.finished = True
+            self.finish_reason = event.finish_reason
 
     @property
     def text(self) -> str:
@@ -247,14 +299,14 @@ def _prepare_turn(
         parent_message_id = None
         prompt_messages = canonical
 
-    # M6: when compiling a DELTA, the assistant tool call a tool result
-    # belongs to may stay in stored state — seed the name map from the
-    # request's FULL canonical history so results never degrade to
-    # "unknown" on the delta path.
+    # M6/M7: when compiling a DELTA, the assistant tool call a tool
+    # result belongs to may stay in stored state — seed the name map from
+    # the request's FULL canonical history so results never degrade to
+    # "unknown" on the delta path. M7: through the persistent tool-call
+    # ID index (ADR-028 point 4), which also backs history validation.
     known_tool_names = {
-        call.id: call.function_name
-        for message in canonical
-        for call in (message.tool_calls or ())
+        call_id: call.function_name
+        for call_id, call in tool_call_index(canonical).items()
     }
     prompt = compile_canonical_to_prompt(prompt_messages, known_tool_names)
     if tool_instructions is not None:
@@ -270,9 +322,15 @@ def _prepare_turn(
     return context, prompt
 
 
-def _commit_turn(context: _TurnContext, recorder: _TurnRecorder) -> None:
-    """Store a completed turn: history := incoming + assistant reply."""
-    context.store.commit_turn(
+def _commit_turn(
+    context: _TurnContext, recorder: _TurnRecorder
+) -> Conversation:
+    """Store a completed turn: history := incoming + assistant reply.
+
+    Returns the (possibly newly created) conversation so callers can
+    post-process the backend link (M7 repair invalidation, ADR-028).
+    """
+    conversation = context.store.commit_turn(
         context.backend_type,
         context.conversation,
         context.incoming,
@@ -281,12 +339,181 @@ def _commit_turn(context: _TurnContext, recorder: _TurnRecorder) -> None:
         parent_message_id=recorder.parent_message_id,
     )
     recorder.committed = True
+    return conversation
 
 
 def _invalidate_turn(context: _TurnContext) -> None:
     """Drop a failed turn's backend link; the next request rebuilds."""
     if context.conversation is not None:
         context.store.invalidate_backend_link(context.conversation)
+
+
+# ---------------------------------------------------------------------------
+# M7: buffered tool turns + bounded repair policy (ADR-028)
+# ---------------------------------------------------------------------------
+
+
+def _drain_tool_attempt(
+    backend_: LLMBackend,
+    context: _TurnContext,
+    prompt: str,
+    parser: EnvelopeParser,
+) -> _TurnRecorder:
+    """Run ONE tool-enabled attempt to completion (M7 buffered path).
+
+    The whole turn is consumed through the envelope parser BEFORE any
+    response byte exists (ADR-028 point 1) — nothing unclassified can
+    reach the wire, and a repair decision can still be taken. Backend
+    failures propagate as ``BackendFailure``; the caller answers them
+    with an HTTP status because everything here is pre-response.
+    """
+    recorder = _TurnRecorder()
+    for event in _tool_aware_events(
+        backend_.stream_turn(
+            context.session_id,
+            prompt,
+            parent_message_id=context.parent_message_id,
+        ),
+        parser,
+    ):
+        recorder.observe(event)
+        if isinstance(event, BackendError):
+            # Defensive: current backends raise BackendFailure
+            # (ADR-011/014); handle the event surface too.
+            raise BackendFailure(
+                category=_category_or_internal(event.kind),
+                message=event.message,
+                retryable=event.retryable,
+                status_code=event.status_code,
+            )
+    return recorder
+
+
+def _run_buffered_tool_turn(
+    backend_: LLMBackend,
+    context: _TurnContext,
+    prompt: str,
+    tools: Sequence[CanonicalTool],
+    *,
+    required: bool,
+) -> tuple[_TurnRecorder, int]:
+    """One tool-enabled turn under the bounded repair policy (M7).
+
+    Returns ``(recorder, attempts_used)``. A repair retry happens when
+    the attempt produced NO valid tool call AND the turn was
+    ``required`` OR the parser flagged ``invalid_envelope_seen`` (the
+    model clearly tried the control format — malformed region or
+    truncated envelope). At most :data:`MAX_TOOL_REPAIR_ATTEMPTS`
+    retries: the protocol forbids infinite repair loops
+    (docs/TOOL_CALLING_PROTOCOL.md). The retry reuses the same backend
+    session but the SAME ORIGINAL ``parent_message_id`` — re-branching
+    keeps the failed attempt out of the threaded upstream context
+    (ADR-028 points 2–3). One fresh parser per attempt keeps the
+    injection boundary per-inference and the flag scoped to its attempt.
+    """
+    attempts_used = 0
+    current_prompt = prompt
+    while True:
+        attempts_used += 1
+        parser = EnvelopeParser(tools)
+        recorder = _drain_tool_attempt(
+            backend_, context, current_prompt, parser
+        )
+        if recorder.tool_calls:
+            return recorder, attempts_used
+        needs_repair = required or parser.invalid_envelope_seen
+        if not needs_repair or attempts_used > MAX_TOOL_REPAIR_ATTEMPTS:
+            return recorder, attempts_used
+        current_prompt = (
+            f"{prompt}\n\n{_tool_repair_hint(tools, required=required)}"
+        )
+
+
+def _synthesized_events(recorder: _TurnRecorder) -> list:
+    """Rebuild normalized events from a buffered turn's outcome (M7).
+
+    Feeding these through the UNCHANGED M3/M6 ``sse_stream`` reproduces
+    the public chunk shapes of the old live path: role chunk, content
+    increments, tool-call opener + arguments chunks, and the terminal
+    chunk (finish_reason overridden to ``tool_calls`` by the renderer
+    when a tool call is present). An empty list means "the backend
+    produced nothing" — the caller maps it to ``STREAM_EMPTY``. A turn
+    that ended without ``MessageFinished`` (broken backend contract)
+    still renders honestly: whatever was produced, plus a terminal chunk.
+    """
+    events: list = [MessageStarted()]
+    events.extend(TextDelta(text) for text in recorder.text_parts)
+    events.extend(ToolCallEmitted(call=call) for call in recorder.tool_calls)
+    if recorder.finished or len(events) > 1:
+        events.append(MessageFinished(recorder.finish_reason))
+        return events
+    return []
+
+
+def _finish_tool_turn(
+    context: _TurnContext, recorder: _TurnRecorder, attempts_used: int
+) -> None:
+    """Commit a finished buffered tool turn; drop the link after repairs.
+
+    After a multi-attempt turn the upstream session holds an orphaned
+    attempt branch the canonical history does not mirror, so the backend
+    link is invalidated AFTER the commit — the next request rebuilds
+    from canonical state and canonical stays the truth (ADR-028 point 3,
+    ADR-020 self-healing). Single-attempt turns keep the M6 behavior:
+    link intact, delta reuse on the next request.
+    """
+    if not recorder.finished or recorder.committed:
+        return
+    conversation = _commit_turn(context, recorder)
+    if attempts_used > 1:
+        context.store.invalidate_backend_link(conversation)
+
+
+def _start_buffered_tool_stream(
+    backend_: LLMBackend,
+    context: _TurnContext,
+    cfg: GatewaySettings,
+    prompt: str,
+    tools: Sequence[CanonicalTool],
+    *,
+    required: bool,
+) -> StreamingResponse:
+    """SSE response for a tool-enabled turn (M7 buffered path, ADR-028).
+
+    The turn — including any bounded repair retry — runs to completion
+    BEFORE the response starts, so every failure is pre-response and
+    answers with a real HTTP status (the Qwen Code client keys retries
+    off status; docs/UPSTREAM_NOTES.md), and no envelope fragment can
+    leak partially. The buffered outcome is re-emitted through the
+    unchanged M3/M6 SSE renderer.
+    """
+    try:
+        recorder, attempts_used = _run_buffered_tool_turn(
+            backend_, context, prompt, tools, required=required
+        )
+    except BackendFailure as failure:
+        _invalidate_turn(context)
+        status, error_body = backend_failure_to_response(failure)
+        raise GatewayHttpError(status, error_body) from failure
+    _finish_tool_turn(context, recorder, attempts_used)
+    events = _synthesized_events(recorder)
+    if events:
+        primed: object = events[0]
+        rest: Iterator = iter(events[1:])
+    else:
+        primed = STREAM_EMPTY
+        rest = iter(())
+    return StreamingResponse(
+        sse_stream(
+            primed,
+            rest,
+            chunk_id=f"chatcmpl_local_{uuid.uuid4().hex}",
+            created=int(time.time()),
+            model=cfg.model_id,
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def _parsed_output_to_event(output):
@@ -585,11 +812,9 @@ def create_app(
         # sends only these two values — docs/UPSTREAM_NOTES.md).
         tools = normalize_tools(body.tools)
         tools_enabled = bool(tools) and body.tool_choice != "none"
-        parser = EnvelopeParser(tools) if tools_enabled else None
+        required = body.tool_choice == "required"
         tool_instructions = (
-            build_tool_instructions(
-                tools, required=body.tool_choice == "required"
-            )
+            build_tool_instructions(tools, required=required)
             if tools_enabled
             else None
         )
@@ -604,48 +829,78 @@ def create_app(
                 ),
             ) from exc
 
+        # M7 (ADR-028 point 5): lenient history validation — orphan tool
+        # results / missing tool_call_ids are logged for operators and
+        # compiled as-is, never rejected (ADR-023 lenient-in).
+        findings = validate_tool_history(canonical)
+        if not findings.clean:
+            _log.warning(
+                "tool history anomalies (compiling as-is): %d orphan tool "
+                "result(s) %s, %d missing tool_call_id(s)",
+                len(findings.orphan_tool_results),
+                list(findings.orphan_tool_results[:3]),
+                findings.missing_tool_call_ids,
+            )
+
         context, prompt = _prepare_turn(
             request, backend_, canonical, tool_instructions
         )
 
         if body.stream:
-            return _start_stream_response(
-                backend_, context, cfg, prompt, parser
-            )
+            if tools_enabled:
+                # M7 (ADR-028): buffered tool turn + bounded repair — the
+                # whole turn completes before any SSE byte is committed.
+                return _start_buffered_tool_stream(
+                    backend_, context, cfg, prompt, tools, required=required
+                )
+            # Tool-disabled streaming stays on the exact M3 path
+            # (byte-identical; M3 fixtures pinned).
+            return _start_stream_response(backend_, context, cfg, prompt)
 
-        recorder = _TurnRecorder()
-        try:
-            finish_reason: str | None = None
-            for event in _tool_aware_events(
-                backend_.stream_turn(
+        if tools_enabled:
+            # M7 (ADR-028): the non-streaming tool path shares the
+            # buffered attempt loop — same repair policy, same commit and
+            # link-invalidation rules as the streaming tool path.
+            try:
+                recorder, attempts_used = _run_buffered_tool_turn(
+                    backend_, context, prompt, tools, required=required
+                )
+            except BackendFailure as failure:
+                _invalidate_turn(context)
+                status, error_body = backend_failure_to_response(failure)
+                raise GatewayHttpError(status, error_body) from failure
+            _finish_tool_turn(context, recorder, attempts_used)
+            finish_reason: str | None = recorder.finish_reason
+        else:
+            recorder = _TurnRecorder()
+            try:
+                finish_reason = None
+                for event in backend_.stream_turn(
                     context.session_id,
                     prompt,
                     parent_message_id=context.parent_message_id,
-                ),
-                parser,
-            ):
-                recorder.observe(event)
-                if isinstance(event, MessageFinished):
-                    finish_reason = event.finish_reason
-                elif isinstance(event, BackendError):
-                    # Defensive: current backends raise BackendFailure
-                    # (ADR-011/014); handle the event surface too.
-                    raise BackendFailure(
-                        category=_category_or_internal(event.kind),
-                        message=event.message,
-                        retryable=event.retryable,
-                        status_code=event.status_code,
-                    )
-                # ReasoningDelta / MessageStarted / BackendMessageId /
-                # UnknownDelta need no response rendering; the recorder
-                # keeps whatever canonical state needs (M4).
-        except BackendFailure as failure:
-            _invalidate_turn(context)
-            status, error_body = backend_failure_to_response(failure)
-            raise GatewayHttpError(status, error_body) from failure
-
-        if recorder.finished and not recorder.committed:
-            _commit_turn(context, recorder)
+                ):
+                    recorder.observe(event)
+                    if isinstance(event, MessageFinished):
+                        finish_reason = event.finish_reason
+                    elif isinstance(event, BackendError):
+                        # Defensive: current backends raise BackendFailure
+                        # (ADR-011/014); handle the event surface too.
+                        raise BackendFailure(
+                            category=_category_or_internal(event.kind),
+                            message=event.message,
+                            retryable=event.retryable,
+                            status_code=event.status_code,
+                        )
+                    # ReasoningDelta / MessageStarted / BackendMessageId /
+                    # UnknownDelta need no response rendering; the recorder
+                    # keeps whatever canonical state needs (M4).
+            except BackendFailure as failure:
+                _invalidate_turn(context)
+                status, error_body = backend_failure_to_response(failure)
+                raise GatewayHttpError(status, error_body) from failure
+            if recorder.finished and not recorder.committed:
+                _commit_turn(context, recorder)
 
         tool_calls_out = [
             ToolCallOut(

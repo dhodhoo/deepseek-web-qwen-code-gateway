@@ -495,3 +495,26 @@ parameters}}`; no `strict`, no `parallel_tool_calls` — observed at scale
 
 Privacy: raw captures remain in the user's private diagnostics directory
 (they contain real prompts); only structural facts are recorded here.
+
+### Live multi-turn tool-loop verification (M7 probe, 2026-08-15)
+
+A live probe through the full gateway pipeline (stream=true, two declared
+tools, local tool execution fed back as `role=tool` history) confirmed the
+upstream behaviors M7 depends on:
+
+- DeepSeek followed the control-envelope protocol on the FIRST TRY for
+  every turn of a 4-turn sequence: `list_directory` → `read_file` →
+  `read_file` → final answer. All three tool turns arrived as clean
+  envelopes (no malformed/truncated attempts), so the bounded repair path
+  (ADR-028) was never needed live.
+- Delta turns carrying compiled `[tool result]` blocks continue the same
+  backend session correctly — turn 4's answer demonstrably used content
+  from the files read on turns 2–3 (it quoted both). Wall time 13.5 s for
+  the whole loop; every turn landed on the session-reuse/delta path.
+- The model answered HONESTLY from truncated tool results ("not fully
+  shown in the excerpt") rather than hallucinating missing content — tool
+  results as DATA in the compiled prompt behave as designed (ADR-023).
+- Repair remains unverifiable on demand live (a cooperating model cannot
+  be forced to malform an envelope); its evidence is the offline suite
+  (tests/test_m7_loop.py). If future live runs show two backend calls per
+  `tool_choice: "required"` turn, the repair path fired (by design).
