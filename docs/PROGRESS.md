@@ -4,9 +4,9 @@ The coding agent must update this file after every milestone.
 
 ## Current status
 
-**Current milestone:** M7 — Multi-turn tool loop
+**Current milestone:** M7 — Multi-turn tool loop — COMPLETE, **ACCEPTANCE PASSED (user-run, 2026-08-15, re-run after the ADR-029 hotfix)**
 
-**State:** IMPLEMENTED + LIVE-PROBED + **ADR-029 hotfix applied and live-re-verified** — **awaiting user-run acceptance** (re-run). Offline suite 384 → 410 → 413 passed (tests/test\*m7_loop.py: bounded repair policy, buffered streaming tool turns, the 3-cycle loop through the real app, persistent id index, lenient history validation — ADR-028; plus the ADR-029 pre-loop repair + anti-simulation tests). The user's first M7 acceptance attempt stalled on turn 1: the model answered in PROSE, simulating the tool loop with fabricated results (diagnostics record 61; replayed live: `stop`, zero tool_calls). ADR-029 fixed it two ways — anti-simulation wording in the tool instructions and a widened repair trigger (`pre_loop`: no assistant tool call in the history yet). Re-verification replay of the EXACT captured request now returns `finish_reason: tool_calls` with a real `list_directory` call. M7 exit (ROADMAP): real Qwen Code completes ≥3 sequential tool interactions and receives a final answer while the gateway executes none of those tools — that final step is user-run like every milestone's acceptance (checklist in docs/QWEN_CODE_INTEGRATION.md). M8 not started — awaits explicit instruction.
+**State:** COMPLETE — **ACCEPTANCE PASSED (user-run, 2026-08-15, re-run after the ADR-029 hotfix)**. Offline suite 384 → 410 → 413 passed (tests/test\*m7*loop.py: bounded repair policy, buffered streaming tool turns, the 3-cycle loop through the real app, persistent id index, lenient history validation — ADR-028; plus the ADR-029 pre-loop repair + anti-simulation tests). The first acceptance attempt stalled on turn 1 (prose-simulated tool loop, diagnostics record 61); ADR-029 fixed it (anti-simulation instructions + pre-loop plain-text repair) and the re-run passed FIRST TRY: three sequential tool interactions (`list_directory(docs)` → `read_file(docs/ROADMAP.md)` → `read_file(docs/TOOL_CALLING_PROTOCOL.md)`) plus a final answer quoting the M7 exit criterion and both sentinels from the files actually read — capture records 66–71, three `call_dsqg*` ids round-tripping verbatim, gateway executed none of the tools. The M7 EXIT per ROADMAP is met. Next milestone is M8 (deterministic bug-fix repository benchmark) — NOT started; awaits the user's explicit go-ahead per the milestone gate.
 
 **Previous milestone:** M6 — One emulated tool call — COMPLETE, **ACCEPTANCE PASSED (user-run, 2026-08-15)**. Real Qwen Code v0.21.11 executed structured tool calls through the gateway: a multi-turn loop of `list_directory` / `read_file` calls (7 calls across successive turns, incl. adapting after a permission denial), tool results compiled back, final answers incorporating the results; Qwen Code's background memory agent ran its own tool loop through the same gateway concurrently without issue. The four live bugs from the first attempt are fixed and live-verified (post-M6 hotfix addendum below; ADR-024/025/026/027).
 
@@ -20,7 +20,7 @@ The coding agent must update this file after every milestone.
 - M4 (2026-08-14): canonical conversation state — bounded in-memory store, history-prefix resolution, backend session reuse, parent-message threading, commit-on-finish + rebuild-on-failure, reconstruction tests.
 - M5 (2026-08-14): real Qwen Code wire compatibility — tools[]/tool_choice accepted and ignored (plain chat usable), opt-in sanitized diagnostic capture layer, source-verified wire fixtures + fixture tests, SDK-driven wire-compat tests, Qwen Code integration/wiring doc.
 - M6 (2026-08-14): one emulated tool call — lenient tools normalization, deterministic [available tools] prompt compiler, strict control-envelope parser (honest plain text on any malformed envelope), tool-shaped history compilation (assistant tool_calls + role=tool), structured OpenAI tool_calls output in both response modes, gateway-minted call_dsqg ids, canonical compact-arguments round trip.
-- M7 (2026-08-15): multi-turn tool loop hardening — buffered tool turns (tool-enabled turns drained fully before any response byte in BOTH response modes; failures pre-response → HTTP status; re-emitted through the unchanged sse_stream so M6 chunk shapes are preserved), bounded repair (≤1 retry per turn with a static hint listing valid tool names — never echoed model output; re-branches on the ORIGINAL parent_message_id), backend-link invalidation after multi-attempt turns (next request rebuilds from canonical — ADR-020 self-heal), persistent tool-call ID index derived per request from canonical history, lenient tool-history validation (log-only, never rejects). ADR-028.
+- M7 (2026-08-15): multi-turn tool loop hardening — buffered tool turns (tool-enabled turns drained fully before any response byte in BOTH response modes; failures pre-response → HTTP status; re-emitted through the unchanged sse_stream so M6 chunk shapes are preserved), bounded repair (≤1 retry per turn with a static hint listing valid tool names — never echoed model output; re-branches on the ORIGINAL parent_message_id), backend-link invalidation after multi-attempt turns (next request rebuilds from canonical — ADR-020 self-heal), persistent tool-call ID index derived per request from canonical history, lenient tool-history validation (log-only, never rejects). ADR-028. **ACCEPTANCE PASSED (user-run, 2026-08-15, re-run after the ADR-029 hotfix):** three sequential tool interactions (`list_directory` → `read_file` ROADMAP.md → `read_file` TOOL_CALLING_PROTOCOL.md) plus a final answer built from the results, gateway executed none of the tools (capture records 66–71).
 
 ## Tests run
 
@@ -162,6 +162,26 @@ list_directory call (arguments {"path":"D:\\deepseek-agent-gateway-starter\\docs
 HTTP 200 in 2.6 s, no sentinels in content. Before the fix the same
 request returned stop / zero tool_calls / 2,349 chars of simulated
 prose. Script deleted after use (established pattern).
+
+M7 LIVE ACCEPTANCE (user-run, 2026-08-15, AFTER the ADR-029 hotfix):
+real Qwen Code on model deepseek-web, fresh session, the checklist
+task (list docs/ + read ROADMAP.md and TOOL_CALLING_PROTOCOL.md +
+answer from them). Capture records 66-71: turn 1 (69 tools, pre-loop)
+-> tool_calls list_directory; the loop continued with the client
+re-sending full history each turn and the gateway answering
+read_file(ROADMAP.md), then read_file(TOOL_CALLING_PROTOCOL.md), then
+the final stop answer — three sequential tool interactions, three
+unique call_dsqg_ ids round-tripping verbatim through
+role=tool.tool_call_id, gateway executed none of the tools. The final
+answer quoted the M7 exit criterion and both sentinels correctly —
+content only obtainable from the two files actually read. Wire notes:
+the client shrank its tools[] from 69 to 20 after turn 1 (tools are
+re-normalized per request; the id index derives from history, so this
+is harmless), injected an extra user-role reminder mid-loop (compiles
+as-is, lenient), and fired one tools=0 non-stream side request after
+the final answer. First-try pass: no repair stall was visible in the
+UI (capture is request-only, so the per-turn call count is not
+recorded). M7 EXIT per ROADMAP: met.
 ```
 
 ## Known limitations
@@ -182,7 +202,7 @@ prose. Script deleted after use (established pattern).
 
 ## Next action
 
-**M7 is IMPLEMENTED, live-probed, and ADR-029-hotfixed — acceptance is user-run (re-run).** The multi-turn tool loop (buffered tool turns, bounded repair, persistent tool-call ids, lenient history validation — ADR-028) plus the ADR-029 hotfix (anti-simulation tool instructions + pre-loop plain-text repair) is offline-green (413 passed) and live-re-verified: the EXACT captured acceptance request that had produced a simulated-prose answer now returns a real `tool_calls` response (`list_directory` on docs). The M7 EXIT per ROADMAP is: real Qwen Code completes at least three sequential tool interactions and receives a final answer; the gateway executes none of those tools. Repro checklist: docs/QWEN_CODE_INTEGRATION.md ("M7 acceptance"). After that passes, the next milestone is M8 (deterministic bug-fix repository benchmark) — per the milestone gate, do NOT start M8 without the user's explicit go-ahead.
+**M7 is COMPLETE — ACCEPTANCE PASSED (user-run, 2026-08-15, re-run after the ADR-029 hotfix).** The multi-turn tool loop (buffered tool turns, bounded repair, persistent tool-call ids, lenient history validation — ADR-028) plus the ADR-029 hotfix (anti-simulation tool instructions + pre-loop plain-text repair) is offline-green (413 passed) and the user-run acceptance met the ROADMAP exit: three sequential tool interactions plus a final answer built from the results, gateway executed none of the tools (capture records 66–71; three `call_dsqg_` ids round-tripped verbatim through `role=tool.tool_call_id`). The first attempt's prose-simulated stall (record 61) was fixed and live-re-verified before the re-run. Next milestone is M8 (deterministic bug-fix repository benchmark) — per the milestone gate, do NOT start M8 without the user's explicit go-ahead.
 
 ---
 

@@ -25,8 +25,10 @@ live-re-verified:** the first acceptance attempt stalled because the model
 answered in prose SIMULATING a tool loop (fabricated results, no envelope);
 the tool instructions now forbid simulated tool execution and the bounded
 repair also fires on pre-loop envelope-less plain text — a replay of the
-exact failing request now returns a real `tool_calls` response. M7
-acceptance is user-run (checklist below). Four
+exact failing request now returns a real `tool_calls` response. **M7
+acceptance PASSED (user-run, 2026-08-15, re-run after the hotfix):**
+three sequential tool interactions plus a final answer built from the
+results (capture records 66–71). Four
 post-M6 live bugs were fixed and live-re-verified (ADR-024/025/026/027).
 The verified wire facts live in `docs/UPSTREAM_NOTES.md`; the fixtured
 request shapes live in `tests/fixtures/qwen_code_wire/`; the tool protocol
@@ -303,17 +305,18 @@ Rollback is unchanged: `/model` back to the previous provider.
 
 ## M7 acceptance (user-run checklist)
 
-**Status: PENDING (re-run after the ADR-029 hotfix).** The first attempt
-(2026-08-15) stalled on turn 1: the model answered in prose, simulating
-the tool loop with fabricated results (no tool call reached Qwen Code —
-hence the "strange" answer). That exact failure mode is fixed and
-live-re-verified (docs/DECISIONS.md ADR-029): anti-simulation tool
-instructions plus a bounded repair retry for pre-loop envelope-less plain
-text. Gateway side is ready — offline suite 413 passed and a replay of the
-captured failing request returns `finish_reason: tool_calls`
-(`list_directory` on docs); the earlier live probe already ran three
-sequential tool interactions plus a final answer through the real backend
-first-try (see docs/PROGRESS.md, "M7 LIVE PROBE").
+**Status: PASSED (user-run, 2026-08-15, re-run after the ADR-029
+hotfix).** The first attempt (2026-08-15) stalled on turn 1: the model
+answered in prose, simulating the tool loop with fabricated results (no
+tool call reached Qwen Code — hence the "strange" answer). ADR-029 fixed
+that mode (anti-simulation instructions + pre-loop plain-text repair),
+and the re-run passed FIRST TRY: `list_directory(docs)` →
+`read_file(docs/ROADMAP.md)` → `read_file(docs/TOOL_CALLING_PROTOCOL.md)`
+→ final answer quoting the M7 exit criterion and both sentinels from the
+files actually read (capture records 66–71: three gateway-minted
+`call_dsqg_` ids round-tripping verbatim through `role=tool.tool_call_id`;
+gateway executed none of the tools). Checklist kept below for regression
+re-runs.
 The exit per ROADMAP M7: **Qwen Code completes at least three sequential
 tool interactions and receives a final answer; the gateway executes none
 of those tools.**
