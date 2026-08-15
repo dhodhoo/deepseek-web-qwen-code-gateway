@@ -116,6 +116,9 @@ def _tool_repair_hint(tools: Sequence[CanonicalTool], *, required: bool) -> str:
 
     Built ONLY from client-supplied tool names — model output is never
     echoed back into a prompt (injection boundary; ADR-028 point 2).
+    Carries one anti-simulation sentence (ADR-029) because the dominant
+    live failure mode is prose that NARRATES a tool loop instead of
+    emitting an envelope.
     """
     names = ", ".join(tool.name for tool in tools)
     closing = (
@@ -134,7 +137,10 @@ def _tool_repair_hint(tools: Sequence[CanonicalTool], *, required: bool) -> str:
         "The envelope must contain exactly one JSON object; 'name' must be "
         "one of the tools listed in the available-tools block; 'arguments' "
         "must be a JSON object matching that tool's parameters schema; no "
-        f"markdown fences and no text before or after the envelope. {closing}"
+        "markdown fences and no text before or after the envelope. "
+        "Never simulate or narrate tool execution in prose — you cannot "
+        "execute tools yourself, so if you need one, request it with the "
+        f"envelope. {closing}"
     )
 
 
@@ -396,6 +402,7 @@ def _run_buffered_tool_turn(
     tools: Sequence[CanonicalTool],
     *,
     required: bool,
+    pre_loop: bool,
 ) -> tuple[_TurnRecorder, int]:
     """One tool-enabled turn under the bounded repair policy (M7).
 
@@ -403,13 +410,19 @@ def _run_buffered_tool_turn(
     the attempt produced NO valid tool call AND the turn was
     ``required`` OR the parser flagged ``invalid_envelope_seen`` (the
     model clearly tried the control format — malformed region or
-    truncated envelope). At most :data:`MAX_TOOL_REPAIR_ATTEMPTS`
-    retries: the protocol forbids infinite repair loops
-    (docs/TOOL_CALLING_PROTOCOL.md). The retry reuses the same backend
-    session but the SAME ORIGINAL ``parent_message_id`` — re-branching
-    keeps the failed attempt out of the threaded upstream context
-    (ADR-028 points 2–3). One fresh parser per attempt keeps the
-    injection boundary per-inference and the flag scoped to its attempt.
+    truncated envelope) OR ``pre_loop`` — the canonical history holds
+    no assistant tool call yet (ADR-029). The pre-loop clause catches
+    the dominant live failure, prose that SIMULATES a tool loop without
+    ever attempting an envelope; once a loop exists, text answers are
+    presumed legitimate final answers and are never repaired (loop
+    termination must stay possible on tool-carrying turns). At most
+    :data:`MAX_TOOL_REPAIR_ATTEMPTS` retries: the protocol forbids
+    infinite repair loops (docs/TOOL_CALLING_PROTOCOL.md). The retry
+    reuses the same backend session but the SAME ORIGINAL
+    ``parent_message_id`` — re-branching keeps the failed attempt out
+    of the threaded upstream context (ADR-028 points 2–3). One fresh
+    parser per attempt keeps the injection boundary per-inference and
+    the flag scoped to its attempt.
     """
     attempts_used = 0
     current_prompt = prompt
@@ -421,7 +434,7 @@ def _run_buffered_tool_turn(
         )
         if recorder.tool_calls:
             return recorder, attempts_used
-        needs_repair = required or parser.invalid_envelope_seen
+        needs_repair = required or parser.invalid_envelope_seen or pre_loop
         if not needs_repair or attempts_used > MAX_TOOL_REPAIR_ATTEMPTS:
             return recorder, attempts_used
         current_prompt = (
@@ -477,6 +490,7 @@ def _start_buffered_tool_stream(
     tools: Sequence[CanonicalTool],
     *,
     required: bool,
+    pre_loop: bool,
 ) -> StreamingResponse:
     """SSE response for a tool-enabled turn (M7 buffered path, ADR-028).
 
@@ -489,7 +503,12 @@ def _start_buffered_tool_stream(
     """
     try:
         recorder, attempts_used = _run_buffered_tool_turn(
-            backend_, context, prompt, tools, required=required
+            backend_,
+            context,
+            prompt,
+            tools,
+            required=required,
+            pre_loop=pre_loop,
         )
     except BackendFailure as failure:
         _invalidate_turn(context)
@@ -842,6 +861,13 @@ def create_app(
                 findings.missing_tool_call_ids,
             )
 
+        # ADR-029: PRE-LOOP plain-text repair — the canonical history
+        # holds no assistant tool call yet, so an envelope-less text
+        # answer on this tool-enabled turn gets the bounded repair retry
+        # (dominant live failure: prose-simulated tool use). Once a loop
+        # exists, text answers are presumed final and never repaired.
+        pre_loop = not tool_call_index(canonical)
+
         context, prompt = _prepare_turn(
             request, backend_, canonical, tool_instructions
         )
@@ -851,7 +877,13 @@ def create_app(
                 # M7 (ADR-028): buffered tool turn + bounded repair — the
                 # whole turn completes before any SSE byte is committed.
                 return _start_buffered_tool_stream(
-                    backend_, context, cfg, prompt, tools, required=required
+                    backend_,
+                    context,
+                    cfg,
+                    prompt,
+                    tools,
+                    required=required,
+                    pre_loop=pre_loop,
                 )
             # Tool-disabled streaming stays on the exact M3 path
             # (byte-identical; M3 fixtures pinned).
@@ -863,7 +895,12 @@ def create_app(
             # link-invalidation rules as the streaming tool path.
             try:
                 recorder, attempts_used = _run_buffered_tool_turn(
-                    backend_, context, prompt, tools, required=required
+                    backend_,
+                    context,
+                    prompt,
+                    tools,
+                    required=required,
+                    pre_loop=pre_loop,
                 )
             except BackendFailure as failure:
                 _invalidate_turn(context)

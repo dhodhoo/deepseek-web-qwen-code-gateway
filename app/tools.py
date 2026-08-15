@@ -191,6 +191,12 @@ def build_tool_instructions(
     stripped from the rendered schema (types/required/enum are kept).
     Validation is unaffected: the envelope parser still checks arguments
     against the FULL un-compacted schema.
+
+    Wording is ANTI-SIMULATION (ADR-029): a live M7 acceptance turn
+    showed the model answering in prose by NARRATING a tool loop with
+    fabricated results instead of emitting an envelope. The optional
+    branch and the envelope rules therefore forbid simulated or narrated
+    tool execution explicitly.
     """
     lines: list[str] = ["[available tools]"]
     if required:
@@ -202,7 +208,10 @@ def build_tool_instructions(
         lines.append(
             "Answer the latest user message. You may either answer normally "
             "or request exactly one tool call using the control envelope "
-            "below."
+            "below. If you need a tool to answer, you MUST request it with "
+            "the control envelope — you cannot execute tools yourself; "
+            "NEVER simulate or narrate tool execution in prose (no "
+            "fabricated listings or results)."
         )
     lines.append("")
     lines.append("Available tools:")
@@ -242,6 +251,10 @@ def build_tool_instructions(
     )
     lines.append(
         "- If no tool is needed, answer normally without any envelope."
+    )
+    lines.append(
+        "- Never describe a tool call in prose; either output a real "
+        "envelope or answer normally."
     )
     return "\n".join(lines)
 

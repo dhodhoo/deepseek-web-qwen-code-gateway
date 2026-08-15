@@ -241,7 +241,18 @@ class TestBuildToolInstructions:
     def test_default_mode_allows_a_normal_answer(self) -> None:
         text = build_tool_instructions([CanonicalTool("t", "d", None)])
         assert "You may either answer normally" in text
-        assert "MUST" not in text
+
+    def test_default_mode_forbids_simulated_tool_use(self) -> None:
+        # ADR-029: the optional wording must forbid prose-simulated tool
+        # execution — a live acceptance turn answered by NARRATING a
+        # tool loop with fabricated results instead of an envelope.
+        text = build_tool_instructions([CanonicalTool("t", "d", None)])
+        assert "NEVER simulate or narrate tool execution in prose" in text
+        assert "you MUST request it with" in text
+        assert (
+            "- Never describe a tool call in prose; either output a real "
+            "envelope or answer normally." in text
+        )
 
     def test_deterministic(self) -> None:
         tools = [CanonicalTool("a", "x", None), CanonicalTool("b", "y", None)]

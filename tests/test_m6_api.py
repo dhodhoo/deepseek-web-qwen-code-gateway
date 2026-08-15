@@ -128,7 +128,12 @@ class TestNonStreamToolCallResponse:
         assert body["choices"][0]["finish_reason"] == "tool_calls"
 
     def test_plain_answer_with_tools_has_no_tool_calls_key(self) -> None:
-        backend = FakeBackend(turns=[fake_text_turn("plain answer")])
+        # ADR-029: PRE-loop plain text costs one bounded repair retry
+        # (second scripted turn, still plain) — the response stays an
+        # honest text message without a tool_calls key.
+        backend = FakeBackend(
+            turns=[fake_text_turn("plain answer"), fake_text_turn("plain answer")]
+        )
         client = _client(_settings(), backend)
         body = client.post(
             "/v1/chat/completions",
@@ -229,16 +234,16 @@ class TestStreamingToolCallResponse:
         assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
     def test_plain_stream_with_tools_is_unchanged(self) -> None:
-        backend = FakeBackend(
-            turns=[
-                [
-                    MessageStarted(),
-                    TextDelta("Hello "),
-                    TextDelta("world"),
-                    MessageFinished("stop"),
-                ]
-            ]
-        )
+        # ADR-029: a PRE-loop plain answer pays one bounded repair retry;
+        # the second scripted turn repeats the same text, so the streamed
+        # chunk shapes stay exactly the honest plain-text shapes.
+        plain_turn = [
+            MessageStarted(),
+            TextDelta("Hello "),
+            TextDelta("world"),
+            MessageFinished("stop"),
+        ]
+        backend = FakeBackend(turns=[plain_turn, plain_turn])
         client = _client(_settings(), backend)
         chunks = _stream_chunks(
             client, _chat_body(stream=True, tools=[READ_FILE_TOOL])
@@ -254,7 +259,9 @@ class TestStreamingToolCallResponse:
 
 class TestToolInstructionsInPrompt:
     def test_tools_are_compiled_into_instructions(self) -> None:
-        backend = FakeBackend(turns=[fake_text_turn("ok")])
+        # ADR-029: pre-loop plain answer → one bounded repair retry, so
+        # two turns are scripted; assertions pin attempt 1's prompt.
+        backend = FakeBackend(turns=[fake_text_turn("ok"), fake_text_turn("ok")])
         client = _client(_settings(), backend)
         client.post(
             "/v1/chat/completions",
@@ -268,7 +275,10 @@ class TestToolInstructionsInPrompt:
         assert TOOL_CALL_END_SENTINEL in prompt
 
     def test_tool_choice_required_adds_the_must_instruction(self) -> None:
-        backend = FakeBackend(turns=[fake_text_turn("ok")])
+        # 'required' + plain answer → the bounded repair retry consumes
+        # the second scripted turn (ADR-028/029); assertions pin
+        # attempt 1's prompt.
+        backend = FakeBackend(turns=[fake_text_turn("ok"), fake_text_turn("ok")])
         client = _client(_settings(), backend)
         client.post(
             "/v1/chat/completions",
@@ -298,7 +308,9 @@ class TestToolInstructionsInPrompt:
         assert "tool_calls" not in message
 
     def test_malformed_tool_entries_are_skipped_not_rejected(self) -> None:
-        backend = FakeBackend(turns=[fake_text_turn("ok")])
+        # ADR-029: one valid tool remains after normalization, so this
+        # PRE-loop plain turn pays the bounded repair retry — two turns.
+        backend = FakeBackend(turns=[fake_text_turn("ok"), fake_text_turn("ok")])
         client = _client(_settings(), backend)
         response = client.post(
             "/v1/chat/completions",

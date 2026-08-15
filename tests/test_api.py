@@ -187,8 +187,12 @@ class TestChatCompletionsRejections:
     def test_tools_with_a_plain_answer_stay_plain_text_in_m6(self) -> None:
         # M6 (ADR-023): tools[] are compiled into prompt instructions, but
         # a model answer without a control envelope is still plain text —
-        # no tool_calls key leaks into the response.
-        backend = FakeBackend(turns=[fake_text_turn("plain answer")])
+        # no tool_calls key leaks into the response. ADR-029: a PRE-loop
+        # plain answer gets one bounded repair retry, so two plain turns
+        # are scripted; the outcome stays honest text either way.
+        backend = FakeBackend(
+            turns=[fake_text_turn("plain answer"), fake_text_turn("plain answer")]
+        )
         client = _client(_settings(), backend)
         payload = _chat_body(
             tools=[
@@ -206,7 +210,7 @@ class TestChatCompletionsRejections:
         assert response.status_code == 200
         message = response.json()["choices"][0]["message"]
         assert message == {"role": "assistant", "content": "plain answer"}
-        assert len(backend.turn_calls) == 1
+        assert len(backend.turn_calls) == 2
         # The tools reached the backend ONLY as the instruction block.
         assert "[available tools]" in backend.turn_calls[0].prompt
         assert "- run_shell: run" in backend.turn_calls[0].prompt

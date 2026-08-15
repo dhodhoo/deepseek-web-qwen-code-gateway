@@ -53,6 +53,7 @@ Recommended v1 protocol:
 A final answer must not use this envelope.
 
 The exact sentinel may change if testing finds a better one, but it must remain:
+
 - explicit,
 - easy to detect incrementally,
 - unlikely to occur in normal source code/prose,
@@ -90,6 +91,7 @@ Do not copy this naively if prompt experiments find a more reliable formulation.
 Qwen Code can repeatedly call the model.
 
 Supporting one tool decision per model turn simplifies:
+
 - parser correctness,
 - streaming,
 - validation,
@@ -122,6 +124,7 @@ delete_everything
 but that tool was not supplied by Qwen Code, never emit it.
 
 Preferred behavior:
+
 - perform one bounded repair turn telling the model the call is invalid and listing valid tool names, or
 - return a controlled provider error if repair is unsafe/unreliable.
 
@@ -130,6 +133,7 @@ Avoid infinite repair loops.
 ## Malformed JSON
 
 Allowed bounded recovery may include:
+
 - stripping surrounding whitespace,
 - extracting exactly the content between sentinels,
 - one deterministic JSON repair strategy for trivial trailing commas if explicitly tested.
@@ -137,6 +141,22 @@ Allowed bounded recovery may include:
 Do not create a highly permissive parser that guesses arbitrary model intent.
 
 If repair fails, use a bounded model repair turn or controlled error.
+
+## Simulated tool use (no envelope attempted)
+
+A model without native function calling may answer in PROSE that narrates
+a tool loop — "I will list the files…" followed by fabricated listings or
+file contents — instead of emitting an envelope. Such output must never
+be treated as a tool call, and the instructions should forbid it
+explicitly ("never simulate or narrate tool execution in prose").
+
+Implemented behavior (ADR-029): when a tool-enabled turn yields no valid
+call AND the request history holds no assistant tool call yet (PRE-loop),
+the same bounded repair turn applies before falling back to honest text.
+Once the history already carries tool calls (MID-loop), a text answer is
+presumed to be the legitimate final answer and must NOT be repaired —
+final-answer turns also carry tools, and repairing them could break loop
+termination.
 
 ## Tool arguments
 
@@ -226,6 +246,7 @@ call_dsqg_<random>
 ```
 
 Store enough mapping so a later `role=tool` message can be associated with:
+
 - the tool name,
 - the original model turn,
 - the conversation.

@@ -414,16 +414,94 @@ class TestBoundedRepairPolicy:
         assert body["choices"][0]["finish_reason"] == "tool_calls"
         assert len(backend.turn_calls) == 2
 
-    def test_optional_plain_text_does_not_repair(self) -> None:
-        backend = FakeBackend(turns=[fake_text_turn("plain answer")])
+    def test_pre_loop_plain_text_triggers_repair(self) -> None:
+        # ADR-029: a tool-enabled turn whose history holds NO assistant
+        # tool call yet gets the bounded repair retry even on
+        # envelope-less plain text — the dominant live failure is prose
+        # that SIMULATES a tool loop (record 61, 2026-08-15 acceptance).
+        backend = FakeBackend(
+            turns=[
+                fake_text_turn("plain simulated answer"),
+                fake_text_turn("second plain answer"),
+                fake_text_turn("never reached"),
+            ]
+        )
         client = _client(backend)
         body = client.post(
             "/v1/chat/completions",
             json=_chat_body(tools=[READ_FILE_TOOL]),
             headers=AUTH,
         ).json()
-        assert len(backend.turn_calls) == 1
-        assert body["choices"][0]["message"]["content"] == "plain answer"
+        # Bounded: exactly two attempts, then the HONEST text of the
+        # last attempt (never a fabricated tool call).
+        assert len(backend.turn_calls) == 2
+        assert body["choices"][0]["finish_reason"] == "stop"
+        assert body["choices"][0]["message"]["content"] == "second plain answer"
+        assert "tool_calls" not in body["choices"][0]["message"]
+        # The retry prompt = original prompt + the static repair hint
+        # with its anti-simulation sentence, on the same parent.
+        attempt_1, attempt_2 = backend.turn_calls[0], backend.turn_calls[1]
+        assert REPAIR_HINT_MARKER not in attempt_1.prompt
+        assert attempt_2.prompt.startswith(attempt_1.prompt)
+        assert REPAIR_HINT_MARKER in attempt_2.prompt
+        assert "Never simulate or narrate tool execution in prose" in (
+            attempt_2.prompt
+        )
+        assert attempt_1.parent_message_id == attempt_2.parent_message_id
+
+    def test_pre_loop_plain_then_envelope_succeeds_on_retry(self) -> None:
+        # ADR-029 happy path: the repair retry converts the simulated
+        # prose turn into a real tool call.
+        backend = FakeBackend(
+            turns=[fake_text_turn("Let me list the files for you..."), _envelope_turn()]
+        )
+        client = _client(backend)
+        body = client.post(
+            "/v1/chat/completions",
+            json=_chat_body(tools=[READ_FILE_TOOL]),
+            headers=AUTH,
+        ).json()
+        choice = body["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        assert len(backend.turn_calls) == 2
+        call = choice["message"]["tool_calls"][0]
+        assert call["function"]["name"] == "read_file"
+        assert call["function"]["arguments"] == '{"file_path":"src/main.py"}'
+
+    def test_mid_loop_plain_text_does_not_repair(self) -> None:
+        # ADR-029: once the history carries an assistant tool call the
+        # turn is MID-loop — a text answer is presumed the legitimate
+        # FINAL answer and must NOT be repaired (loop termination must
+        # stay possible on tool-carrying turns).
+        backend = FakeBackend(
+            turns=[_envelope_turn(), fake_text_turn("The final answer.")]
+        )
+        client = _client(backend)
+        first = client.post(
+            "/v1/chat/completions",
+            json=_chat_body(tools=[READ_FILE_TOOL]),
+            headers=AUTH,
+        ).json()
+        call = first["choices"][0]["message"]["tool_calls"][0]
+        second = client.post(
+            "/v1/chat/completions",
+            json=_chat_body(
+                messages=[
+                    {"role": "user", "content": "Read src/main.py"},
+                    {"role": "assistant", "content": None, "tool_calls": [call]},
+                    {"role": "tool", "tool_call_id": call["id"], "content": "x"},
+                ],
+                tools=[READ_FILE_TOOL],
+            ),
+            headers=AUTH,
+        ).json()
+        # Exactly ONE inference for the final answer — no repair retry,
+        # and the delta-reuse link stayed intact.
+        assert len(backend.turn_calls) == 2
+        assert second["choices"][0]["finish_reason"] == "stop"
+        assert second["choices"][0]["message"]["content"] == "The final answer."
+        assert REPAIR_HINT_MARKER not in backend.turn_calls[1].prompt
+        assert len(backend.sessions_created) == 1
 
     def test_valid_envelope_first_attempt_keeps_the_link(self) -> None:
         backend = FakeBackend(

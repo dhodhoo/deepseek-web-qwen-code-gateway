@@ -78,7 +78,11 @@ class TestAgentTurnStreamWithTools:
     """Fixture: agent_turn_stream_with_tools.json (the main agent shape)."""
 
     def test_streams_plain_text_answer(self) -> None:
-        backend = FakeBackend(turns=[AGENT_SSE_TURN])
+        # ADR-029: this fixture is a PRE-loop agent turn (tools, no
+        # tool_choice), so the plain answer pays one bounded repair
+        # retry — the second scripted turn is identical, keeping the
+        # pinned wire shape; attempt 1's bytes never reach the stream.
+        backend = FakeBackend(turns=[AGENT_SSE_TURN, AGENT_SSE_TURN])
         client = _client(_settings(), backend)
         lines = _stream_lines(client, _load_fixture("agent_turn_stream_with_tools.json"))
 
@@ -101,7 +105,9 @@ class TestAgentTurnStreamWithTools:
         assert all("usage" not in chunk for chunk in chunks)
 
     def test_backend_receives_compiled_prompt_plus_tool_instructions(self) -> None:
-        backend = FakeBackend(turns=[AGENT_SSE_TURN])
+        # ADR-029: pre-loop plain answer → one bounded repair retry; the
+        # assertions below pin attempt 1's ORIGINAL prompt shape.
+        backend = FakeBackend(turns=[AGENT_SSE_TURN, AGENT_SSE_TURN])
         client = _client(_settings(), backend)
         _stream_lines(client, _load_fixture("agent_turn_stream_with_tools.json"))
         # M6 (ADR-023, superseding the M5 "tools never reach the backend"
@@ -128,7 +134,10 @@ class TestAgentTurnStreamWithTools:
         assert "<<<DSQG_END_TOOL_CALL>>>" in instructions
 
     def test_same_body_non_streamed_returns_json(self) -> None:
-        backend = FakeBackend(turns=[fake_text_turn(AGENT_TURN)])
+        # ADR-029: same pre-loop repair as the streaming twin above.
+        backend = FakeBackend(
+            turns=[fake_text_turn(AGENT_TURN), fake_text_turn(AGENT_TURN)]
+        )
         client = _client(_settings(), backend)
         payload = _load_fixture("agent_turn_stream_with_tools.json")
         payload["stream"] = False

@@ -518,3 +518,32 @@ upstream behaviors M7 depends on:
   be forced to malform an envelope); its evidence is the offline suite
   (tests/test_m7_loop.py). If future live runs show two backend calls per
   `tool_choice: "required"` turn, the repair path fired (by design).
+
+### Prose-simulated tool use and the ADR-029 replay (2026-08-15)
+
+The user's first M7 acceptance attempt surfaced a NEW upstream behavior
+(not a gateway wire bug): on the very first agent turn (69 tools,
+`tool_choice` absent) the model answered in PROSE — narrating a simulated
+tool loop ("Saya akan menampilkan daftar file…") with a fabricated `docs/`
+listing (reassembled from the QWEN.md reading list inside the system
+prompt) and fake "read" summaries. `finish_reason: stop`, zero tool calls,
+no envelope attempted — so neither the M7 repair trigger nor any parser
+flag fired. A model without native function calling falls back to
+NARRATING actions when the prompt does not explicitly forbid simulating
+them. The same stochastic wrinkle appeared once during M6 acceptance
+(hallucinated shell block).
+
+ADR-029 (docs/DECISIONS.md) counters it deterministically: the tool
+instructions now forbid simulated/narrated tool execution, and the bounded
+repair also fires on PRE-loop envelope-less plain text (history carries no
+assistant tool call yet). Live re-verification replayed the EXACT captured
+request through the patched gateway against the real backend: the outcome
+flipped from stop/2,349 chars of simulated prose to `finish_reason:
+tool_calls` with a real `list_directory` call
+(`{"path":"D:\\deepseek-agent-gateway-starter\\docs"}`), HTTP 200 in 2.6 s.
+Upstream facts confirmed by this replay: (1) the model CAN follow the
+envelope protocol on a 69-tool agent turn once the anti-simulation wording
+is present (and/or the repair hint follows a simulated attempt); (2) the
+threaded session accepted the re-branch on the original parent without
+error. Capture remains request-only, so which attempt produced the call is
+not recorded; the replay script was deleted after use.

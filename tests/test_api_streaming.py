@@ -234,8 +234,11 @@ class TestStreamingValidationAndAuth:
     def test_stream_with_tools_and_a_plain_answer_has_no_tool_calls(self) -> None:
         # M6 (ADR-023): Qwen Code agent turns always carry tools[]; when
         # the model answer holds no control envelope the stream stays
-        # plain text — no tool_calls deltas are fabricated.
-        backend = FakeBackend(turns=[SSE_TURN])
+        # plain text — no tool_calls deltas are fabricated. ADR-029: the
+        # PRE-loop plain answer costs one bounded repair retry (second
+        # scripted turn, identical text); attempt 1's text never reaches
+        # the wire.
+        backend = FakeBackend(turns=[SSE_TURN, SSE_TURN])
         client = _client(_settings(), backend)
         payload = _chat_body(
             tools=[

@@ -20,7 +20,13 @@ is IMPLEMENTED and live-probed:** buffered tool turns, one bounded repair
 retry on missing/malformed envelopes, repeated tool-result/model cycles,
 persistent tool-call ids, lenient history validation — the probe ran three
 sequential tool interactions plus a final answer through the real backend
-(first-try, 13.5 s). M7 acceptance is user-run (checklist below). Four
+(first-try, 13.5 s). **Post-M7 hotfix (ADR-029) applied and
+live-re-verified:** the first acceptance attempt stalled because the model
+answered in prose SIMULATING a tool loop (fabricated results, no envelope);
+the tool instructions now forbid simulated tool execution and the bounded
+repair also fires on pre-loop envelope-less plain text — a replay of the
+exact failing request now returns a real `tool_calls` response. M7
+acceptance is user-run (checklist below). Four
 post-M6 live bugs were fixed and live-re-verified (ADR-024/025/026/027).
 The verified wire facts live in `docs/UPSTREAM_NOTES.md`; the fixtured
 request shapes live in `tests/fixtures/qwen_code_wire/`; the tool protocol
@@ -297,9 +303,17 @@ Rollback is unchanged: `/model` back to the previous provider.
 
 ## M7 acceptance (user-run checklist)
 
-**Status: PENDING.** Gateway side is ready — offline suite 410 passed and
-the live probe ran three sequential tool interactions plus a final answer
-through the real backend first-try (see docs/PROGRESS.md, "M7 LIVE PROBE").
+**Status: PENDING (re-run after the ADR-029 hotfix).** The first attempt
+(2026-08-15) stalled on turn 1: the model answered in prose, simulating
+the tool loop with fabricated results (no tool call reached Qwen Code —
+hence the "strange" answer). That exact failure mode is fixed and
+live-re-verified (docs/DECISIONS.md ADR-029): anti-simulation tool
+instructions plus a bounded repair retry for pre-loop envelope-less plain
+text. Gateway side is ready — offline suite 413 passed and a replay of the
+captured failing request returns `finish_reason: tool_calls`
+(`list_directory` on docs); the earlier live probe already ran three
+sequential tool interactions plus a final answer through the real backend
+first-try (see docs/PROGRESS.md, "M7 LIVE PROBE").
 The exit per ROADMAP M7: **Qwen Code completes at least three sequential
 tool interactions and receives a final answer; the gateway executes none
 of those tools.**
@@ -333,7 +347,16 @@ of those tools.**
      assistant prose on a tool turn.
 5. If a turn takes noticeably longer than M6 turns: tool-enabled turns
    are buffered end-to-end (ADR-028), and a turn that needed the bounded
-   repair costs two backend calls. Both are by design; a turn that
-   ultimately answers plain text after a repair still keeps the session
-   usable (the next request self-heals via canonical rebuild if the turn
-   used more than one attempt).
+   repair costs two backend calls — since ADR-029 this also applies to a
+   PRE-loop turn that first answers plain text without an envelope (the
+   anti-simulation retry), so a slow FIRST turn with a correct tool call
+   or honest text at the end is the hotfix working, not a regression.
+   A turn that ultimately answers plain text after a repair still keeps
+   the session usable (the next request self-heals via canonical rebuild
+   if the turn used more than one attempt).
+6. If an answer ever LOOKS like simulated tool execution again ("Saya
+   akan membaca file…" followed by fabricated results, no tool shown in
+   the UI): that is the ADR-029 failure mode escaping both defenses —
+   note the line count in `GATEWAY_DIAGNOSTICS_DIR/requests.jsonl` for
+   the turn and report it (capture is request-only, so the response side
+   needs the replay treatment).

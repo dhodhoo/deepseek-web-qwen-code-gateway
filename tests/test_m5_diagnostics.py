@@ -104,7 +104,10 @@ class TestCaptureDisabledByDefault:
 
 class TestCaptureIntegration:
     def test_successful_request_is_captured(self, tmp_path: Path) -> None:
-        backend = FakeBackend(turns=[fake_text_turn("ok")])
+        # ADR-029: this tool-enabled PRE-loop turn pays one bounded
+        # repair retry, so two turns are scripted; capture is
+        # REQUEST-only and per-HTTP-request, so exactly ONE record.
+        backend = FakeBackend(turns=[fake_text_turn("ok"), fake_text_turn("ok")])
         client = _client(_settings(diagnostics_dir=tmp_path), backend)
         payload = {
             "model": MODEL,
