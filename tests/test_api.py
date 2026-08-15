@@ -274,20 +274,32 @@ class TestChatCompletionsRejections:
 
 
 class TestBackendFailureMapping:
-    def _post(self, backend: FakeBackend):
-        client = _client(_settings(), backend)
+    def _post(
+        self, backend: FakeBackend, settings: GatewaySettings | None = None
+    ):
+        client = _client(settings or _settings(), backend)
         return client.post("/v1/chat/completions", json=_chat_body(), headers=AUTH)
 
     def test_rate_limited_maps_to_429(self) -> None:
         failure = BackendFailure(
             category=BackendErrorCategory.RATE_LIMITED, message="slow down"
         )
-        response = self._post(FakeBackend(turns=[[failure]]))
+        # M9 (ADR-036): RATE_LIMITED is retryable, so the deterministic
+        # mapped status must survive the WHOLE bounded retry budget —
+        # script one failure per attempt (default budget: 1 + 2 retries).
+        # Backoff is zeroed here; the schedule itself is pinned in
+        # tests/test_m9_reliability.py.
+        backend = FakeBackend(turns=[[failure], [failure], [failure]])
+        response = self._post(
+            backend, settings=_settings(retry_backoff_seconds=0.0)
+        )
         assert response.status_code == 429
         error = response.json()["error"]
         assert error["code"] == "RATE_LIMITED"
         assert error["type"] == "upstream_rate_limit_error"
         assert error["message"] == "slow down"
+        # Bounded, never a hot loop: exactly budget-many attempts.
+        assert len(backend.turn_calls) == 3
 
     def test_auth_invalid_maps_to_502(self) -> None:
         failure = BackendFailure(

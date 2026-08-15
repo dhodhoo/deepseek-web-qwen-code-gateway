@@ -96,9 +96,12 @@ Field notes (verified from source):
   Code (removed since v0.10.1) — keys come from `envKey` env vars / `.env`
   / settings `env`.
 - `generationConfig` is impermeable/atomic: keep the whole object inside
-  the provider entry. `maxRetries: 1` keeps client-side retries bounded
-  while the gateway's own retry policy is still M9 work (the SDK otherwise
-  retries 429/5xx up to 3x on top of transport-level replays).
+  the provider entry. `maxRetries: 1` keeps client-side retries bounded:
+  since M9 (ADR-036) the gateway ALREADY absorbs transient failures with
+  its own bounded transport retry (up to 2 retries, deterministic linear
+  backoff), so a 429/5xx that reaches Qwen Code means the gateway's whole
+  budget is exhausted — one bounded client retry is plenty (the SDK
+  otherwise retries 429/5xx up to 3x on top of transport-level replays).
 - The built-in `openai` protocol needs no `providerProtocol` entry (that
   key is only for custom protocol ids).
 

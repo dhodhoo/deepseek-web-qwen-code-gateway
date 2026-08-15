@@ -48,6 +48,7 @@ class DeepSeekWebBackend(LLMBackend):
         self,
         auth_token: str,
         cookies_file: str | Path | None = None,
+        request_timeout: float | None = None,
     ) -> None:
         """Initialize the vendored client.
 
@@ -55,8 +56,24 @@ class DeepSeekWebBackend(LLMBackend):
         ``{"cookies": {...}}`` (upstream format). When provided, its cookies
         replace whatever the vendored client loaded from its default
         location. Cookies are treated as secrets: never logged.
+
+        ``request_timeout`` (M9, ADR-036; optional) bounds every upstream
+        HTTP call in seconds: the vendored client used ``timeout=None``
+        (unlimited), so a dead socket could block the single call-gate
+        slot forever. Per curl_cffi semantics the value is an INACTIVITY
+        timeout on the streaming call (silent sockets abort after this
+        long; healthy long streams survive) and a total timeout on
+        control-plane calls. ``None`` keeps the vendored default.
         """
+        from dsk import api as dsk_api
         from dsk.api import DeepSeekAPI  # vendored
+
+        if request_timeout is not None:
+            # Annotated vendor patch seam (dsk/api.py DEFAULT_REQUEST_TIMEOUT,
+            # [DSQG-VENDOR-PATCH] M9). Module-level because the vendored
+            # client reads it at call time; single-backend process, so no
+            # cross-instance contention.
+            dsk_api.DEFAULT_REQUEST_TIMEOUT = float(request_timeout)
 
         try:
             self._api = DeepSeekAPI(auth_token)

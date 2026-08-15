@@ -90,14 +90,16 @@ LIST_DIR_TOOL = {
 }
 
 
-def _settings() -> GatewaySettings:
-    return GatewaySettings(
-        backend_type="fake", gateway_api_key=SecretStr("test-key")
-    )
+def _settings(**overrides) -> GatewaySettings:
+    base: dict = {"backend_type": "fake", "gateway_api_key": SecretStr("test-key")}
+    base.update(overrides)
+    return GatewaySettings(**base)
 
 
-def _client(backend: FakeBackend) -> TestClient:
-    return TestClient(create_app(_settings(), backend))
+def _client(
+    backend: FakeBackend, settings: GatewaySettings | None = None
+) -> TestClient:
+    return TestClient(create_app(settings or _settings(), backend))
 
 
 def _chat_body(**overrides) -> dict:
@@ -562,8 +564,12 @@ class TestBoundedRepairPolicy:
         failure = BackendFailure(
             category=BackendErrorCategory.RATE_LIMITED, message="slow down"
         )
-        backend = FakeBackend(turns=[[failure]])
-        client = _client(backend)
+        # M9 (ADR-036): RATE_LIMITED is retryable, so the deterministic
+        # status must survive the WHOLE bounded transport budget — one
+        # scripted failure per attempt (backoff zeroed; the schedule is
+        # pinned in tests/test_m9_reliability.py).
+        backend = FakeBackend(turns=[[failure], [failure], [failure]])
+        client = _client(backend, settings=_settings(retry_backoff_seconds=0.0))
         response = client.post(
             "/v1/chat/completions",
             json=_chat_body(tools=[READ_FILE_TOOL], tool_choice="required"),
@@ -572,6 +578,8 @@ class TestBoundedRepairPolicy:
         # Buffered tool turn: the failure is pre-response → HTTP status.
         assert response.status_code == 429
         assert response.json()["error"]["code"] == "RATE_LIMITED"
+        # Bounded, never a hot loop: exactly budget-many attempts.
+        assert len(backend.turn_calls) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -645,8 +653,13 @@ class TestStreamingBufferedToolTurns:
         failure = BackendFailure(
             category=BackendErrorCategory.UPSTREAM_5XX, message="boom"
         )
-        backend = FakeBackend(turns=[[TextDelta("partial"), failure]])
-        client = _client(backend)
+        # M9 (ADR-036): UPSTREAM_5XX is retryable, so the buffered drain is
+        # retried within the bounded budget — script the same failing turn
+        # once per attempt (backoff zeroed). The outcome stays pre-response:
+        # the buffered tool path decides BEFORE any SSE byte.
+        failing_turn = [TextDelta("partial"), failure]
+        backend = FakeBackend(turns=[failing_turn, failing_turn, failing_turn])
+        client = _client(backend, settings=_settings(retry_backoff_seconds=0.0))
         with client.stream(
             "POST",
             "/v1/chat/completions",

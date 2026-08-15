@@ -4,9 +4,9 @@ The coding agent must update this file after every milestone.
 
 ## Current status
 
-**Current milestone:** M9 — Reliability hardening — NOT STARTED, awaits the user's explicit go-ahead (milestone gate). M0–M8 are complete.
+**Current milestone:** M9 — Reliability hardening — COMPLETE (offline; live behavior follows deterministically from the offline pins). M0–M9 are complete; M10 (multi-account routing) awaits the user's explicit go-ahead (milestone gate).
 
-**State:** M8 ACCEPTANCE PASSED (user-run, 2026-08-15, FOURTH attempt) — the full autonomous coding loop ran through the gateway on the ADR-034/035 hotfix round 2. Real Qwen Code inspected the fixture (`read_file` ×2), applied the one-line fix (`edit`), ran the tests via `run_shell_command` (twice), and explained the change — capture records 93–106 (monotonic success loop 99–106), every id a gateway-minted `call_dsqg_` round-tripping verbatim through `role=tool.tool_call_id`, gateway executed none of the tools. Result independently verified: the fixture diff is exactly `return total // len(words)` → `return total / len(words)`; `Ran 9 tests ... OK`; the final explanation correctly names integer → true division in `average_word_length`. The ADR-035 bounded repair fired live during the run (`triggers: no_envelope`) and terminated by construction — the final tool-enabled turn paid its one extra inference, answered plainly again, and its honest text flushed; zero simulation markers fired. The fixture was reset to its committed buggy state after the pass.
+**State:** M9 delivered the ROADMAP reliability items behind ADR-036: a BOUNDED transport-retry policy (budget 2, deterministic linear backoff 0.5 s / 1.0 s, taxonomy-driven — non-retryable categories make exactly ONE attempt, no hot loop; final failure re-raised unchanged so mapped statuses are identical to the no-retry path); an upstream request timeout where the vendor had `timeout=None` (annotated vendor patch `DSQG_UPSTREAM_TIMEOUT_SECONDS`, default 60 s; inactivity/stall semantics on the streaming call, total timeout on control-plane calls); strict terminal behavior (a turn without `MessageFinished` is truncation — retryable pre-byte, an error envelope WITHOUT `[DONE]` mid-stream, never a fabricated `stop`); Cloudflare normalization pinned (503 `upstream_unavailable_error`, single attempt); cancellation REJECTED by decision (the call-gate semaphore cannot be released cross-thread; bounded timeout + retry subsumes the need); and operational metrics (`app/metrics.py`, ASGI middleware, open `GET /admin/metrics`). New suite `tests/test_m9_reliability.py` (34 tests) plus six planned re-pins of pre-existing tests whose single-shot retryable failures now consume the retry budget by design. Suite 424 → 458 passed.
 
 **Previous milestone:** M8 — Real coding acceptance — COMPLETE, **ACCEPTANCE PASSED (user-run, 2026-08-15, fourth attempt after hotfix rounds 1+2)**. Autonomous read→edit→test→explain loop through the gateway (capture records 93–106). The first three attempts failed on envelope-less prose turns (marker-bearing simulation, then marker-less intent prose flushed by the termination guard) and were fixed by ADR-031/033 (round 1) and ADR-034/035 (round 2).
 
@@ -22,6 +22,7 @@ The coding agent must update this file after every milestone.
 - M6 (2026-08-14): one emulated tool call — lenient tools normalization, deterministic [available tools] prompt compiler, strict control-envelope parser (honest plain text on any malformed envelope), tool-shaped history compilation (assistant tool_calls + role=tool), structured OpenAI tool_calls output in both response modes, gateway-minted call_dsqg ids, canonical compact-arguments round trip.
 - M7 (2026-08-15): multi-turn tool loop hardening — buffered tool turns (tool-enabled turns drained fully before any response byte in BOTH response modes; failures pre-response → HTTP status; re-emitted through the unchanged sse_stream so M6 chunk shapes are preserved), bounded repair (≤1 retry per turn with a static hint listing valid tool names — never echoed model output; re-branches on the ORIGINAL parent_message_id), backend-link invalidation after multi-attempt turns (next request rebuilds from canonical — ADR-020 self-heal), persistent tool-call ID index derived per request from canonical history, lenient tool-history validation (log-only, never rejects). ADR-028. **ACCEPTANCE PASSED (user-run, 2026-08-15, re-run after the ADR-029 hotfix):** three sequential tool interactions (`list_directory` → `read_file` ROADMAP.md → `read_file` TOOL_CALLING_PROTOCOL.md) plus a final answer built from the results, gateway executed none of the tools (capture records 66–71).
 - M8 (2026-08-15, offline side): real coding acceptance preparation — ADR-030 (design-first), deterministic buggy fixture `acceptance/m8-buggy-repo/` (stdlib-only `textstats` + unittest suite, exactly one failing test / one-line fix, both states offline-verified, fixture docs never leak the bug, committed in the buggy state), offline coding-loop regression `tests/test_m8_coding_shapes.py` (five-cycle loop in the agent wire shape without tool*choice — run_shell_command → grep_search → read_file → edit with large string arguments → run_shell_command → final answer; tool-result injection boundary in both response modes). Readiness check: ZERO gateway code changes required (M6/M7 machinery is tool-agnostic). Suite 413 → 416 passed. Live acceptance is user-run. **ACCEPTANCE PASSED (user-run, 2026-08-15, FOURTH attempt):** after three failed attempts fixed by two hotfix rounds (ADR-031/033; ADR-034/035), the full loop ran live — `read_file` ×2 → `edit` → `run_shell_command` ×2 → final explanation (capture records 93–106; gateway-minted `call_dsqg*`ids round-tripping verbatim; gateway executed none of the tools); fixture suite`Ran 9 tests ... OK`; the one-line `//`→`/` fix correctly explained; fixture reset to buggy afterwards.
+- M9 (2026-08-15): reliability hardening — bounded transport retry (`app/reliability.py`: budget 2, linear backoff `base × retry_number` 0.5 s / 1.0 s, no jitter; only taxonomy-retryable failures retried — RATE_LIMITED / UPSTREAM_NETWORK / UPSTREAM_5XX plus truncation; AUTH_INVALID / CLOUDFLARE_BLOCKED / UPSTREAM_PROTOCOL / CLIENT_BAD_REQUEST / INTERNAL make exactly ONE attempt; final failure re-raised unchanged → mapped statuses identical to no-retry; wraps ONLY pre-byte interactions — stream priming, buffered tool-turn drains, session creation, non-stream drains — mid-stream failures never retried), upstream timeout via annotated vendor patch (`dsk/api.py DEFAULT_REQUEST_TIMEOUT`, `DSQG_UPSTREAM_TIMEOUT_SECONDS` default 60.0; curl_cffi inactivity/stall semantics on the streaming call, total timeout otherwise), strict terminal (`_strict_terminal`: no `MessageFinished` → `UPSTREAM_PROTOCOL` truncation, retryable pre-byte; error envelope WITHOUT `[DONE]` mid-stream; zero-event turns are truncation, not empty answers), Cloudflare pins (503 `upstream_unavailable_error`, `CloudflareError` AND cloudflare-mentioning `APIError`, single attempt), cancellation explicitly REJECTED (ADR-036: call-gate Semaphore cannot release cross-thread), operational metrics (`app/metrics.py` MetricsCollector + pure-ASGI MetricsMiddleware + open `GET /admin/metrics`; request status classes + durations, backend attempts/failures/durations, transport retries, tool-turn + repair counters), six planned re-pins of pre-M9 tests, and the 34-test failure-injection suite `tests/test_m9_reliability.py`. ADR-036.
 
 ## Tests run
 
@@ -237,6 +238,33 @@ Zero simulation markers fired. Independently re-verified afterwards:
 fixture diff exactly `return total // len(words)` -> `return total /
 len(words)`, `Ran 9 tests ... OK`, fixture reset to its committed buggy
 state.
+
+M9 suite (same day, ADR-036):
+.venv\Scripts\python.exe -m pytest -q
+424 -> 458 passed, 3 deselected (live tests excluded by default
+marker). New: tests/test_m9_reliability.py (34 tests) — with_transport_retry
+unit pins (budget, linear backoff [0.5, 1.0] injected-sleep schedule,
+taxonomy-driven single attempt for non-retryables, non-BackendFailure
+propagation, max_retries=0, metrics accounting), public retry behavior
+(retryable recovery 200 with turn_calls==2; non-retryable ONE attempt,
+no hot loop; budget exhaustion keeps the exact no-retry error envelope;
+backend_attempts counts session + turn attempts), strict terminal
+(eventless turn recovery pre-byte; eventless-turn budget exhaustion ->
+502 UPSTREAM_PROTOCOL; MID-stream truncation -> 200 + error envelope +
+NO [DONE] + exactly ONE attempt), buffered tool-turn truncation budget,
+Cloudflare pins (CloudflareError AND cloudflare-mentioning APIError ->
+CLOUDFLARE_BLOCKED, 503 upstream_unavailable_error, single attempt),
+timeout plumbing (request_timeout -> vendor DEFAULT_REQUEST_TIMEOUT
+seam; None leaves the vendor default; env parsing), metrics surface
+(open /admin/metrics shape; per-endpoint status classes; tool-turn +
+repair counters), config parsing (defaults + env overrides + ConfigError
+matrix). Six planned re-pins of pre-M9 tests whose single-shot
+retryable failures now consume the retry budget by design (test_api
+rate-limit mapping, test_api_streaming first-byte failure + the old
+empty-turn test -> truncation contract, test_api_multi_turn pre-stream
+failure invalidation, test_m7_loop repair-failure + streaming-tool-failure
+statuses) — every re-pin asserts the SAME public status/type/code plus
+exactly budget-many backend calls.
 ```
 
 ## Known limitations
@@ -248,7 +276,8 @@ state.
 - Live multi-turn acceptance against chat.deepseek.com: the delta+parent strategy is NOW live-verified (post-M6 hotfix ADR-025 — upstream requires `parent_message_id` as a u32 number; after the fix, tool-history turn 2 succeeds on the session-reuse path). The formal pytest live test `tests/test_live_upstream.py::test_live_multi_turn_threads_parent_message_id` has still never run (marker `live`); the probe covered the same behavior. If upstream ever rejects parent threading again, the rebuild path (fresh session + full-history prompt) remains correct and is the documented fallback.
 - Qwen Code agent turns carry ~69 tools; the `[available tools]` block is compacted to fit the upstream prompt budget (ADR-024: first-line descriptions capped at 150 chars, schema `description` keys stripped). The total prompt for a full agent turn is still ~85KB (dominated by the client's own history) — if DeepSeek Web's prompt budget shrinks or history grows, history-side budgeting becomes necessary (not before).
 - Conversation state is in-memory only (bounded 256, least-recently-updated eviction) and dies with the process; continuity self-heals because every request carries its own history. SQLite persistence deferred (ADR-020).
-- Live error paths (429/5xx/Cloudflare) were not triggered during probing; classification is unit-tested offline only.
+- Live error paths (429/5xx/Cloudflare) were not triggered during probing; classification is unit-tested offline only. Since M9 (ADR-036) every simulated failure has a DETERMINISTIC public behavior pinned by tests: retryable categories absorb up to the bounded budget (2 retries, linear 0.5 s/1.0 s backoff) and then surface the SAME mapped status as the no-retry path; non-retryable categories (incl. Cloudflare blocks) make exactly one attempt.
+- M9 reliability boundaries (ADR-036): transport retry covers ONLY pre-byte interactions (priming, buffered drains, session creation) — once HTTP 200 is committed, failures/truncation emit the in-stream error envelope and never retry (replaying deltas would corrupt the wire); the upstream timeout is an INACTIVITY bound on the streaming call (silent socket aborts after `DSQG_UPSTREAM_TIMEOUT_SECONDS`, default 60 s; healthy long streams survive) and a total bound on control-plane calls — a slow-but-talking stream is not aborted; request cancellation is intentionally NOT supported (the call-gate Semaphore cannot be released cross-thread; a cancelled turn would deadlock the single backend slot); metrics are in-memory per process (reset on restart, no persistence by design).
 - Upstream deepseek4free is dormant since 2025-02-09; its stream parser was fully obsolete (protocol changed). Further drift is possible at any time; probe captures are the early-warning mechanism.
 - Sampling parameters are accepted but ignored; no usage chunk in streams (no upstream token counts; Qwen Code tolerates absence).
 - Reasoning/thinking content is intentionally NOT surfaced in streams.
@@ -257,7 +286,7 @@ state.
 
 ## Next action
 
-**M8 ACCEPTANCE PASSED (user-run, 2026-08-15, fourth attempt) — M0–M8 complete.** The autonomous coding loop ran end-to-end through the gateway on the ADR-034/035 build (capture records 93–106; success loop 99–106: `read_file` ×2 → `edit` → `run_shell_command` ×2 → final explanation). All ROADMAP M8 exit criteria verified: the exact one-line fix (`//` → `/` in `average_word_length`), fixture suite `Ran 9 tests ... OK`, a correct final explanation, gateway-minted ids round-tripping verbatim, the gateway executing NONE of the tools, and no raw sentinels or simulation in the UI. The ADR-035 bounded repair fired live (`no_envelope`) and terminated by construction. The fixture was reset to its committed buggy state after the pass. **Next milestone is M9 (reliability hardening) — per the milestone gate, do NOT start M9 without the user's explicit go-ahead.**
+**M9 COMPLETE (offline) — M0–M9 complete.** Reliability hardening shipped behind ADR-036: bounded transport retry (budget 2, deterministic linear backoff, taxonomy-driven; non-retryables single-attempt — no hot loop by construction), upstream timeout (annotated vendor patch; stall semantics on streams), strict terminal behavior (truncation is an error, never a fabricated `stop`; `[DONE]` only after a real terminal marker), Cloudflare normalization pins, and open operational metrics at `GET /admin/metrics`. Full offline suite 458 passed, 3 deselected; the six behavior-change re-pins were executed in the same commit (every re-pin keeps the public status/type/code and adds the budget proof). Live M9 behavior needs no acceptance run — the failure paths are simulated deterministically offline — but the running gateway instance predates M9 and must be RESTARTED to serve it. **Next milestone is M10 (multi-account routing) — per the milestone gate, do NOT start M10 without the user's explicit go-ahead.**
 
 ---
 

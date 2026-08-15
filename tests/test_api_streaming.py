@@ -180,7 +180,14 @@ class TestStreamingErrors:
         failure = BackendFailure(
             category=BackendErrorCategory.RATE_LIMITED, message="slow down"
         )
-        client = _client(_settings(), FakeBackend(turns=[[failure]]))
+        # M9 (ADR-036): the retryable failure must map to the SAME status
+        # after the whole bounded retry budget (one scripted failure per
+        # attempt; backoff zeroed — the schedule is pinned in
+        # tests/test_m9_reliability.py).
+        client = _client(
+            _settings(retry_backoff_seconds=0.0),
+            FakeBackend(turns=[[failure], [failure], [failure]]),
+        )
         response = client.post("/v1/chat/completions", json=_chat_body(), headers=AUTH)
         assert response.status_code == 429
         error = response.json()["error"]
@@ -215,13 +222,23 @@ class TestStreamingErrors:
         # The partial content still arrived before the failure.
         assert _parse(lines[1])["choices"][0]["delta"]["content"] == "par"
 
-    def test_empty_scripted_turn_is_a_well_formed_empty_stream(self) -> None:
-        client = _client(_settings(), FakeBackend(turns=[[]]))
-        lines = _stream_lines(client, _chat_body())
-        assert lines[-1] == "data: [DONE]"
-        chunks = [_parse(line) for line in lines[:-1]]
-        assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
-        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    def test_eventless_turn_is_truncation_after_bounded_retry(self) -> None:
+        # M9 (ADR-036) strict terminal: a turn that ends without a
+        # MessageFinished marker is a truncated upstream answer — never a
+        # fabricated "stop". A zero-event turn fails at priming, so it is
+        # retried within the bounded budget (one empty turn scripted per
+        # attempt; backoff zeroed) and then surfaces as a deterministic
+        # 502 UPSTREAM_PROTOCOL.
+        backend = FakeBackend(turns=[[], [], []])
+        client = _client(_settings(retry_backoff_seconds=0.0), backend)
+        response = client.post("/v1/chat/completions", json=_chat_body(), headers=AUTH)
+        assert response.status_code == 502
+        error = response.json()["error"]
+        assert error["code"] == "UPSTREAM_PROTOCOL"
+        assert error["message"] == (
+            "Upstream turn ended without a terminal marker (truncated)"
+        )
+        assert len(backend.turn_calls) == 3
 
     def test_exhausted_fake_before_first_byte_is_500(self) -> None:
         client = _client(_settings(), FakeBackend())  # no scripted turns

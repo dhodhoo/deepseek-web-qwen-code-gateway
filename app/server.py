@@ -76,6 +76,7 @@ from .conversation import (
 )
 from .diagnostics import RequestRecorder
 from .error_mapping import backend_failure_to_response, openai_error_body
+from .metrics import MetricsCollector, MetricsMiddleware
 from .openai_types import (
     AssistantMessageOut,
     ChatCompletionRequest,
@@ -91,7 +92,8 @@ from .prompt_compiler import (
     compile_canonical_to_prompt,
     messages_to_canonical,
 )
-from .streaming import STREAM_EMPTY, sse_stream
+from .reliability import RetryPolicy, with_transport_retry
+from .streaming import sse_stream
 from .tool_envelope import (
     SIMULATION_MARKERS,
     EmittedToolCall,
@@ -114,6 +116,61 @@ _log = logging.getLogger("dsqg.server")
 #: i.e. at most two backend calls per turn. The protocol demands the bound
 #: ("Avoid infinite repair loops", docs/TOOL_CALLING_PROTOCOL.md).
 MAX_TOOL_REPAIR_ATTEMPTS = 1
+
+
+# ---------------------------------------------------------------------------
+# M9 (ADR-036): strict terminal enforcement + transport-retry glue
+# ---------------------------------------------------------------------------
+
+
+def _truncation_failure() -> BackendFailure:
+    """Strict-terminal failure: a turn ended WITHOUT ``MessageFinished``.
+
+    A clean-but-markerless stream is a truncated upstream answer; handing
+    it to the client as a completed ``stop`` turn would silently deliver
+    a partial answer. Classified UPSTREAM_PROTOCOL but marked RETRYABLE:
+    transient truncation deserves the bounded transport retry, and a
+    persistent one surfaces as 502 after the budget — deterministically.
+    """
+    return BackendFailure(
+        category=BackendErrorCategory.UPSTREAM_PROTOCOL,
+        message="Upstream turn ended without a terminal marker (truncated)",
+        retryable=True,
+    )
+
+
+def _strict_terminal(events):
+    """Pass events through; raise truncation if no ``MessageFinished`` came.
+
+    Wraps the backend pipeline closest to the source so the failure
+    propagates through ``_observed_events`` (which invalidates the
+    backend link on ``BackendFailure``) and — on the streaming path —
+    surfaces inside ``sse_stream``'s consumption, where it becomes the
+    in-stream error envelope WITHOUT ``[DONE]`` (the mid-stream failure
+    contract, ADR-019).
+    """
+    finished = False
+    for event in events:
+        if isinstance(event, MessageFinished):
+            finished = True
+        yield event
+    if not finished:
+        raise _truncation_failure()
+
+
+def _make_on_retry(policy: RetryPolicy):
+    """Transport-retry log hook (the gateway's only retry log line)."""
+
+    def on_retry(retry_number: int, delay: float, failure: BackendFailure) -> None:
+        _log.info(
+            "transport retry %d/%d after %.2fs: category=%s",
+            retry_number,
+            policy.max_retries,
+            delay,
+            failure.category.value,
+        )
+
+    return on_retry
 
 
 def _tool_repair_hint(
@@ -373,7 +430,15 @@ def _prepare_turn(
         parent_message_id = conversation.backend_parent_message_id
         prompt_messages = delta
     else:
-        session = backend_.create_session()
+        # M9 (ADR-036): session creation is a pre-byte backend call too,
+        # so it gets the same bounded transport retry (a transient network
+        # hiccup here used to fail the whole request immediately).
+        session = with_transport_retry(
+            backend_.create_session,
+            policy=request.app.state.retry_policy,
+            on_retry=_make_on_retry(request.app.state.retry_policy),
+            metrics=request.app.state.metrics,
+        )
         session_id = session.session_id
         parent_message_id = None
         prompt_messages = canonical
@@ -480,6 +545,11 @@ def _drain_tool_attempt(
                 retryable=event.retryable,
                 status_code=event.status_code,
             )
+    if not recorder.finished:
+        # M9 (ADR-036) strict terminal: a truncated turn must never enter
+        # the repair policy (or reach the client) as if it had completed.
+        # Retryable — the transport retry re-runs this drain.
+        raise _truncation_failure()
     return recorder
 
 
@@ -492,6 +562,8 @@ def _run_buffered_tool_turn(
     required: bool,
     pre_loop: bool,
     retry_base: str | None = None,
+    policy: RetryPolicy,
+    metrics: MetricsCollector | None = None,
 ) -> tuple[_TurnRecorder, int]:
     """One tool-enabled turn under the bounded repair policy (M7).
 
@@ -535,9 +607,28 @@ def _run_buffered_tool_turn(
     current_prompt = prompt
     while True:
         attempts_used += 1
+
+        # M9 (ADR-036): each semantic attempt is wrapped in the bounded
+        # TRANSPORT retry — transient failures (rate limit, network,
+        # truncation) re-run the drain on the same prompt/parent before
+        # the repair policy ever sees them. One fresh envelope parser per
+        # attempt (semantic AND transport), keeping the injection
+        # boundary per-inference; ``parser`` afterwards is the SUCCESSFUL
+        # attempt's parser, which the trigger inspection below needs.
         parser = EnvelopeParser(tools)
-        recorder = _drain_tool_attempt(
-            backend_, context, current_prompt, parser
+
+        def _attempt(_prompt: str = current_prompt) -> _TurnRecorder:
+            nonlocal parser
+            parser = EnvelopeParser(tools)
+            return _drain_tool_attempt(
+                backend_, context, _prompt, parser
+            )
+
+        recorder = with_transport_retry(
+            _attempt,
+            policy=policy,
+            on_retry=_make_on_retry(policy),
+            metrics=metrics,
         )
         if recorder.tool_calls:
             return recorder, attempts_used
@@ -570,6 +661,8 @@ def _run_buffered_tool_turn(
                 attempts_used,
                 ", ".join(reasons),
             )
+            if metrics is not None:
+                metrics.record_tool_repair_budget_exhausted()
             return recorder, attempts_used
         _log.info(
             "tool repair retry %d/%d (triggers: %s)",
@@ -577,6 +670,8 @@ def _run_buffered_tool_turn(
             MAX_TOOL_REPAIR_ATTEMPTS,
             ", ".join(reasons),
         )
+        if metrics is not None:
+            metrics.record_tool_repair_retry()
         # ADR-033: simulation-marker retries rebuild on the STRIPPED
         # base (no tool-shaped history) so the retry context presents
         # no imitable block template; every other retry keeps the exact
@@ -595,18 +690,17 @@ def _synthesized_events(recorder: _TurnRecorder) -> list:
     the public chunk shapes of the old live path: role chunk, content
     increments, tool-call opener + arguments chunks, and the terminal
     chunk (finish_reason overridden to ``tool_calls`` by the renderer
-    when a tool call is present). An empty list means "the backend
-    produced nothing" — the caller maps it to ``STREAM_EMPTY``. A turn
-    that ended without ``MessageFinished`` (broken backend contract)
-    still renders honestly: whatever was produced, plus a terminal chunk.
+    when a tool call is present). Since M9 (ADR-036) ONLY turns that
+    carried a real terminal marker reach this function — truncated
+    drains raise before the repair policy or the renderer can see them —
+    so the synthesized stream always ends with ``MessageFinished`` and
+    never fabricates a completion.
     """
     events: list = [MessageStarted()]
     events.extend(TextDelta(text) for text in recorder.text_parts)
     events.extend(ToolCallEmitted(call=call) for call in recorder.tool_calls)
-    if recorder.finished or len(events) > 1:
-        events.append(MessageFinished(recorder.finish_reason))
-        return events
-    return []
+    events.append(MessageFinished(recorder.finish_reason))
+    return events
 
 
 def _finish_tool_turn(
@@ -638,6 +732,8 @@ def _start_buffered_tool_stream(
     required: bool,
     pre_loop: bool,
     retry_base: str | None = None,
+    policy: RetryPolicy,
+    metrics: MetricsCollector | None = None,
 ) -> StreamingResponse:
     """SSE response for a tool-enabled turn (M7 buffered path, ADR-028).
 
@@ -657,19 +753,19 @@ def _start_buffered_tool_stream(
             required=required,
             pre_loop=pre_loop,
             retry_base=retry_base,
+            policy=policy,
+            metrics=metrics,
         )
     except BackendFailure as failure:
         _invalidate_turn(context)
         status, error_body = backend_failure_to_response(failure)
         raise GatewayHttpError(status, error_body) from failure
     _finish_tool_turn(context, recorder, attempts_used)
+    # M9 (ADR-036): the synthesized stream always carries a terminal
+    # marker (strict terminal), so it is never empty and never degenerate.
     events = _synthesized_events(recorder)
-    if events:
-        primed: object = events[0]
-        rest: Iterator = iter(events[1:])
-    else:
-        primed = STREAM_EMPTY
-        rest = iter(())
+    primed: object = events[0]
+    rest: Iterator = iter(events[1:])
     return StreamingResponse(
         sse_stream(
             primed,
@@ -750,39 +846,65 @@ def _start_stream_response(
     cfg: GatewaySettings,
     prompt: str,
     parser: EnvelopeParser | None = None,
+    *,
+    policy: RetryPolicy,
+    metrics: MetricsCollector | None = None,
 ) -> StreamingResponse:
     """Begin an SSE streaming turn (M3 priming + M4 state bookkeeping).
 
-    Pipeline order: backend events → control-envelope parser (M6; a
-    no-op pass-through when tools are disabled) → canonical-state tap
-    (``_observed_events``) → SSE renderer. The transform runs BEFORE the
-    tap so the recorder and the commit see the parsed turn (renderable
-    text + emitted tool call), never raw envelope fragments.
+    Pipeline order: backend events → strict-terminal guard (M9) →
+    control-envelope parser (M6; a no-op pass-through when tools are
+    disabled) → canonical-state tap (``_observed_events``) → SSE
+    renderer. The transform runs BEFORE the tap so the recorder and the
+    commit see the parsed turn (renderable text + emitted tool call),
+    never raw envelope fragments.
 
     The FIRST event is pulled synchronously (this handler runs in
-    Starlette's threadpool) BEFORE any response byte is committed: failures
-    raised while priming therefore still answer with a real HTTP status —
-    the Qwen Code client keys its retry behavior off HTTP status
-    (docs/UPSTREAM_NOTES.md). Mid-stream failures become an in-stream error
-    envelope instead (app/streaming.py, ADR-019).
+    Starlette's threadpool) BEFORE any response byte is committed:
+    failures raised while priming therefore still answer with a real
+    HTTP status — the Qwen Code client keys its retry behavior off HTTP
+    status (docs/UPSTREAM_NOTES.md). M9 (ADR-036): priming is wrapped in
+    the bounded transport retry — each attempt builds a FRESH pipeline
+    (fresh recorder, fresh backend generator), so a retryable pre-byte
+    failure (rate limit, network, zero-event/first-event truncation)
+    re-issues the turn before any status goes out. Mid-stream failures
+    (after HTTP 200 is committed) are never retried; they become an
+    in-stream error envelope instead (app/streaming.py, ADR-019) — same
+    contract when the strict-terminal guard fires on a truncated stream.
+
+    Note: the route only ever passes ``parser=None`` (tool-enabled turns
+    use the buffered path, M7); retried priming therefore never reuses a
+    partially fed parser.
     """
-    recorder = _TurnRecorder()
-    events = _observed_events(
-        _tool_aware_events(
-            backend_.stream_turn(
-                context.session_id,
-                prompt,
-                parent_message_id=context.parent_message_id,
+
+    def _prime_attempt():
+        pipeline = _observed_events(
+            _strict_terminal(
+                _tool_aware_events(
+                    backend_.stream_turn(
+                        context.session_id,
+                        prompt,
+                        parent_message_id=context.parent_message_id,
+                    ),
+                    parser,
+                )
             ),
-            parser,
-        ),
-        context=context,
-        recorder=recorder,
-    )
+            context=context,
+            recorder=_TurnRecorder(),
+        )
+        # A zero-event turn raises the (retryable) truncation failure
+        # from _strict_terminal here — StopIteration can no longer escape
+        # priming, so STREAM_EMPTY is unreachable via the routes (ADR-036).
+        primed = next(pipeline)
+        return pipeline, primed
+
     try:
-        primed = next(events)
-    except StopIteration:
-        primed = STREAM_EMPTY
+        events, primed = with_transport_retry(
+            _prime_attempt,
+            policy=policy,
+            on_retry=_make_on_retry(policy),
+            metrics=metrics,
+        )
     except BackendFailure as failure:
         _invalidate_turn(context)
         status, error_body = backend_failure_to_response(failure)
@@ -815,19 +937,23 @@ def create_app(
     settings: GatewaySettings | None = None,
     backend: LLMBackend | None = None,
     store: ConversationStore | None = None,
+    metrics: MetricsCollector | None = None,
 ) -> FastAPI:
     """Build the gateway application.
 
     ``settings`` defaults to :meth:`GatewaySettings.from_env`; ``backend``
     defaults to :func:`build_backend(settings)`; ``store`` defaults to a
-    fresh bounded in-memory :class:`ConversationStore` (ADR-020). All three
-    are injectable for tests (the whole surface is testable offline with
-    ``FakeBackend``).
+    fresh bounded in-memory :class:`ConversationStore` (ADR-020);
+    ``metrics`` defaults to a fresh :class:`MetricsCollector` (M9,
+    ADR-036). All four are injectable for tests (the whole surface is
+    testable offline with ``FakeBackend``).
     """
     if settings is None:
         settings = GatewaySettings.from_env()
     if backend is None:
         backend = build_backend(settings)
+    if metrics is None:
+        metrics = MetricsCollector()
 
     app = FastAPI(
         title="DeepSeek Qwen Gateway",
@@ -841,6 +967,17 @@ def create_app(
     app.state.settings = settings
     app.state.backend = backend
     app.state.store = store if store is not None else ConversationStore()
+    # M9 (ADR-036): reliability knobs shared by every request path — the
+    # bounded transport-retry policy (from settings) and the collector
+    # behind GET /admin/metrics.
+    app.state.metrics = metrics
+    app.state.retry_policy = RetryPolicy(
+        max_retries=settings.max_retries,
+        backoff_seconds=settings.retry_backoff_seconds,
+    )
+    # Pure ASGI instrumentation (streaming-safe): records every request's
+    # endpoint, final status class and duration.
+    app.add_middleware(MetricsMiddleware, metrics=metrics)
     # M5 (ADR-021): opt-in diagnostic request capture; None when disabled.
     app.state.recorder = (
         RequestRecorder(settings.diagnostics_dir)
@@ -926,6 +1063,16 @@ def create_app(
             },
         }
 
+    @app.get("/admin/metrics")
+    def admin_metrics(request: Request) -> dict:
+        """Operational counters (M9, ADR-036).
+
+        Unauthenticated like ``/health``: the gateway binds locally and
+        the payload carries counters and durations only — no prompts, no
+        ids, never secrets.
+        """
+        return request.app.state.metrics.snapshot()
+
     @app.get(
         "/v1/models",
         dependencies=[Depends(require_gateway_auth)],
@@ -946,6 +1093,10 @@ def create_app(
         # regardless of this annotation.
         cfg: GatewaySettings = request.app.state.settings
         backend_: LLMBackend = request.app.state.backend
+        # M9 (ADR-036): the bounded transport-retry policy and the
+        # metrics collector live on app.state (built in create_app).
+        policy: RetryPolicy = request.app.state.retry_policy
+        metrics: MetricsCollector | None = request.app.state.metrics
 
         # M5 (ADR-021): capture the request BEFORE any validation so the
         # diagnostic layer also records shapes the gateway rejects — that
@@ -1022,6 +1173,9 @@ def create_app(
             request, backend_, canonical, tool_instructions
         )
 
+        if tools_enabled and metrics is not None:
+            metrics.record_tool_turn()
+
         if body.stream:
             if tools_enabled:
                 # M7 (ADR-028): buffered tool turn + bounded repair — the
@@ -1035,10 +1189,14 @@ def create_app(
                     required=required,
                     pre_loop=pre_loop,
                     retry_base=retry_base,
+                    policy=policy,
+                    metrics=metrics,
                 )
-            # Tool-disabled streaming stays on the exact M3 path
-            # (byte-identical; M3 fixtures pinned).
-            return _start_stream_response(backend_, context, cfg, prompt)
+            # Tool-disabled streaming stays on the M3 path, plus the M9
+            # bounded transport retry around priming + strict terminal.
+            return _start_stream_response(
+                backend_, context, cfg, prompt, policy=policy, metrics=metrics
+            )
 
         if tools_enabled:
             # M7 (ADR-028): the non-streaming tool path shares the
@@ -1053,6 +1211,8 @@ def create_app(
                     required=required,
                     pre_loop=pre_loop,
                     retry_base=retry_base,
+                    policy=policy,
+                    metrics=metrics,
                 )
             except BackendFailure as failure:
                 _invalidate_turn(context)
@@ -1061,18 +1221,19 @@ def create_app(
             _finish_tool_turn(context, recorder, attempts_used)
             finish_reason: str | None = recorder.finish_reason
         else:
-            recorder = _TurnRecorder()
-            try:
-                finish_reason = None
+            # M9 (ADR-036): the whole non-streaming drain is pre-byte, so
+            # it sits inside the bounded transport retry; strict terminal
+            # turns a markerless stream into the retryable truncation
+            # failure instead of a fabricated ``stop`` answer.
+            def _plain_attempt() -> _TurnRecorder:
+                local = _TurnRecorder()
                 for event in backend_.stream_turn(
                     context.session_id,
                     prompt,
                     parent_message_id=context.parent_message_id,
                 ):
-                    recorder.observe(event)
-                    if isinstance(event, MessageFinished):
-                        finish_reason = event.finish_reason
-                    elif isinstance(event, BackendError):
+                    local.observe(event)
+                    if isinstance(event, BackendError):
                         # Defensive: current backends raise BackendFailure
                         # (ADR-011/014); handle the event surface too.
                         raise BackendFailure(
@@ -1084,11 +1245,23 @@ def create_app(
                     # ReasoningDelta / MessageStarted / BackendMessageId /
                     # UnknownDelta need no response rendering; the recorder
                     # keeps whatever canonical state needs (M4).
+                if not local.finished:
+                    raise _truncation_failure()
+                return local
+
+            try:
+                recorder = with_transport_retry(
+                    _plain_attempt,
+                    policy=policy,
+                    on_retry=_make_on_retry(policy),
+                    metrics=metrics,
+                )
             except BackendFailure as failure:
                 _invalidate_turn(context)
                 status, error_body = backend_failure_to_response(failure)
                 raise GatewayHttpError(status, error_body) from failure
-            if recorder.finished and not recorder.committed:
+            finish_reason = recorder.finish_reason
+            if not recorder.committed:
                 _commit_turn(context, recorder)
 
         tool_calls_out = [

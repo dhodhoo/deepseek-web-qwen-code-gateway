@@ -50,6 +50,7 @@ Items marked **LIVE-PENDING** require a credential run of `scripts/probe_deepsee
 
 - Upstream pins `curl-cffi==0.8.1b9`. **Not installable** on Python 3.12+/3.14 on Windows: no wheels; sdist build downloads `libcurl-impersonate v0.8.2` from a GitHub release that now 404s.
 - Verified replacement: `curl-cffi==0.16.0` (cp310-abi3 wheel). All APIs used by the vendored client exist: `requests.request/post(..., impersonate='chrome120', stream=True, timeout=None)`, `response.iter_lines()`, `response.json()`, `requests.exceptions.RequestException`. `chrome120` is still an accepted impersonation target in 0.16.0.
+- **M9 (ADR-036):** the vendored `timeout=None` (unlimited) is replaced by the annotated vendor patch `[DSQG-VENDOR-PATCH] M9` (`dsk/api.py DEFAULT_REQUEST_TIMEOUT`, set from `DSQG_UPSTREAM_TIMEOUT_SECONDS`, default 60 s). curl_cffi semantics: with `stream=True` the value becomes an INACTIVITY bound (connect timeout + `LOW_SPEED_LIMIT=1`/`LOW_SPEED_TIME`), so a silent socket aborts while a healthy long stream survives; on non-streaming calls it is a total timeout.
 - Behavioral risk (RESOLVED 2026-08-14): TLS/HTTP2 fingerprint differences between curl-cffi 0.8.1b9 and 0.16.0 impersonation profiles were a concern; the live probe succeeded with 0.16.0 `chrome120` impersonation — no bot-detection rejection observed in three runs.
 
 ### Auth behavior
@@ -162,16 +163,28 @@ Verified offline (unit-tested classification). Live probing hit no error paths
 (valid credential, no CF challenge, no rate limit across four runs), so live
 error triggering remains untested:
 
-| Upstream                                 | Gateway category   | Retryable         |
-| ---------------------------------------- | ------------------ | ----------------- |
-| `AuthenticationError` (401)              | AUTH_INVALID       | no                |
-| `RateLimitError` (429)                   | RATE_LIMITED       | yes (bounded, M9) |
-| `CloudflareError` / CF-giveup `APIError` | CLOUDFLARE_BLOCKED | no                |
-| `NetworkError`                           | UPSTREAM_NETWORK   | yes               |
-| `APIError` status >= 500                 | UPSTREAM_5XX       | yes               |
-| `APIError` other status                  | UPSTREAM_PROTOCOL  | no                |
-| `APIError` no status (JSON/parse)        | UPSTREAM_PROTOCOL  | no                |
-| malformed SSE JSON                       | UPSTREAM_PROTOCOL  | no                |
+| Upstream                                 | Gateway category              | Retryable           |
+| ---------------------------------------- | ----------------------------- | ------------------- |
+| `AuthenticationError` (401)              | AUTH_INVALID                  | no                  |
+| `RateLimitError` (429)                   | RATE_LIMITED                  | yes (bounded, M9)   |
+| `CloudflareError` / CF-giveup `APIError` | CLOUDFLARE_BLOCKED            | no                  |
+| `NetworkError`                           | UPSTREAM_NETWORK              | yes                 |
+| `APIError` status >= 500                 | UPSTREAM_5XX                  | yes                 |
+| `APIError` other status                  | UPSTREAM_PROTOCOL             | no                  |
+| `APIError` no status (JSON/parse)        | UPSTREAM_PROTOCOL             | no                  |
+| malformed SSE JSON                       | UPSTREAM_PROTOCOL             | no                  |
+| turn ends without a terminal marker (M9) | UPSTREAM_PROTOCOL (truncated) | yes (pre-byte only) |
+
+Since M9 (ADR-036) the "Retryable" column is ENFORCED by the bounded
+transport retry: retryable failures are retried up to the budget
+(`GATEWAY_MAX_RETRIES`, default 2; linear backoff, no jitter) before the
+client sees anything, non-retryable failures make exactly one attempt,
+and the final failure keeps the exact no-retry HTTP mapping. Truncation
+is the one deliberate override: the taxonomy default for
+UPSTREAM_PROTOCOL is non-retryable, but a marker-less turn (a transient
+upstream cut) is retried pre-byte; mid-stream truncation is never
+retried (HTTP 200 already committed). All of this is pinned offline by
+tests/test_m9_reliability.py; live triggering still unobserved.
 
 ### Deviations from starter assumptions
 

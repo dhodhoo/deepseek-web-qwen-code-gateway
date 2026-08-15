@@ -29,6 +29,13 @@ Environment variables (see .env.example):
 * ``GATEWAY_HOST``/``GATEWAY_PORT`` — bind address for ``python -m app.main``
 * ``GATEWAY_DIAGNOSTICS_DIR``  — optional directory for the opt-in M5
   diagnostic request capture (sanitized JSONL; see app/diagnostics.py)
+* ``GATEWAY_MAX_RETRIES``      — M9 (ADR-036): max transport retries per
+  request (default ``2``; ``0`` disables; bounded, never infinite)
+* ``GATEWAY_RETRY_BACKOFF_SECONDS`` — M9: linear retry backoff base
+  (default ``0.5``; retry *n* sleeps ``base * n``)
+* ``DSQG_UPSTREAM_TIMEOUT_SECONDS`` — M9: upstream request timeout
+  (default ``60``; a stall/inactivity timeout on the streaming call per
+  curl_cffi semantics, total timeout on control-plane calls)
 
 ``python -m app.main`` additionally merges the repository-root ``.env``
 file under the real environment via :func:`load_env_file` (ADR-022):
@@ -44,6 +51,10 @@ from typing import Mapping
 from pydantic import BaseModel, ConfigDict, SecretStr
 
 from .backends.base import LLMBackend
+from .reliability import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_RETRY_BACKOFF_SECONDS,
+)
 
 __all__ = [
     "ConfigError",
@@ -61,6 +72,10 @@ FAKE_BACKEND_TYPE = "fake"
 DEFAULT_MODEL_ID = "deepseek-web"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
+
+# M9 (ADR-036): the retry defaults are imported from app/reliability.py
+# (single source); the upstream timeout default is owned here.
+DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 60.0
 
 _TRUTHY = {"1", "true", "yes", "on"}
 _FALSY = {"0", "false", "no", "off", ""}
@@ -89,6 +104,54 @@ def _parse_port(raw: str | None) -> int:
     if not 1 <= port <= 65535:
         raise ConfigError("GATEWAY_PORT must be between 1 and 65535")
     return port
+
+
+def _parse_non_negative_int(raw: str | None, var_name: str, default: int) -> int:
+    """M9 (ADR-036): integer env parsing with a default (never negative)."""
+    value = (raw or "").strip()
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ConfigError(
+            f"{var_name} must be an integer, got a value of length {len(value)}"
+        ) from None
+    if parsed < 0:
+        raise ConfigError(f"{var_name} must be >= 0 (bounded by design)")
+    return parsed
+
+
+def _parse_non_negative_float(raw: str | None, var_name: str, default: float) -> float:
+    """M9 (ADR-036): float env parsing, >= 0 (backoff may be 0 = no delay)."""
+    value = (raw or "").strip()
+    if not value:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise ConfigError(
+            f"{var_name} must be a number, got a value of length {len(value)}"
+        ) from None
+    if parsed < 0:
+        raise ConfigError(f"{var_name} must be >= 0")
+    return parsed
+
+
+def _parse_seconds(raw: str | None, var_name: str, default: float) -> float:
+    """M9 (ADR-036): float-seconds env parsing (must be > 0)."""
+    value = (raw or "").strip()
+    if not value:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise ConfigError(
+            f"{var_name} must be a number, got a value of length {len(value)}"
+        ) from None
+    if not parsed > 0:
+        raise ConfigError(f"{var_name} must be > 0")
+    return parsed
 
 
 def load_env_file(
@@ -161,6 +224,10 @@ class GatewaySettings(BaseModel):
     port: int = DEFAULT_PORT
     # --- M5: opt-in diagnostic request capture (app/diagnostics.py) ------
     diagnostics_dir: Path | None = None
+    # --- M9 (ADR-036): reliability hardening ------------------------------
+    max_retries: int = DEFAULT_MAX_RETRIES
+    retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS
+    upstream_timeout_seconds: float = DEFAULT_UPSTREAM_TIMEOUT_SECONDS
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "GatewaySettings":
@@ -191,6 +258,22 @@ class GatewaySettings(BaseModel):
         diagnostics_raw = (source.get("GATEWAY_DIAGNOSTICS_DIR") or "").strip()
         common["diagnostics_dir"] = (
             Path(diagnostics_raw) if diagnostics_raw else None
+        )
+        # M9 (ADR-036): bounded retry policy + upstream timeout.
+        common["max_retries"] = _parse_non_negative_int(
+            source.get("GATEWAY_MAX_RETRIES"),
+            "GATEWAY_MAX_RETRIES",
+            DEFAULT_MAX_RETRIES,
+        )
+        common["retry_backoff_seconds"] = _parse_non_negative_float(
+            source.get("GATEWAY_RETRY_BACKOFF_SECONDS"),
+            "GATEWAY_RETRY_BACKOFF_SECONDS",
+            DEFAULT_RETRY_BACKOFF_SECONDS,
+        )
+        common["upstream_timeout_seconds"] = _parse_seconds(
+            source.get("DSQG_UPSTREAM_TIMEOUT_SECONDS"),
+            "DSQG_UPSTREAM_TIMEOUT_SECONDS",
+            DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
         )
 
         if backend_type == FAKE_BACKEND_TYPE:
@@ -243,6 +326,9 @@ def build_backend(settings: GatewaySettings) -> LLMBackend:
         return DeepSeekWebBackend(
             settings.deepseek_web.auth_token.get_secret_value(),
             cookies_file=settings.deepseek_web.cookies_file,
+            # M9 (ADR-036): bounded upstream timeout (stall semantics on
+            # the streaming call; see vendor/deepseek4free/dsk/api.py).
+            request_timeout=settings.upstream_timeout_seconds,
         )
 
     raise ConfigError(f"Unknown backend_type {settings.backend_type!r}")

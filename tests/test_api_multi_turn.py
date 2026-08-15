@@ -42,8 +42,12 @@ def _settings(**overrides) -> GatewaySettings:
     return GatewaySettings(**base)
 
 
-def _client(backend: FakeBackend, store: ConversationStore | None = None) -> TestClient:
-    return TestClient(create_app(_settings(), backend, store))
+def _client(
+    backend: FakeBackend,
+    store: ConversationStore | None = None,
+    settings: GatewaySettings | None = None,
+) -> TestClient:
+    return TestClient(create_app(settings or _settings(), backend, store))
 
 
 def _turn(text: str, message_id: str | None = None, *, finish: str = "stop") -> list:
@@ -306,20 +310,26 @@ class TestFailureAndRebuild:
     def test_pre_stream_failure_on_existing_conversation_invalidates_link(
         self,
     ) -> None:
+        # M9 (ADR-036): RATE_LIMITED is retryable, so the failing turn must
+        # be scripted once per attempt in the bounded budget (1 + 2 retries;
+        # backoff zeroed — the schedule is pinned in
+        # tests/test_m9_reliability.py). The invalidation/rebuild contract
+        # is unchanged: after the WHOLE budget fails, the link is gone and
+        # the next request rebuilds from canonical state.
+        failure = BackendFailure(
+            category=BackendErrorCategory.RATE_LIMITED, message="slow down"
+        )
         backend = FakeBackend(
             turns=[
                 _turn("A1", "resp-1"),
-                [
-                    BackendFailure(
-                        category=BackendErrorCategory.RATE_LIMITED,
-                        message="slow down",
-                    )
-                ],
+                [failure],
+                [failure],
+                [failure],
                 _turn("A2", "resp-2"),
             ]
         )
         store = ConversationStore()
-        client = _client(backend, store)
+        client = _client(backend, store, settings=_settings(retry_backoff_seconds=0.0))
 
         client.post("/v1/chat/completions", json=_chat([_user("one")]), headers=AUTH)
         failed = client.post(
@@ -343,7 +353,7 @@ class TestFailureAndRebuild:
             headers=AUTH,
         )
         assert retry.status_code == 200
-        rebuild = backend.turn_calls[2]
+        rebuild = backend.turn_calls[4]  # three failed attempts consumed 1..3
         assert rebuild.session_id == "fake-session-2"
         assert "[user]\none" in rebuild.prompt  # rebuilt from canonical state
         assert "[user]\ntwo" in rebuild.prompt

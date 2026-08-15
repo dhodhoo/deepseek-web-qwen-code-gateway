@@ -14,6 +14,16 @@ import time
 ThinkingMode = Literal['detailed', 'simple', 'disabled']
 SearchMode = Literal['enabled', 'disabled']
 
+# [DSQG-VENDOR-PATCH] M9 (ADR-036): both HTTP call sites below used
+# timeout=None — a dead upstream socket could block forever. They now read
+# this module-level value (seconds). The gateway's DeepSeekWebBackend sets
+# it from DSQG_UPSTREAM_TIMEOUT_SECONDS (default 60). curl_cffi semantics:
+# with stream=True this becomes an INACTIVITY timeout (LOW_SPEED_LIMIT=1 /
+# LOW_SPEED_TIME=ceil(t) plus a connect timeout), so healthy long streams
+# survive; without streaming it is a total timeout. None restores the
+# original unlimited behavior.
+DEFAULT_REQUEST_TIMEOUT: Optional[float] = None
+
 class DeepSeekError(Exception):
     """Base exception for all DeepSeek API errors"""
     pass
@@ -132,7 +142,9 @@ class DeepSeekAPI:
                     json=json_data,
                     cookies=self.cookies,
                     impersonate='chrome120',
-                    timeout=None
+                    # [DSQG-VENDOR-PATCH] M9 (ADR-036): was timeout=None —
+                    # total timeout for these non-streaming control calls.
+                    timeout=DEFAULT_REQUEST_TIMEOUT
                 )
 
                 # Check if we hit Cloudflare protection
@@ -238,7 +250,11 @@ class DeepSeekAPI:
                 cookies=self.cookies,  # Add cookies
                 impersonate='chrome120',
                 stream=True,
-                timeout=None
+                # [DSQG-VENDOR-PATCH] M9 (ADR-036): was timeout=None —
+                # curl_cffi maps a float here to an INACTIVITY timeout
+                # (LOW_SPEED_LIMIT=1 / LOW_SPEED_TIME), aborting silent
+                # sockets while healthy long streams keep flowing.
+                timeout=DEFAULT_REQUEST_TIMEOUT
             )
 
             if response.status_code != 200:
