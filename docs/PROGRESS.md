@@ -4,11 +4,11 @@ The coding agent must update this file after every milestone.
 
 ## Current status
 
-**Current milestone:** M8 — Real coding acceptance
+**Current milestone:** M9 — Reliability hardening — NOT STARTED, awaits the user's explicit go-ahead (milestone gate). M0–M8 are complete.
 
-**State:** HOTFIXED after THREE failed user acceptance attempts — **awaiting the user-run acceptance re-run**. The third attempt (2026-08-15 ~10:38) died with a NEW shape: every hotfix mechanism worked as designed (capture records 88–92), but the model kept emitting non-envelope mid-loop turns — including marker-less intent prose plus fabricated `[User]`/`[assistant]` transcripts that escaped every detector, which the termination guard then flushed as the "final answer". Fixed by two design-first escalations: ADR-034 (MAIN-path rendering — historical tool calls compile byte-identical to the instructed envelope itself, so imitation becomes a VALID tool request; marker set extended with the transcript markers; live-verified: replay of the killer turn 91 recovered a real `run_shell_command`) and ADR-035 (universal bounded repair — EVERY envelope-less tool-enabled turn gets the one bounded retry, guard removed; termination preserved by construction via the budget + the plain-answer-permitting hint; live-verified: replay of record 90 logs `tool repair retry 1/1 (triggers: no_envelope)` then recovers a real `read_file` of the not-yet-read test file). Suite 422 → 424 passed, 3 deselected. The main-path history rendering changed (envelope blocks instead of `[assistant tool call]` blocks) — M5 wire-fixture row and history tests re-pinned accordingly; everything else byte-identical. The fixture remains committed in its buggy state. ROADMAP M8 exit unchanged — the user-run re-run is the gate (checklist in docs/QWEN_CODE_INTEGRATION.md). M9 not started — awaits explicit instruction.
+**State:** M8 ACCEPTANCE PASSED (user-run, 2026-08-15, FOURTH attempt) — the full autonomous coding loop ran through the gateway on the ADR-034/035 hotfix round 2. Real Qwen Code inspected the fixture (`read_file` ×2), applied the one-line fix (`edit`), ran the tests via `run_shell_command` (twice), and explained the change — capture records 93–106 (monotonic success loop 99–106), every id a gateway-minted `call_dsqg_` round-tripping verbatim through `role=tool.tool_call_id`, gateway executed none of the tools. Result independently verified: the fixture diff is exactly `return total // len(words)` → `return total / len(words)`; `Ran 9 tests ... OK`; the final explanation correctly names integer → true division in `average_word_length`. The ADR-035 bounded repair fired live during the run (`triggers: no_envelope`) and terminated by construction — the final tool-enabled turn paid its one extra inference, answered plainly again, and its honest text flushed; zero simulation markers fired. The fixture was reset to its committed buggy state after the pass.
 
-**Previous milestone:** M7 — Multi-turn tool loop — COMPLETE, **ACCEPTANCE PASSED (user-run, 2026-08-15, re-run after the ADR-029 hotfix)**. Three sequential tool interactions (`list_directory` → two `read_file`) plus a final answer built from the results; gateway executed none of the tools (capture records 66–71). The first attempt's prose-simulated stall (record 61) was fixed by the ADR-029 hotfix and live-re-verified before the re-run.
+**Previous milestone:** M8 — Real coding acceptance — COMPLETE, **ACCEPTANCE PASSED (user-run, 2026-08-15, fourth attempt after hotfix rounds 1+2)**. Autonomous read→edit→test→explain loop through the gateway (capture records 93–106). The first three attempts failed on envelope-less prose turns (marker-bearing simulation, then marker-less intent prose flushed by the termination guard) and were fixed by ADR-031/033 (round 1) and ADR-034/035 (round 2).
 
 ## Completed
 
@@ -21,7 +21,7 @@ The coding agent must update this file after every milestone.
 - M5 (2026-08-14): real Qwen Code wire compatibility — tools[]/tool_choice accepted and ignored (plain chat usable), opt-in sanitized diagnostic capture layer, source-verified wire fixtures + fixture tests, SDK-driven wire-compat tests, Qwen Code integration/wiring doc.
 - M6 (2026-08-14): one emulated tool call — lenient tools normalization, deterministic [available tools] prompt compiler, strict control-envelope parser (honest plain text on any malformed envelope), tool-shaped history compilation (assistant tool_calls + role=tool), structured OpenAI tool_calls output in both response modes, gateway-minted call_dsqg ids, canonical compact-arguments round trip.
 - M7 (2026-08-15): multi-turn tool loop hardening — buffered tool turns (tool-enabled turns drained fully before any response byte in BOTH response modes; failures pre-response → HTTP status; re-emitted through the unchanged sse_stream so M6 chunk shapes are preserved), bounded repair (≤1 retry per turn with a static hint listing valid tool names — never echoed model output; re-branches on the ORIGINAL parent_message_id), backend-link invalidation after multi-attempt turns (next request rebuilds from canonical — ADR-020 self-heal), persistent tool-call ID index derived per request from canonical history, lenient tool-history validation (log-only, never rejects). ADR-028. **ACCEPTANCE PASSED (user-run, 2026-08-15, re-run after the ADR-029 hotfix):** three sequential tool interactions (`list_directory` → `read_file` ROADMAP.md → `read_file` TOOL_CALLING_PROTOCOL.md) plus a final answer built from the results, gateway executed none of the tools (capture records 66–71).
-- M8 (2026-08-15, offline side): real coding acceptance preparation — ADR-030 (design-first), deterministic buggy fixture `acceptance/m8-buggy-repo/` (stdlib-only `textstats` + unittest suite, exactly one failing test / one-line fix, both states offline-verified, fixture docs never leak the bug, committed in the buggy state), offline coding-loop regression `tests/test_m8_coding_shapes.py` (five-cycle loop in the agent wire shape without tool_choice — run_shell_command → grep_search → read_file → edit with large string arguments → run_shell_command → final answer; tool-result injection boundary in both response modes). Readiness check: ZERO gateway code changes required (M6/M7 machinery is tool-agnostic). Suite 413 → 416 passed. Live acceptance is user-run.
+- M8 (2026-08-15, offline side): real coding acceptance preparation — ADR-030 (design-first), deterministic buggy fixture `acceptance/m8-buggy-repo/` (stdlib-only `textstats` + unittest suite, exactly one failing test / one-line fix, both states offline-verified, fixture docs never leak the bug, committed in the buggy state), offline coding-loop regression `tests/test_m8_coding_shapes.py` (five-cycle loop in the agent wire shape without tool*choice — run_shell_command → grep_search → read_file → edit with large string arguments → run_shell_command → final answer; tool-result injection boundary in both response modes). Readiness check: ZERO gateway code changes required (M6/M7 machinery is tool-agnostic). Suite 413 → 416 passed. Live acceptance is user-run. **ACCEPTANCE PASSED (user-run, 2026-08-15, FOURTH attempt):** after three failed attempts fixed by two hotfix rounds (ADR-031/033; ADR-034/035), the full loop ran live — `read_file` ×2 → `edit` → `run_shell_command` ×2 → final explanation (capture records 93–106; gateway-minted `call_dsqg*`ids round-tripping verbatim; gateway executed none of the tools); fixture suite`Ran 9 tests ... OK`; the one-line `//`→`/` fix correctly explained; fixture reset to buggy afterwards.
 
 ## Tests run
 
@@ -221,6 +221,22 @@ retry copied the ANNOTATED header verbatim), superseded the same day,
 and its mechanism fully reverted — app/prompt_compiler.py is
 byte-identical to the pinned M2-M7 state. Scripts deleted after use
 (established pattern).
+
+M8 ACCEPTANCE (user-run, 2026-08-15, FOURTH attempt, on the ADR-034/035
+hotfix round 2): PASSED — all ROADMAP M8 exit criteria. The monotonic
+success loop is capture records 99-106: read_file -> +read_file ->
++edit -> +run_shell_command -> +run_shell_command, then a tool-less
+final summary turn; every tool call carried a gateway-minted call_dsqg_
+id round-tripping verbatim through role=tool.tool_call_id, and the
+gateway executed nothing. Gateway log during the run: `tool repair
+retry 1/1 (triggers: no_envelope)` fired once, and the final
+tool-enabled turn ended `after 2 attempt(s); repair budget exhausted
+(triggers: no_envelope)` — attempt 2 answered plainly again, so the
+honest final text flushed (ADR-035 termination by construction, live).
+Zero simulation markers fired. Independently re-verified afterwards:
+fixture diff exactly `return total // len(words)` -> `return total /
+len(words)`, `Ran 9 tests ... OK`, fixture reset to its committed buggy
+state.
 ```
 
 ## Known limitations
@@ -241,7 +257,32 @@ byte-identical to the pinned M2-M7 state. Scripts deleted after use
 
 ## Next action
 
-**M8 hotfix round 2 complete — the acceptance RE-RUN is user-run.** The user's third acceptance attempt failed on a new shape (every prior hotfix mechanism worked; the model emitted marker-less mid-loop intent prose plus fabricated `[User]`/`[assistant]` transcripts, which the termination guard flushed as the final answer — capture records 88–92). The round-2 hotfix (ADR-034: main-path history tool calls render as the instructed envelope itself + transcript markers; ADR-035: universal bounded repair, termination guard removed) fixed exactly that failure mode and live-re-verified BOTH killer turns by replaying the captured requests: record 91 now emits a real `run_shell_command` envelope directly; record 90 logs `tool repair retry 1/1 (triggers: no_envelope)` and recovers a real `read_file` of the not-yet-read test file. Fixture state: `acceptance/m8-buggy-repo/` is committed in its BUGGY state (stdlib-only `textstats` + unittest suite, 9 tests; buggy = exactly one failure `AssertionError: 1 != 1.5`; fixed (`//` → `/`) = all OK — both states offline-verified) and currently SHOWS the buggy state. Offline regression pins the coding-loop wire shapes (tests/test_m8_coding_shapes.py; suite 422 → 424 passed after the hotfix). The user-run step: start the gateway, launch Qwen Code from inside `acceptance/m8-buggy-repo/`, give the EXACT ROADMAP prompt "Find and fix the bug, then run the tests and explain what changed." Repro checklist: docs/QWEN_CODE_INTEGRATION.md ("M8 acceptance"). After it passes, the next milestone is M9 (reliability hardening) — per the milestone gate, do NOT start M9 without the user's explicit go-ahead.
+**M8 ACCEPTANCE PASSED (user-run, 2026-08-15, fourth attempt) — M0–M8 complete.** The autonomous coding loop ran end-to-end through the gateway on the ADR-034/035 build (capture records 93–106; success loop 99–106: `read_file` ×2 → `edit` → `run_shell_command` ×2 → final explanation). All ROADMAP M8 exit criteria verified: the exact one-line fix (`//` → `/` in `average_word_length`), fixture suite `Ran 9 tests ... OK`, a correct final explanation, gateway-minted ids round-tripping verbatim, the gateway executing NONE of the tools, and no raw sentinels or simulation in the UI. The ADR-035 bounded repair fired live (`no_envelope`) and terminated by construction. The fixture was reset to its committed buggy state after the pass. **Next milestone is M9 (reliability hardening) — per the milestone gate, do NOT start M9 without the user's explicit go-ahead.**
+
+---
+
+## 2026-08-15 — M8 ACCEPTANCE PASSED (user-run, fourth attempt)
+
+### Result
+
+PASS on all ROADMAP M8 exit criteria, gateway running the committed ADR-034/035 hotfix round 2 (`b8b5ba2`):
+
+- Qwen Code autonomously inspected the fixture (`read_file` of `textstats.py` and `test_textstats.py`), edited the bug (`edit`), ran the tests via `run_shell_command` (twice), and explained the change — no human steering mid-loop.
+- Final explanation correctly named the fix: integer division `//` → true division `/` in `average_word_length` (`return total // len(words)` → `return total / len(words)`).
+- Fixture suite ends green: `Ran 9 tests ... OK` (independently re-run from the gateway side after the pass).
+- The gateway executed NONE of the tools — capture records 93–106 show only gateway-minted `call_dsqg_` ids round-tripping verbatim through `role=tool.tool_call_id`; execution was Qwen Code's throughout.
+- No raw sentinel text reached the UI; zero simulation markers fired during the pass.
+
+### Evidence notes
+
+- Monotonic success loop: records 99→106 (`read_file` → +`read_file` → +`edit` → +`run_shell_command` → +`run_shell_command`; record 106 is the tool-less final summary turn). Records 93–98 cover the same attempt's early phase including a side query.
+- ADR-035 worked live exactly as designed: the gateway log shows `tool repair retry 1/1 (triggers: no_envelope)` during the run, and the final tool-enabled turn ended `after 2 attempt(s); repair budget exhausted (triggers: no_envelope)` — attempt 2 answered plainly again, so the honest text flushed. Termination by construction, not by a guard, under real acceptance traffic.
+- The attempt-3 killer shapes (marker-less intent prose, fabricated `[User]`/`[assistant]` transcripts) never recurred.
+- Post-pass: fixture reset to its committed buggy state (`git checkout -- acceptance/m8-buggy-repo`); the temporary verifier script was deleted after use (established pattern).
+
+### Next milestone
+
+M9 (reliability hardening) awaits the user's explicit go-ahead — milestone gate.
 
 ---
 

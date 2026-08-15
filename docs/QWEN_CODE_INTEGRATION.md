@@ -8,7 +8,7 @@ protocol it uses the official OpenAI Node.js SDK (pinned exactly at
 standards-correct OpenAI Chat Completions API rather than a Qwen-specific
 HTTP protocol.
 
-**Status (M8 hotfix round 2 complete — fourth acceptance attempt pending):** plain chat works end-to-end (live-accepted 2026-08-14, a
+**Status (M8 ACCEPTANCE PASSED — user-run, 2026-08-15, fourth attempt):** plain chat works end-to-end (live-accepted 2026-08-14, a
 real Qwen Code v0.21.11 install answered through the gateway),
 **prompt-emulated tool calling is implemented AND live-accepted** (ADR-023):
 the gateway teaches DeepSeek a control-envelope protocol, parses the
@@ -39,7 +39,12 @@ becomes a valid tool request, ADR-034), and EVERY tool-enabled turn that
 ends without a valid envelope gets ONE bounded repair retry — the mid-loop
 termination guard was removed after live falsification (ADR-035). Replays
 of BOTH killer records from the third attempt now return real `tool_calls`
-responses. **The M8 acceptance RE-RUN (fourth attempt) is pending:** a
+responses. **M8 acceptance PASSED on the fourth attempt (user-run,
+2026-08-15):** the full autonomous loop ran through the gateway —
+`read_file` ×2 → `edit` → `run_shell_command` ×2 → final explanation
+(capture records 93–106, `call_dsqg_` ids round-tripping verbatim,
+gateway executed nothing), fixture suite `Ran 9 tests ... OK`, and a
+correct explanation of the one-line `//` → `/` fix. A
 deterministic buggy fixture is
 committed at `acceptance/m8-buggy-repo/` (stdlib-only, one failing test,
 both states offline-verified), the coding-loop wire shapes are
@@ -246,8 +251,7 @@ Do not rely on it as the only source of project requirements;
 
 ## M8 acceptance (user-run checklist)
 
-**Status: READY — awaiting the user-run FOURTH attempt (hotfix round 2,
-2026-08-15).**
+**Status: PASSED (user-run, 2026-08-15, FOURTH attempt, hotfix round 2).**
 The first three acceptance attempts all died on the model answering in
 prose instead of emitting the control envelope — attempts 1–2 on
 marker-bearing mid-loop simulation, attempt 3 on MARKER-LESS mid-loop
@@ -258,6 +262,14 @@ EVERY envelope-less tool turn now gets the one bounded retry — and
 re-pinned main-path history rendering so historical tool calls display as
 the instructed envelope itself (imitation becomes a valid request). Both
 killer records of attempt 3 replay to real `tool_calls` responses.
+PASS record (2026-08-15 ~11:28, gateway at commit `b8b5ba2`): the loop
+ran `read_file` ×2 → `edit` → `run_shell_command` ×2 → final explanation
+(monotonic success loop records 99–106); the ADR-035 `no_envelope` retry
+fired live and the final tool-enabled turn flushed honest text after its
+bounded retry (budget exhausted by construction); zero simulation markers;
+the fixture diff was exactly the one-line `//` → `/` fix; `Ran 9 tests
+... OK`; the gateway executed nothing. Fixture reset to its committed
+buggy state afterwards.
 The deterministic buggy fixture is committed at `acceptance/m8-buggy-repo/`
 (ADR-030): one library module + one stdlib-only unittest suite, exactly one
 failing test whose location and nature are NOT stated anywhere in the
