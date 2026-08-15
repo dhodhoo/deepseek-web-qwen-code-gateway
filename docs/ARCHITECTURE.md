@@ -253,19 +253,28 @@ INTERNAL
 
 Every category should indicate whether retry/failover is appropriate.
 
-## Later admin UI
+## Admin UI (delivered M12, ADR-039)
 
-Admin UI is intentionally outside the core milestones.
+Admin UI was intentionally outside the core milestones; M12 delivered it as ONE
+self-contained HTML page at `GET /admin` (inline CSS + vanilla JS, no external
+assets, no build step) acting as a pure stateless client of additive `/admin/*`
+JSON endpoints (`/admin/summary`, `/admin/sessions`, `/admin/settings`, plus
+the pre-existing `/admin/metrics` and `/admin/accounts`, and
+`POST /admin/accounts/{id}/disable|enable|reset`).
 
-When added it may expose:
+Of the original wish list:
 
-- account health,
-- add/disable account,
-- cooldown state,
-- gateway status,
-- request metadata,
-- session count,
-- sanitized logs,
-- settings.
+- account health — delivered (dashboard + accounts tab),
+- add/disable account — DISABLE/ENABLE/RESET delivered over the M10 router
+  seams; runtime ADD/REMOVE stays deferred (would move credentials across the
+  admin boundary),
+- cooldown state — delivered (accounts tab + `by_state` counts),
+- gateway status — delivered (dashboard embeds the exact `/health` payload),
+- request metadata — delivered as aggregates (`/admin/metrics` subset),
+- session count — delivered (dashboard + `/admin/sessions` metadata rows),
+- sanitized logs — NOT delivered (metrics/summary only; no log tail),
+- settings — delivered as a read-only effective-config echo.
 
-It must never reveal full stored credentials after save.
+It never reveals stored credentials — enforced STRUCTURALLY since M10:
+`AccountRecord` carries no credential field, and no admin view builder ever
+touches a `SecretStr` (secrets surface as presence only: configured/open/unset).

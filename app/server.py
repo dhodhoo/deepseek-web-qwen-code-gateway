@@ -50,6 +50,14 @@ history is rehydrated into the prompt, and the same turn re-runs there.
 When another usable account exists the failing request succeeds
 transparently; otherwise the ORIGINAL error surfaces byte-identical.
 Mid-stream failures (after any response byte) never fail over.
+
+M12 (ADR-039) admin UI: ``GET /admin`` serves a self-contained operator
+dashboard (inline JS, no external assets) over additive, structurally
+secret-free JSON endpoints — ``GET /admin/summary`` (dashboard
+aggregate), ``GET /admin/sessions`` (conversation metadata only),
+``GET /admin/settings`` (masked, presence-only secrets) and the account
+lifecycle mutations ``POST /admin/accounts/{id}/enable|disable|reset``.
+``/v1/*``, ``/health`` and the existing admin payloads are unchanged.
 """
 
 from __future__ import annotations
@@ -62,10 +70,16 @@ from dataclasses import dataclass
 from typing import Iterator, Sequence
 
 from fastapi import Depends, FastAPI, Header, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from . import __version__
 from .accounts import ACCOUNT_INVALID, AccountRecord, AccountRouter
+from .admin import (
+    ADMIN_PAGE_HTML,
+    build_sessions_view,
+    build_settings_view,
+    build_summary,
+)
 from .backends.base import BackendSession, LLMBackend
 from .backends.errors import BackendErrorCategory, BackendFailure
 from .backends.events import (
@@ -1391,15 +1405,17 @@ def create_app(
 
     # -------------------------------------------------------------- routes
 
-    @app.get("/health")
-    def health(request: Request) -> dict:
-        """Process/service health (never exposes secrets)."""
-        router_: AccountRouter = request.app.state.router
+    def _fleet_health_payload(router_: AccountRouter) -> dict:
+        """The ``/health`` payload — fleet-aware since M10 (ADR-037).
+
+        Shared verbatim with ``GET /admin/summary`` (M12, ADR-039) so
+        the dashboard's system-health card and the probe endpoint can
+        never disagree. Single-account deployments keep the exact
+        pre-M10 semantics until a final 401 retires the account.
+        """
         snapshot = router_.default_account.backend.health_check()
         # M10 (ADR-037): ready when the local backend reports ready AND
-        # at least one enabled account is not invalid. Single-account
-        # deployments keep the exact pre-M10 semantics until a final 401
-        # retires the account.
+        # at least one enabled account is not invalid.
         accounts_ok = any(
             account.enabled and account.health_status != ACCOUNT_INVALID
             for account in router_.accounts
@@ -1413,6 +1429,11 @@ def create_app(
                 "status": "ready" if ok else "not_ready",
             },
         }
+
+    @app.get("/health")
+    def health(request: Request) -> dict:
+        """Process/service health (never exposes secrets)."""
+        return _fleet_health_payload(request.app.state.router)
 
     @app.get("/admin/metrics")
     def admin_metrics(request: Request) -> dict:
@@ -1433,12 +1454,118 @@ def create_app(
         labels, derived state (disabled > invalid > cooldown > healthy),
         cooldown counters and timestamps. Credentials live only inside
         the account backends and are never serialized by this module.
-        Read-only in M10: account lifecycle management arrives with the
-        M12 admin UI.
+        Since M12 (ADR-039) the lifecycle mutations live at
+        ``POST /admin/accounts/{id}/enable|disable|reset``.
         """
         router_: AccountRouter = request.app.state.router
         store_: ConversationStore = request.app.state.store
         return {"accounts": router_.summary(store_)}
+
+    # ---------------------------------------------- M12 (ADR-039) admin UI
+
+    @app.get("/admin", include_in_schema=False)
+    def admin_ui() -> HTMLResponse:
+        """Self-contained operator dashboard (M12, ADR-039).
+
+        ONE static HTML document with inline CSS + vanilla JS — no
+        external assets, no build step, works offline (local-first).
+        The page is a pure stateless client of the ``/admin/*`` JSON
+        endpoints; the core API (``/v1/*``, ``/health``) never
+        references it — deleting the page changes nothing about gateway
+        behavior.
+        """
+        return HTMLResponse(ADMIN_PAGE_HTML)
+
+    @app.get("/admin/summary")
+    def admin_summary(request: Request) -> dict:
+        """Dashboard aggregate (M12, ADR-039).
+
+        Fleet health (the exact ``/health`` payload), per-state account
+        counts, conversation/session counts and headline metrics.
+        Unauthenticated like the other ``/admin`` reads — structurally
+        secret-free: counters and derived states only.
+        """
+        router_: AccountRouter = request.app.state.router
+        store_: ConversationStore = request.app.state.store
+        metrics_: MetricsCollector = request.app.state.metrics
+        return build_summary(
+            router_, store_, metrics_, _fleet_health_payload(router_)
+        )
+
+    @app.get("/admin/sessions")
+    def admin_sessions(request: Request) -> dict:
+        """Sanitized session list (M12, ADR-039).
+
+        Conversation METADATA only — ids, account/session binding,
+        status, message/tool-call counters, timestamps. Message content
+        (prompts, tool arguments, tool results) is never serialized by
+        any admin surface.
+        """
+        store_: ConversationStore = request.app.state.store
+        return {"sessions": build_sessions_view(store_)}
+
+    @app.get("/admin/settings")
+    def admin_settings(request: Request) -> dict:
+        """Read-only masked settings view (M12, ADR-039).
+
+        Secrets render as PRESENCE ONLY (auth mode, account count) —
+        never values. Settings are env-derived and frozen at startup;
+        a restart applies new values (runtime mutation is out of scope).
+        """
+        cfg: GatewaySettings = request.app.state.settings
+        return build_settings_view(cfg)
+
+    def _account_lifecycle(
+        account_id: str, action: str, request: Request
+    ) -> dict:
+        """One account lifecycle mutation (M12, ADR-039).
+
+        Mapped 1:1 onto the M10 router methods (the "M12 surface" named
+        since ADR-037): disable/enable flip the operator flag (disable
+        also releases the account's conversation links), reset restores
+        an invalid/cooling account to healthy after credential rotation.
+        Returns the UPDATED masked account row; unknown ids answer 404.
+        """
+        router_: AccountRouter = request.app.state.router
+        store_: ConversationStore = request.app.state.store
+        if router_.get(account_id) is None:
+            raise GatewayHttpError(
+                404,
+                openai_error_body(
+                    f"The account '{account_id}' does not exist.",
+                    "invalid_request_error",
+                    "ACCOUNT_NOT_FOUND",
+                ),
+            )
+        if action == "disable":
+            router_.set_enabled(account_id, False, store_)
+        elif action == "enable":
+            router_.set_enabled(account_id, True, store_)
+        else:  # "reset"
+            router_.reset(account_id)
+        row = next(
+            entry
+            for entry in router_.summary(store_)
+            if entry["id"] == account_id
+        )
+        return {"account": row}
+
+    @app.post("/admin/accounts/{account_id}/disable")
+    def admin_account_disable(account_id: str, request: Request) -> dict:
+        """Operator disable (M12): blocks routing + releases session links."""
+        return _account_lifecycle(account_id, "disable", request)
+
+    @app.post("/admin/accounts/{account_id}/enable")
+    def admin_account_enable(account_id: str, request: Request) -> dict:
+        """Operator enable (M12): flips the flag only — an ``invalid``
+        account stays invalid until ``reset``."""
+        return _account_lifecycle(account_id, "enable", request)
+
+    @app.post("/admin/accounts/{account_id}/reset")
+    def admin_account_reset(account_id: str, request: Request) -> dict:
+        """Operator restoration (M12): enabled + healthy + cleared
+        cooldown/counters — after credential rotation."""
+        return _account_lifecycle(account_id, "reset", request)
 
     @app.get(
         "/v1/models",
